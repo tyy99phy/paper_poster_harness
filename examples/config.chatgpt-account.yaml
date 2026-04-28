@@ -1,0 +1,25 @@
+strict: true
+paper:
+  query: "arXiv paper title or topic"
+  out: runs/example
+llm:
+  backend: chatgpt_account
+  model: gpt-5.5
+  timeout: 300
+  account:
+    auth_dir: ~/.config/poster-harness/auth
+    account: ""      # empty = auto-discover
+    auth_file: ""    # optional explicit auth JSON path
+image_generation:
+  backend: chatgpt_account
+  model: gpt-5.5
+  size: 1024x1536
+  quality: high
+  variants: 1
+  upscale_factor: 4.0
+  account:
+    auth_dir: ~/.config/poster-harness/auth
+    account: ""
+    auth_file: ""
+autoposter:
+  style: cms-hep

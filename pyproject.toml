@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "paper-poster-harness"
+version = "0.1.0"
+description = "Strict LLM + image-generation harness for turning academic papers into placeholder-first conference posters."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "paper-poster-harness contributors"}]
+dependencies = [
+  "Pillow>=10",
+  "PyYAML>=6",
+  "PyMuPDF>=1.24",
+  "python-pptx>=0.6.23",
+]
+
+[project.scripts]
+poster-harness = "poster_harness.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["poster_harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
