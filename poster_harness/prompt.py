@@ -4,24 +4,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-INTERNAL_DEFAULTS = [
-    "replace placeholder",
-    "validated cms/pptx plots",
-    "preserving the generated design language",
-    "next step:",
-    "internal",
-    "draft",
-    "TODO",
-    "to be replaced",
-    "placeholder figures",
-    "use a clean",
-    "use cms blue",
-    "bottom strip should",
-    "should read as",
-    "caption should",
-    "source text",
-    "source document",
-]
+from .schemas import DEFAULT_FORBIDDEN_PHRASES
+
+INTERNAL_DEFAULTS = DEFAULT_FORBIDDEN_PHRASES
 
 
 HEP_POSTER_GRAMMAR = [
@@ -168,20 +153,33 @@ def build_prompt(spec: dict[str, Any]) -> str:
         lines += [
             "- The listed dimensions are readability targets on a 1024×1536 canvas; the aspect ratio itself is mandatory.",
             "- For wide placeholders, do not make a full-width ribbon unless the height also scales with the ratio. Example: 950 px wide at 2.5:1 requires about 380 px height; if that is too tall, use a shorter but still large box such as 650×260.",
+            "- Hard rejection rule: a wide placeholder whose height is below 220 px on the 1024×1536 canvas is invalid, even if the text label says 2.5:1.",
+            "- Hard rejection rule: do not place a scientific placeholder over bullet text, section titles, badges, or flowcharts. Keep a visible empty gutter between text and every placeholder.",
             "- For square placeholders, reserve a genuinely square panel; do not place them inside landscape cards that will later crop or letterbox the real figure.",
+            "- Hard rejection rule: a 1:1 square placeholder drawn as 300×220, 280×200, or any other landscape/portrait rectangle is invalid. If only 230 px height is available, make the box 230×230 rather than wider.",
+            "- Hard rejection rule: any ratio above 1:1 is landscape. A 1.2:1 placeholder must be slightly wider than tall, for example 300×250; a tall 220×260 box labeled 1.2:1 is invalid.",
             "- If text competes with placeholder geometry, shrink/remove text before breaking the declared aspect ratio.",
             "- If a surrounding section/card is too narrow, reshape the surrounding card; never distort the placeholder ratio.",
             "- Curved/circular/pill design elements are allowed around cards, but figure placeholder boxes remain clean rectangles with the exact geometry above.",
             "",
         ]
+        layout_overrides = _geometry_first_layout_overrides(sections, placeholders)
+        if layout_overrides:
+            lines += layout_overrides + [""]
 
     # Section details.
     for sec in sections:
         sid = sec.get("id")
         title = sec.get("title", f"Section {sid}")
         layout = sec.get("layout", "card")
+        sec_figs = [p for p in placeholders if p.get("section") == sid]
+        bullet_budget = _section_bullet_budget(sec_figs)
         lines.append(f"Section {sid}, layout: {layout}, title: \"{sid}  {_q(title)}\"")
         if sec.get("text"):
+            if bullet_budget is not None:
+                lines.append(
+                    f"Text budget for this figure-containing section: render at most {bullet_budget} short bullets; omit lower-priority bullets before shrinking placeholders."
+                )
             lines.append("Text content:")
             for t in sec["text"]:
                 if isinstance(t, str):
@@ -195,12 +193,27 @@ def build_prompt(spec: dict[str, Any]) -> str:
                         clean = sanitize_public_text(str(b), spec.get("forbidden_phrases"))
                         if clean:
                             lines.append(f"  Body: {_q(clean)}")
+                    rendered_bullets = 0
                     for b in t.get("bullets", []):
+                        if bullet_budget is not None and rendered_bullets >= bullet_budget:
+                            continue
                         clean = sanitize_public_text(str(b), spec.get("forbidden_phrases"))
                         if clean:
                             lines.append(f"  Bullet: {_q(clean)}")
-        sec_figs = [p for p in placeholders if p.get("section") == sid]
+                            rendered_bullets += 1
         if sec_figs:
+            if any((_parse_aspect_ratio_text(str(fig.get("aspect") or "")) or 1.0) >= 2.0 for fig in sec_figs):
+                lines.append(
+                    "Wide-figure section layout: use a short left/top text block and a medium-wide figure placeholder about two-thirds canvas width, "
+                    "not a full-width ribbon. Target around 600–720 px wide and 240–300 px tall on 1024×1536; leave both side margins visible."
+                )
+                lines.append(
+                    "For this wide-figure section, render at most two short bullets if space is tight; preserving the placeholder height is more important than showing every bullet."
+                )
+            elif len(sec_figs) >= 2:
+                lines.append(
+                    "Multi-placeholder section layout: draw separate adjacent figure tiles with a visible gutter; do not let neighboring placeholder boxes touch or overlap."
+                )
             lines.append("Use these blank placeholders in this section (do not draw their content):")
             for fig in sec_figs:
                 aspect_text = str(fig.get("aspect", "1:1 square"))
@@ -215,8 +228,15 @@ def build_prompt(spec: dict[str, Any]) -> str:
                 if hint:
                     lines.append(f"  Placement/size hint for [{fig['id']}]: {hint}")
             lines.append("Do not render separate captions directly above or below these placeholder boxes; keep padding clear for later figure replacement.")
+            lines.append("In this section, reserve one uninterrupted figure zone for the placeholder(s). Keep all bullets/text outside that zone with at least 18 px visual gutter; never let a placeholder cover text.")
         if sec.get("flowchart"):
-            lines.append("Draw this as a simple public text-only analysis flowchart, not a source-figure placeholder:")
+            wide_sec = any((_parse_aspect_ratio_text(str(fig.get("aspect") or "")) or 1.0) >= 2.0 for fig in sec_figs)
+            if wide_sec:
+                lines.append(
+                    "Optional compact public text-only analysis flowchart: draw it only if the wide placeholder still keeps its target height; otherwise omit the flowchart before shrinking the placeholder."
+                )
+            else:
+                lines.append("Draw this as a simple public text-only analysis flowchart, not a source-figure placeholder:")
             lines.append("- Render only concise node labels and arrows derived from the following items; do NOT render instruction sentences verbatim.")
             for item in sec["flowchart"]:
                 lines.append(f"- Node label: \"{_q(str(item))}\"")
@@ -246,6 +266,9 @@ def build_prompt(spec: dict[str, Any]) -> str:
         "- Use modern rounded cards, subtle shadows, scientific background art, glow/depth effects, and coherent accent colors.",
         "- Give wide scientific-plot placeholders enough absolute size for readability while preserving their declared source aspect ratio.",
         "- Never solve a wide plot by making it an ultra-thin strip; reduce nearby text or give the plot a taller module instead.",
+        "- If a wide plot needs 680×272 px, allocate that real box; do not draw a 900×140 strip and expect the replacement stage to fix it.",
+        "- Keep the Section 3 strategy plot below its text block with clear separation, and keep the Section 4 hero result fully inside the result card above the summary/conclusion row.",
+        "- For a square hero result, remove decorative badges/logos or reduce text before compressing the square figure tile into a landscape rectangle.",
         "- If there are many placeholders, visually group them into one hero result, two supporting analysis figures, and smaller diagnostics rather than equal tiles.",
         "- Preserve enough whitespace for later replacement; no decorative artwork may overlap a placeholder rectangle.",
     ]
@@ -276,15 +299,22 @@ def _placeholder_geometry_blueprint(fig: dict[str, Any]) -> str:
         ratio_text = f"width:height ≈ {ratio:.2f}:1"
     else:
         ratio_text = f"width:height ≈ 1:{(1.0 / ratio):.2f}"
+    if 0.92 <= ratio <= 1.08:
+        lower_w = lower_h = 230 if _is_hero_label(label) else max(160, int(width * 0.82))
+    else:
+        lower_w = max(80, int(width * 0.90))
+        lower_h = max(80, int(height * 0.90))
     return (
         f"{ratio_text}; target visible box about {width}×{height} px on a 1024×1536 canvas; "
-        f"label '{label}'; do not substitute a generic landscape slot."
+        f"label '{label}'; do not substitute a generic landscape slot; "
+        f"visible box bounds should stay close to {lower_w}-{int(width*1.10)} px wide and "
+        f"{lower_h}-{int(height*1.10)} px tall."
     )
 
 
 def _suggested_placeholder_size(ratio: float, *, label: str) -> tuple[int, int]:
     low = label.lower()
-    hero = any(key in low for key in ("limit", "result", "constraint", "cross section", "significance", "exclusion", "observed"))
+    hero = _is_hero_label(label)
     if 0.92 <= ratio <= 1.08:
         side = 330 if hero else 220
         return side, side
@@ -297,6 +327,11 @@ def _suggested_placeholder_size(ratio: float, *, label: str) -> tuple[int, int]:
     return width, height
 
 
+def _is_hero_label(label: str) -> bool:
+    low = str(label or "").lower()
+    return any(key in low for key in ("limit", "result", "constraint", "cross section", "significance", "exclusion", "observed"))
+
+
 def _parse_aspect_ratio_text(aspect: str) -> float | None:
     text = str(aspect or "").strip().lower()
     match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*[:/]\s*([0-9]+(?:\.[0-9]+)?)", text)
@@ -304,6 +339,61 @@ def _parse_aspect_ratio_text(aspect: str) -> float | None:
         return 1.0 if "square" in text else None
     den = float(match.group(2))
     return float(match.group(1)) / den if den else None
+
+
+def _geometry_first_layout_overrides(sections: list[dict[str, Any]], placeholders: list[dict[str, Any]]) -> list[str]:
+    section_titles = {sec.get("id"): str(sec.get("title") or f"Section {sec.get('id')}") for sec in sections}
+    wide: list[dict[str, Any]] = []
+    square: list[dict[str, Any]] = []
+    for fig in placeholders:
+        ratio = _parse_aspect_ratio_text(str(fig.get("aspect") or ""))
+        if ratio is None:
+            continue
+        if ratio >= 2.0:
+            wide.append(fig)
+        if 0.92 <= ratio <= 1.08:
+            square.append(fig)
+    if not (wide or square):
+        return []
+
+    lines = [
+        "GEOMETRY-FIRST LAYOUT OVERRIDE:",
+        "- If a section layout phrase such as 'middle-left' or 'middle-right' conflicts with the placeholder size target, ignore that phrase and preserve the placeholder geometry.",
+        "- It is better to omit bullets or make a section card taller/wider than to shrink a scientific placeholder below its declared aspect-ratio box.",
+        "- Do not use a two-column body layout when it would force a 2.5:1 plot into a thin half-width ribbon or force a 1:1 result into a landscape slot.",
+    ]
+    for fig in wide:
+        ratio = _parse_aspect_ratio_text(str(fig.get("aspect") or "")) or 2.5
+        width, height = _suggested_placeholder_size(ratio, label=str(fig.get("label") or ""))
+        sid = fig.get("section")
+        lines.append(
+            f"- [{fig.get('id')}], Section {sid} ({section_titles.get(sid, 'untitled')}): make the whole section/card wide enough for a {width}×{height} px visible box on 1024×1536. "
+            "Prefer a full-width horizontal band or a two-thirds-width figure zone; never a narrow half-column slot. Minimum visible height is 240 px for 2.5:1 plots."
+        )
+    for fig in square:
+        width, height = _suggested_placeholder_size(1.0, label=str(fig.get("label") or ""))
+        sid = fig.get("section")
+        lines.append(
+            f"- [{fig.get('id')}], Section {sid} ({section_titles.get(sid, 'untitled')}): draw a true square result tile about {width}×{height} px. "
+            "The visible dashed rectangle's width and height must differ by less than 10%; do not put it inside a short landscape result card. "
+            "If the card is height-limited, shrink to a smaller square such as 240×240 and remove nearby badges/art rather than drawing a 300×220 rectangle."
+        )
+    if wide and square:
+        lines.append(
+            "- When a wide plot section and a square hero-result section both exist, do not place those two sections side-by-side as equal half-width cards; stack or stagger them vertically so both placeholders keep their required height."
+        )
+    return lines
+
+
+def _section_bullet_budget(sec_figs: list[dict[str, Any]]) -> int | None:
+    if not sec_figs:
+        return None
+    ratios = [_parse_aspect_ratio_text(str(fig.get("aspect") or "")) or 1.0 for fig in sec_figs]
+    if any(ratio >= 2.0 for ratio in ratios):
+        return 2
+    if any(0.92 <= ratio <= 1.08 for ratio in ratios):
+        return 2
+    return 3
 
 
 def _style_rule_list(style: dict[str, Any], key: str, defaults: list[str]) -> list[str]:
@@ -323,7 +413,7 @@ def _placeholder_layout_hint(fig: dict[str, Any]) -> str:
     if any(key in label for key in ("limit", "95%", "result", "constraint", "upper", "cross section", "significance", "exclusion", "measurement", "observation", "interpretation")):
         return "make this a dominant key-result figure, not a thumbnail; allocate the largest readable near-square slot in its section and reduce neighboring text if needed."
     if any(key in label for key in ("distribution", "region", "background", "fit", "control", "post-fit", "pre-fit", "multi-panel", "unfolded")) or "wide" in aspect:
-        return "make this wide or multi-panel plot a large landscape panel with real vertical height; use full width only if the height scales with the declared ratio, never as a ribbon-thin strip."
+        return "make this a medium-wide landscape panel with real vertical height, preferably right of the strategy text; do not span the whole card width unless the height is at least 240 px on a 1024×1536 canvas."
     if any(key in label for key in ("detector", "event display", "topology", "selection", "strategy", "workflow")):
         return "use this as a clear supporting visual near the method text; keep it medium-sized and unobstructed."
     return ""

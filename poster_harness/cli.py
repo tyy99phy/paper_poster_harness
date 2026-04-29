@@ -23,8 +23,9 @@ from .config import (
     write_default_harness_config,
 )
 from .extract import extract_pdf_images, extract_text, extract_pptx_media, render_pdf_pages
+from .latex_utils import clean_latex_inline, extract_latex_braced
 from .prompt import build_prompt, sanitize_public_text
-from .replace import normalize_placeholder_geometry, replace_placeholders, upscale_image
+from .replace import audit_generated_placeholder_geometry, normalize_placeholder_geometry, replace_placeholders, upscale_image
 from .image_backend import generate_images_from_config
 from .llm import ChatGPTAccountResponsesProvider
 from .llm_stages import (
@@ -33,14 +34,14 @@ from .llm_stages import (
     qa_poster,
     select_figures,
 )
-from .schemas import DEFAULT_MODEL
+from .schemas import DEFAULT_MODEL, default_poster_spec
 
 
 def cmd_init(args: argparse.Namespace) -> None:
     root = Path(args.project_dir)
     for sub in ["input", "assets", "generated", "exports", "specs", "prompts", "scratch"]:
         (root / sub).mkdir(parents=True, exist_ok=True)
-    spec = _default_spec(title=args.title or "Untitled Scientific Poster")
+    spec = default_poster_spec(title=args.title or "Untitled Scientific Poster")
     dump_config(spec, root / "specs" / "poster_spec.yaml")
     print(root)
     print(root / "specs" / "poster_spec.yaml")
@@ -129,7 +130,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
 def cmd_draft_spec(args: argparse.Namespace) -> None:
     text = Path(args.text).read_text(encoding="utf-8", errors="replace")
     title = args.title or _guess_title(text)
-    spec = _default_spec(title=title)
+    spec = default_poster_spec(title=title)
     # Fill with a conservative manual starter; strict autoposter uses LLM stages instead.
     abstract = _guess_abstract(text)
     if abstract:
@@ -471,6 +472,19 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             detections,
             min_confidence=float(_opt(args.min_detection_confidence, config, "autoposter.min_detection_confidence", 0.15)),
         )
+        geometry_issues = audit_generated_placeholder_geometry(
+            base_image=image_path,
+            spec=spec_with_placements,
+            ratio_tolerance=float(cfg_get(config, "autoposter.placeholder_aspect_tolerance", 0.20)),
+        )
+        if geometry_issues:
+            geometry_issue_path = dirs["qa"] / f"{stem}.placeholder-geometry.qa.yaml"
+            dump_config({"passes": False, "issues": geometry_issues}, geometry_issue_path)
+            run_manifest["qa"].append(str(geometry_issue_path))
+            placeholder_failures.append(
+                f"{image_path}: failed deterministic placeholder geometry QA; see {geometry_issue_path}"
+            )
+            continue
         qa_image_path = Path(image_path)
         if bool(cfg_get(config, "autoposter.normalize_placeholder_geometry", True)):
             redraw_geometry = bool(cfg_get(config, "autoposter.redraw_normalized_placeholders", False))
@@ -812,61 +826,16 @@ def _latex_asset_caption_map(text: str) -> dict[str, str]:
         ]
         if not includes:
             continue
-        caption = _extract_latex_braced(block, "caption") or _extract_latex_braced(block, "topcaption")
+        caption = extract_latex_braced(block, "caption") or extract_latex_braced(block, "topcaption")
         if not caption:
             continue
-        cleaned = _clean_latex_inline(caption)
+        cleaned = clean_latex_inline(caption)
         for idx, stem in enumerate(includes):
             label = cleaned
             if len(includes) == 2 and re.search(r"\bleft\b", cleaned, flags=re.I) and re.search(r"\bright\b", cleaned, flags=re.I):
                 label = f"{cleaned} ({'left' if idx == 0 else 'right'} panel)"
             mapping[stem] = label
     return mapping
-
-
-def _extract_latex_braced(text: str, command: str) -> str:
-    marker = f"\\{command}"
-    index = text.find(marker)
-    if index < 0:
-        return ""
-    brace = text.find("{", index + len(marker))
-    if brace < 0:
-        return ""
-    depth = 0
-    start = brace + 1
-    for pos in range(brace, len(text)):
-        char = text[pos]
-        if char == "{" and (pos == 0 or text[pos - 1] != "\\"):
-            depth += 1
-        elif char == "}" and (pos == 0 or text[pos - 1] != "\\"):
-            depth -= 1
-            if depth == 0:
-                return text[start:pos]
-    return ""
-
-
-def _clean_latex_inline(text: str) -> str:
-    replacements = {
-        r"\hT": "HT",
-        r"\pT": "pT",
-        r"\PGm": "mu",
-        r"\Pgm": "mu",
-        r"\hmn": "heavy Majorana neutrino",
-        r"\WO": "Weinberg operator",
-        r"\mN": "mN",
-        r"\Vmn": "VmuN",
-        r"\GeV": "GeV",
-        r"\TeV": "TeV",
-        r"\CL": "CL",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    text = re.sub(r"~?\\cite\{[^{}]*\}", "", text)
-    text = re.sub(r"\$+", "", text)
-    text = re.sub(r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])?", "", text)
-    text = text.replace("{", "").replace("}", "")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
 
 
 def _caption_to_label(caption: str, *, default_label: str) -> str:
@@ -968,59 +937,6 @@ def _apply_spec_extras(spec: dict[str, Any], extras: Mapping[str, Any]) -> dict[
             if cleaned
         ]
     return out
-
-
-def _default_spec(title: str) -> dict:
-    return {
-        "project": {
-            "title": title,
-            "topic": title,
-            "subtitle": "",
-            "authors": "",
-            "identity": "",
-            "audience": "academic conference audience",
-        },
-        "style": {
-            "summary": "premium CERN/LHCC-inspired scientific poster, modern editorial HEP design, artistic but readable, not a collage",
-            "aspect": "A0 vertical / 2:3 ratio",
-            "top_band": "strong dark title banner with concise identity text and abstract detector/beam artwork",
-            "body_layout": "4-6 large numbered modules with one dominant result region, generous gutters, and varied card shapes",
-            "color_grammar": "primary result = blue; secondary result = warm red; use consistently",
-        },
-        "forbidden_phrases": [
-            "replace placeholder",
-            "validated CMS/PPTX",
-            "generated design language",
-            "next step:",
-            "internal",
-            "TODO",
-            "draft",
-        ],
-        "sections": [
-            {"id": 1, "title": "Motivation and physics target", "layout": "upper full-width, 3 columns", "text": [{"title": "Motivation", "body": ["Summarize the central physics motivation in 1–2 public sentences."], "bullets": []}]},
-            {"id": 2, "title": "Analysis strategy", "layout": "large middle card", "text": [{"title": "Method", "body": ["Summarize the method, object selection, reconstruction, or experimental strategy."], "bullets": []}], "flowchart": ["Use a clean vector flowchart for the main analysis logic if applicable."]},
-            {"id": 3, "title": "Samples and background estimation", "layout": "lower-left card", "text": [{"title": "Inputs", "body": ["Describe datasets, simulation, controls, or background estimates."], "bullets": []}]},
-            {"id": 4, "title": "Key results", "layout": "lower-right card", "text": [{"title": "Results", "body": ["Describe one or two key result messages."], "bullets": []}]},
-            {"id": 5, "title": "Summary and prospects", "layout": "bottom full-width card", "text": [{"title": "Summary", "body": ["Summarize the takeaway and public prospects."], "bullets": []}]},
-        ],
-        "placeholders": [
-            {"id": "FIG 01", "section": 1, "label": "Motivation/context figure", "aspect": "2:1 wide", "asset": "fig01.png"},
-            {"id": "FIG 02", "section": 1, "label": "Signal or process diagram", "aspect": "4:3", "asset": "fig02.png"},
-            {"id": "FIG 03", "section": 3, "label": "Samples/table or method sketch", "aspect": "4:3", "asset": "fig03.png"},
-            {"id": "FIG 04", "section": 3, "label": "Background/method figure", "aspect": "2.4:1 wide", "asset": "fig04.png"},
-            {"id": "FIG 05", "section": 4, "label": "Key result A", "aspect": "1:1 square", "asset": "fig05.png"},
-            {"id": "FIG 06", "section": 4, "label": "Key result B", "aspect": "1:1 square", "asset": "fig06.png"},
-            {"id": "FIG 07", "section": 5, "label": "Diagnostic/result C", "aspect": "1:1 square", "asset": "fig07.png"},
-            {"id": "FIG 08", "section": 5, "label": "Diagnostic/result D", "aspect": "1:1 square", "asset": "fig08.png"},
-        ],
-        "placements": {},
-        "conclusion": [
-            "State the main public result in one sentence.",
-            "State the robustness or validation message in one sentence.",
-            "State future physics prospects in one sentence.",
-        ],
-        "closing": "Thank you for your attention!",
-    }
 
 
 def _guess_title(text: str) -> str:

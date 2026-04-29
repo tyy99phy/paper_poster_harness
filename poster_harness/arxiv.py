@@ -9,6 +9,7 @@ import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlparse
 from urllib import request
 
 from .config import cfg_get
@@ -179,7 +180,14 @@ def download_arxiv_bundle(
     )
 
 
-def download_url(url: str, dest: str | Path, *, timeout: int = 180) -> Path:
+def download_url(
+    url: str,
+    dest: str | Path,
+    *,
+    timeout: int = 180,
+    allowed_hosts: Sequence[str] = ("arxiv.org", "export.arxiv.org"),
+) -> Path:
+    _validate_download_url(url, allowed_hosts=allowed_hosts)
     path = Path(dest)
     path.parent.mkdir(parents=True, exist_ok=True)
     req = request.Request(url, headers={"User-Agent": "poster-harness/0.1"})
@@ -188,6 +196,16 @@ def download_url(url: str, dest: str | Path, *, timeout: int = 180) -> Path:
     if path.stat().st_size == 0:
         raise RuntimeError(f"downloaded empty file from {url}")
     return path
+
+
+def _validate_download_url(url: str, *, allowed_hosts: Sequence[str]) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise RuntimeError(f"refusing non-HTTPS download URL: {url}")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed = {item.lower().rstrip(".") for item in allowed_hosts}
+    if host not in allowed:
+        raise RuntimeError(f"refusing download URL outside allowed hosts {sorted(allowed)}: {url}")
 
 
 def download_arxiv_source(url: str, dest: str | Path, *, arxiv_id: str, timeout: int = 180) -> Path:

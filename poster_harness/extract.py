@@ -6,7 +6,9 @@ from pathlib import Path
 from zipfile import ZipFile
 from typing import Iterable
 
-from PIL import Image, ImageOps, ImageDraw, ImageFont
+from PIL import Image, ImageOps, ImageDraw
+
+from .fonts import load_font
 
 
 def extract_text(input_path: str | Path, out_txt: str | Path | None = None) -> str:
@@ -175,10 +177,7 @@ def make_contact_sheet(paths: Iterable[Path], out_path: str | Path, cell: tuple[
     w, h = cell
     sheet = Image.new("RGB", (cols * w, rows * h), "white")
     draw = ImageDraw.Draw(sheet)
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-    except Exception:
-        font = None
+    font = load_font(14)
     for idx, (p, im) in enumerate(items):
         x = (idx % cols) * w
         y = (idx // cols) * h

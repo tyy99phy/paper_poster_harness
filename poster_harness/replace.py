@@ -5,7 +5,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageOps, ImageDraw, ImageFilter, ImageFont, ImageChops
+from PIL import Image, ImageOps, ImageDraw, ImageFilter, ImageChops
+
+from .fonts import load_font
 
 
 def replace_placeholders(
@@ -158,6 +160,58 @@ def normalize_placeholder_geometry(
     out.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out, quality=95)
     return out, updated
+
+
+def audit_generated_placeholder_geometry(
+    *,
+    base_image: str | Path,
+    spec: dict[str, Any],
+    scale: float = 1.0,
+    ratio_tolerance: float = 0.20,
+) -> list[dict[str, Any]]:
+    """Deterministically verify visible placeholder aspect ratios.
+
+    LLM QA can be fooled by placeholder label text. This audit checks the pixel
+    geometry before any hidden normalization. If the image model drew a 2.5:1
+    placeholder as a ribbon-like 6:1 strip, strict autoposter should reject the
+    variant instead of trying to hide the mismatch with post-processing.
+    """
+    canvas = Image.open(base_image).convert("RGB")
+    placements = dict(spec.get("placements") or {})
+    placeholders = {str(p.get("id")): p for p in spec.get("placeholders", [])}
+    issues: list[dict[str, Any]] = []
+    for fig_id, raw_box in placements.items():
+        ph = placeholders.get(str(fig_id), {})
+        if not ph:
+            continue
+        expected = _parse_placeholder_aspect(str(ph.get("aspect") or ""))
+        if not expected:
+            continue
+        try:
+            detected_box = tuple(int(round(float(v) * scale)) for v in raw_box)  # type: ignore[arg-type]
+        except Exception:
+            continue
+        if len(detected_box) != 4:
+            continue
+        visible_box = _find_enclosing_placeholder_panel(canvas, detected_box, expected) or detected_box
+        actual = _box_ratio(visible_box)
+        rel_error = _ratio_relative_error(actual, expected)
+        if rel_error > ratio_tolerance:
+            issues.append(
+                {
+                    "id": str(fig_id),
+                    "expected_ratio": round(expected, 4),
+                    "actual_ratio": round(actual, 4),
+                    "relative_error": round(rel_error, 4),
+                    "detected_box": list(detected_box),
+                    "visible_box": list(visible_box),
+                    "message": (
+                        f"{fig_id} visible placeholder ratio {actual:.2f}:1 does not match "
+                        f"declared ratio {expected:.2f}:1 within {ratio_tolerance:.0%}"
+                    ),
+                }
+            )
+    return issues
 
 
 def _parse_placeholder_aspect(aspect: str) -> float | None:
@@ -424,7 +478,26 @@ def _find_enclosing_placeholder_panel(
     # edges can otherwise be mistaken for a panel.
     if _box_area(panel) < _box_area(box) * 0.75:
         return None
+    # Do not let a surrounding section/card border masquerade as the placeholder
+    # itself.  This happened for artistic result cards that contain a nearly
+    # square dashed placeholder: the long card outline was colorful enough to be
+    # detected as a "panel", producing a 2:1 replacement region.  Keep the LLM
+    # seed box when it is already closer to the declared source ratio and the
+    # pixel expansion grows into a much worse geometry.
+    raw_error = _ratio_relative_error(_box_ratio(box), ratio)
+    panel_error = _ratio_relative_error(_box_ratio(panel), ratio)
+    area_growth = _box_area(panel) / max(1, _box_area(box))
+    if area_growth > 1.15 and panel_error > raw_error + 0.08:
+        return None
     return panel
+
+
+def _box_ratio(box: tuple[int, int, int, int]) -> float:
+    return max(1, box[2] - box[0]) / max(1, box[3] - box[1])
+
+
+def _ratio_relative_error(actual: float, expected: float) -> float:
+    return abs(actual / max(expected, 0.01) - 1.0)
 
 
 def _is_placeholder_border_pixel(pixel: tuple[int, int, int]) -> bool:
@@ -587,15 +660,12 @@ def _draw_clean_placeholder(
     radius = max(6, min(w, h) // 20)
     d.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=(255, 255, 255, 255), outline=(95, 95, 120, 255), width=2)
     _draw_dashed_rect(d, [4, 4, w - 5, h - 5], fill=(105, 70, 140, 255), width=2, dash=10)
-    try:
-        bold_size = max(14, min(28, h // 8))
-        body_size = max(8, min(18, h // 12))
-        small_size = max(8, min(15, h // 14))
-        bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", bold_size)
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", body_size)
-        small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", small_size)
-    except Exception:
-        bold = font = small = None
+    bold_size = max(14, min(28, h // 8))
+    body_size = max(8, min(18, h // 12))
+    small_size = max(8, min(15, h // 14))
+    bold = load_font(bold_size, bold=True)
+    font = load_font(body_size)
+    small = load_font(small_size)
     lines, fonts = _placeholder_text_layout(
         d,
         fig_id=fig_id,
@@ -638,13 +708,11 @@ def _placeholder_text_layout(
         if aspect:
             lines.append(f"aspect {aspect}")
         return lines, [None] * len(lines)
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     body_start = getattr(font, "size", 10)
     for body_size in range(body_start, 7, -1):
-        body = ImageFont.truetype(font_path, body_size)
-        title = ImageFont.truetype(bold_path, max(body_size + 3, min(getattr(bold, "size", body_size + 4), body_size + 8)))
-        tiny = ImageFont.truetype(font_path, max(8, body_size - 1))
+        body = load_font(body_size)
+        title = load_font(max(body_size + 3, min(getattr(bold, "size", body_size + 4), body_size + 8)), bold=True)
+        tiny = load_font(max(8, body_size - 1))
         label_lines = _wrap_text(label, max_width, draw, body)
         lines = [f"[{fig_id}]", *label_lines]
         if aspect:
@@ -653,9 +721,9 @@ def _placeholder_text_layout(
         total = sum((getattr(f, "size", body_size) + 4) for f in fonts)
         if total <= max_height:
             return lines, fonts
-    body = ImageFont.truetype(font_path, 8)
-    title = ImageFont.truetype(bold_path, 11)
-    tiny = ImageFont.truetype(font_path, 8)
+    body = load_font(8)
+    title = load_font(11, bold=True)
+    tiny = load_font(8)
     label_lines = _wrap_text(label, max_width, draw, body)
     lines = [f"[{fig_id}]", *label_lines]
     if aspect:
@@ -743,16 +811,13 @@ def _draw_text_overlay(canvas: Image.Image, overlay: dict[str, Any], scale: floa
     d = ImageDraw.Draw(canvas)
     radius = int(overlay.get('radius', 8) * scale)
     d.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=fill)
-    font_path = overlay.get('font', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf')
+    font_path = overlay.get('font') or None
     font_size = max(8, int(overlay.get('font_size', 12) * scale))
     small_size = max(8, int(overlay.get('small_font_size', font_size) * scale))
     heading_size = max(font_size, int(overlay.get('heading_font_size', font_size + 2) * scale))
-    try:
-        font = ImageFont.truetype(font_path, font_size)
-        small = ImageFont.truetype(font_path, small_size)
-        heading_font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', heading_size)
-    except Exception:
-        font = small = heading_font = None
+    font = load_font(font_size, preferred=font_path)
+    small = load_font(small_size, preferred=font_path)
+    heading_font = load_font(heading_size, bold=True)
     pad = int(overlay.get('padding', 10) * scale)
     cur_y = y0 + pad
     max_w = x1 - x0 - 2 * pad

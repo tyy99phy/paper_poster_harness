@@ -35,7 +35,7 @@ image_generation:
   model: gpt-5.5
   size: 1024x1536
   quality: high
-  variants: 1
+  variants: 3
   generated_scale: 4.0
   upscale_factor: 4.0
   account:
@@ -59,6 +59,7 @@ autoposter:
   min_detection_confidence: 0.15
   normalize_placeholder_geometry: true
   redraw_normalized_placeholders: false
+  placeholder_aspect_tolerance: 0.20
   pdf_render_dpi: 220
   max_pages: 12
   figure_layout_policy: Use the selected source asset aspect ratio as the placeholder

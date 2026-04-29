@@ -2,7 +2,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from poster_harness.replace import normalize_placeholder_geometry, replace_placeholders
+from poster_harness.replace import audit_generated_placeholder_geometry, normalize_placeholder_geometry, replace_placeholders
 
 
 def test_normalize_placeholder_geometry_matches_declared_aspects(tmp_path: Path):
@@ -122,3 +122,46 @@ def test_normalize_can_plan_geometry_without_redrawing_visible_placeholders(tmp_
     assert not planned_path.exists()
     assert updated["placements"]["FIG 01"][2] - updated["placements"]["FIG 01"][0] == updated["placements"]["FIG 01"][3] - updated["placements"]["FIG 01"][1]
     assert "_replacement_clear_boxes" in updated
+
+
+def test_audit_generated_placeholder_geometry_rejects_wide_ribbon(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (1024, 1536), "white")
+    draw = ImageDraw.Draw(im)
+    draw.rectangle([40, 800, 984, 940], outline=(120, 65, 150), width=2)
+    im.save(base)
+    spec = {
+        "placeholders": [{"id": "FIG 02", "label": "Wide plot", "aspect": "2.5:1 wide"}],
+        "placements": {"FIG 02": [40, 800, 984, 940]},
+    }
+    issues = audit_generated_placeholder_geometry(base_image=base, spec=spec, ratio_tolerance=0.20)
+    assert issues
+    assert issues[0]["id"] == "FIG 02"
+    assert issues[0]["actual_ratio"] > 5
+
+
+def test_audit_does_not_expand_square_placeholder_to_surrounding_card(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (4096, 6144), "white")
+    draw = ImageDraw.Draw(im)
+    for offset in range(8):
+        draw.rounded_rectangle(
+            [817 + offset, 3647 + offset, 4003 - offset, 5128 - offset],
+            radius=40,
+            outline=(40, 110, 190),
+            width=1,
+        )
+    x0, y0, x1, y1 = 2104, 3872, 3274, 4874
+    for x in range(x0, x1, 60):
+        draw.line([(x, y0), (min(x + 12, x1), y0)], fill=(210, 140, 20), width=3)
+        draw.line([(x, y1), (min(x + 12, x1), y1)], fill=(210, 140, 20), width=3)
+    for y in range(y0, y1, 60):
+        draw.line([(x0, y), (x0, min(y + 12, y1))], fill=(210, 140, 20), width=3)
+        draw.line([(x1, y), (x1, min(y + 12, y1))], fill=(210, 140, 20), width=3)
+    im.save(base)
+
+    spec = {
+        "placeholders": [{"id": "FIG 01", "label": "Result", "aspect": "1:1 square"}],
+        "placements": {"FIG 01": [x0, y0, x1, y1]},
+    }
+    assert audit_generated_placeholder_geometry(base_image=base, spec=spec, ratio_tolerance=0.20) == []

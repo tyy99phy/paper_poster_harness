@@ -55,7 +55,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
         "model": "gpt-5.5",
         "size": "1024x1536",
         "quality": "high",
-        "variants": 1,
+        "variants": 3,
         "generated_scale": 4.0,
         "upscale_factor": 4.0,
         "account": {
@@ -81,6 +81,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
         "min_detection_confidence": 0.15,
         "normalize_placeholder_geometry": True,
         "redraw_normalized_placeholders": False,
+        "placeholder_aspect_tolerance": 0.20,
         "pdf_render_dpi": 220,
         "max_pages": 12,
         "figure_layout_policy": (

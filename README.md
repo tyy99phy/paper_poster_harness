@@ -74,7 +74,7 @@ image_generation:
   model: gpt-5.5
   size: 1024x1536
   quality: high
-  variants: 1
+  variants: 3
   generated_scale: 4.0
   upscale_factor: 4.0
   account:
@@ -135,12 +135,15 @@ poster-harness autoposter \
 ## 输出文件
 
 ```text
-runs/<run>/generated/*placeholder-layout.png      # 生图模型生成的占位符海报
+runs/<run>/generated/*placeholder-layout-native.png # 生图模型原生输出
+runs/<run>/generated/*placeholder-layout.png      # 4× 高清占位符海报
 runs/<run>/exports/*realfigures.png               # 替换真实论文图片后的海报
 runs/<run>/exports/*realfigures-4x.png            # 4× 放大版
 runs/<run>/qa/*.qa.yaml                           # QA 结果
 runs/<run>/run_manifest.yaml                      # 运行记录
 ```
+
+默认会生成 3 个候选模板，并只导出通过严格占位符 QA 的版本。
 
 ## 占位符规则
 

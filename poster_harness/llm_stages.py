@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 
 from PIL import Image
 
+from .latex_utils import clean_latex_inline, extract_latex_braced
 from .llm import ChatGPTAccountResponsesProvider
 from .prompt import INTERNAL_DEFAULTS, sanitize_public_text
 from .schemas import (
@@ -247,9 +248,9 @@ def _compose_prompt(*, header: str, instructions: Sequence[str], context: Mappin
 
 
 def _guess_title(text: str) -> str:
-    latex_title = _extract_latex_command(text, "title")
+    latex_title = extract_latex_braced(text, "title")
     if latex_title:
-        cleaned = _clean_source_markup(latex_title)
+        cleaned = clean_latex_inline(latex_title)
         if 12 <= len(cleaned) <= 240:
             return cleaned
     for line in text.splitlines():
@@ -260,64 +261,22 @@ def _guess_title(text: str) -> str:
             continue
         if line.startswith("#"):
             line = line.lstrip("#").strip()
-        line = _clean_source_markup(line)
+        line = clean_latex_inline(line)
         if 12 <= len(line) <= 180:
             return line
     return "Untitled Scientific Poster"
 
 
 def _guess_abstract(text: str) -> str:
-    latex_abstract = _extract_latex_command(text, "abstract")
+    latex_abstract = extract_latex_braced(text, "abstract")
     if latex_abstract:
-        return _clean_source_markup(latex_abstract)[:700]
+        return clean_latex_inline(latex_abstract)[:700]
     lowered = text.lower()
     idx = lowered.find("abstract")
     snippet = text[idx : idx + 1800] if idx >= 0 else text[:1800]
     snippet = re.sub(r"\s+", " ", snippet).strip()
     sentences = re.split(r"(?<=[.!?])\s+", snippet)
-    return _clean_source_markup(" ".join(sentences[:2]))[:700]
-
-
-def _extract_latex_command(text: str, command: str) -> str:
-    marker = f"\\{command}"
-    index = text.find(marker)
-    if index < 0:
-        return ""
-    brace = text.find("{", index + len(marker))
-    if brace < 0:
-        return ""
-    depth = 0
-    start = brace + 1
-    for pos in range(brace, len(text)):
-        char = text[pos]
-        if char == "{" and (pos == 0 or text[pos - 1] != "\\"):
-            depth += 1
-        elif char == "}" and (pos == 0 or text[pos - 1] != "\\"):
-            depth -= 1
-            if depth == 0:
-                return text[start:pos]
-    return ""
-
-
-def _clean_source_markup(text: str) -> str:
-    text = re.sub(r"\\texorpdfstring\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}\{([^{}]*)\}", r"\2", text)
-    replacements = {
-        r"\sqrt{s}": "sqrt(s)",
-        r"\TeV": "TeV",
-        r"\GeV": "GeV",
-        r"\fbinv": "fb^-1",
-        r"\PGm": "mu",
-        r"\Pgm": "mu",
-        r"\CL": "CL",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    text = re.sub(r"~+", " ", text)
-    text = re.sub(r"\$+", "", text)
-    text = re.sub(r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])?", "", text)
-    text = text.replace("{", "").replace("}", "")
-    text = re.sub(r"\s+", " ", text).strip(" .\n\t")
-    return text.strip()
+    return clean_latex_inline(" ".join(sentences[:2]))[:700]
 
 
 def _truncate(text: str, limit: int) -> str:
