@@ -25,7 +25,7 @@ from .config import (
 from .extract import extract_pdf_images, extract_text, extract_pptx_media, render_pdf_pages
 from .latex_utils import clean_latex_inline, extract_latex_braced
 from .prompt import build_prompt, sanitize_public_text
-from .replace import audit_generated_placeholder_geometry, normalize_placeholder_geometry, replace_placeholders, upscale_image
+from .replace import audit_generated_placeholder_geometry, audit_figure_containment, normalize_placeholder_geometry, replace_placeholders, upscale_image
 from .image_backend import generate_images_from_config
 from .llm import ChatGPTAccountResponsesProvider
 from .llm_stages import (
@@ -306,7 +306,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
     if resolution:
         arxiv_bundle = download_arxiv_bundle(resolution, out_dir=dirs["input"] / "arxiv", config=config)
         paper = arxiv_bundle.pdf_path
-        text_source = Path(text_source_arg) if text_source_arg else arxiv_bundle.main_tex
+        text_source = Path(text_source_arg) if text_source_arg else (arxiv_bundle.main_tex or arxiv_bundle.pdf_path)
         source_roots.extend(arxiv_bundle.asset_roots)
     else:
         if not paper_arg:
@@ -413,7 +413,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         "arxiv_bundle": {
             "metadata": str(arxiv_bundle.metadata_path),
             "source_dir": str(arxiv_bundle.source_dir),
-            "main_tex": str(arxiv_bundle.main_tex),
+            "main_tex": str(arxiv_bundle.main_tex) if arxiv_bundle.main_tex else "",
         } if arxiv_bundle else {},
         "text_source": str(text_source),
         "source_roots": [str(p) for p in source_roots],
@@ -526,13 +526,29 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         # placeholder layer; this avoids white normalized boxes that do not align
         # with the model's original card art.
         replacement_base_path = Path(image_path)
-        replace_placeholders(
-            base_image=replacement_base_path,
-            spec=spec_with_placements,
-            asset_dir=dirs["assets"],
-            out_path=export_path,
-        )
-        run_manifest["exports"].append(str(export_path))
+        try:
+            replace_placeholders(
+                base_image=replacement_base_path,
+                spec=spec_with_placements,
+                asset_dir=dirs["assets"],
+                out_path=export_path,
+            )
+        except Exception as exc:
+            placeholder_failures.append(
+                f"{image_path}: failed deterministic replacement; {exc}"
+            )
+            continue
+        # Run deterministic containment audit on the replacement plan.
+        containment_issues = audit_figure_containment(spec=spec_with_placements)
+        if containment_issues:
+            containment_path = dirs["qa"] / f"{stem}.containment.qa.yaml"
+            dump_config({"passes": False, "issues": containment_issues}, containment_path)
+            run_manifest["qa"].append(str(containment_path))
+            placeholder_failures.append(
+                f"{image_path}: failed deterministic figure containment QA; see {containment_path}"
+            )
+            continue
+        candidate_exports = [str(export_path)]
         qa_image = export_path
         upscale_factor = float(_opt(args.upscale_factor, config, "image_generation.upscale_factor", 4.0) or 0)
         if upscale_factor and upscale_factor > 1:
@@ -547,14 +563,20 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
                 extra_scale = upscale_factor / max(1.0, generated_scale)
                 upscaled_base_path = dirs["generated"] / f"{stem}-production-base-{int(upscale_factor)}x.png"
                 upscale_image(replacement_base_path, upscaled_base_path, factor=extra_scale)
-                replace_placeholders(
-                    base_image=upscaled_base_path,
-                    spec=spec_with_placements,
-                    asset_dir=dirs["assets"],
-                    out_path=upscaled_path,
-                    scale=extra_scale,
-                )
-            run_manifest["exports"].append(str(upscaled_path))
+                try:
+                    replace_placeholders(
+                        base_image=upscaled_base_path,
+                        spec=spec_with_placements,
+                        asset_dir=dirs["assets"],
+                        out_path=upscaled_path,
+                        scale=extra_scale,
+                    )
+                except Exception as exc:
+                    placeholder_failures.append(
+                        f"{image_path}: failed deterministic high-resolution replacement; {exc}"
+                    )
+                    continue
+            candidate_exports.append(str(upscaled_path))
             qa_image = upscaled_path
 
         qa_envelope = qa_poster(
@@ -569,12 +591,23 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         qa_path = dirs["qa"] / f"{stem}.final.qa.yaml"
         dump_config(qa_result, qa_path)
         run_manifest["qa"].append(str(qa_path))
+        if not bool(qa_result.get("passes")):
+            for failed_export in candidate_exports:
+                try:
+                    Path(failed_export).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            placeholder_failures.append(
+                f"{export_path}: failed strict final QA; see {qa_path}"
+            )
+            continue
+        run_manifest["exports"].extend(candidate_exports)
 
     if not run_manifest["exports"]:
         run_manifest_path = root / "run_manifest.yaml"
         dump_config(run_manifest, run_manifest_path)
         detail = "; ".join(placeholder_failures) if placeholder_failures else "no exportable generated image"
-        raise RuntimeError(f"autoposter: no generated poster passed strict placeholder QA ({detail})")
+        raise RuntimeError(f"autoposter: no generated poster passed strict QA ({detail})")
 
     run_manifest_path = root / "run_manifest.yaml"
     dump_config(run_manifest, run_manifest_path)
@@ -870,8 +903,11 @@ def _style_preset(name: str, config: Mapping[str, Any] | None = None) -> tuple[d
                 "summary": "premium high-energy-physics conference poster, CERN/LHCC-inspired, CMS-style detector aesthetic, luminous beamline abstraction, artistic but readable; not a collage",
                 "aspect": "A0 vertical / 2:3 ratio",
                 "top_band": "dark navy title band with identity area on left and abstract detector/beam art on right",
-                "body_layout": "five major modules on a pale scientific background with one dominant key-result figure card that preserves source aspect",
-                "color_grammar": "primary result = CMS blue; secondary interpretation = magenta/purple; limits/results = gold and black accents",
+                "body_layout": "five major modules on a pale scientific background with one dominant warm-white key-result figure card that preserves source aspect",
+                "color_grammar": "primary result = CMS blue; secondary interpretation = magenta/purple; limits/results = restrained gold and black accents; every plot/diagram surface remains warm-white or very pale neutral",
+                "typography": "CMS/CERN editorial sans-serif: bold condensed title, clear numbered module headers, dark readable body text on light cards, compact bullets.",
+                "color_palette": "Deep navy/indigo outer atmosphere with CMS cobalt blue, violet/magenta accents, restrained amber/gold highlights, and warm-white/pearl figure cards.",
+                "figure_surface": "All scientific figure areas must use warm-white or pearl card interiors; dark colors may frame figures but must not fill plot-containing blocks.",
             },
             {
                 "decorative_art_constraints": [
@@ -897,8 +933,11 @@ def _style_preset(name: str, config: Mapping[str, Any] | None = None) -> tuple[d
             "summary": "premium CERN/LHCC-inspired scientific poster, modern editorial HEP design, artistic but readable, not a collage",
             "aspect": "A0 vertical / 2:3 ratio",
             "top_band": "strong title banner with concise identity text and abstract scientific artwork",
-            "body_layout": "4-6 large numbered modules with one dominant result region, generous gutters, and varied card shapes",
-            "color_grammar": "one primary accent color for headline results and one secondary accent color for contrasts",
+            "body_layout": "4-6 large numbered modules with one dominant result region, generous gutters, varied card shapes, and light paper-like figure cards",
+            "color_grammar": "one primary accent color for headline results and one secondary accent color for contrasts; all figure surfaces remain warm-white or very pale neutral",
+            "typography": "Modern editorial sans-serif with bold title, crisp section headers, compact readable bullets, and a disciplined type scale.",
+            "color_palette": "Deep indigo or graphite atmosphere, cobalt/cyan primary accents, violet/magenta secondary accents, restrained amber/gold highlights, and warm-white content/figure cards.",
+            "figure_surface": "Every scientific figure placeholder must live on a warm-white, pearl, or very pale neutral card/mat; never on a dark content block.",
         },
         {
             "decorative_art_constraints": [

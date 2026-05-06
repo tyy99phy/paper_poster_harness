@@ -16,9 +16,13 @@ from .config import cfg_get
 
 CHATGPT_CODEX_RESPONSES_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_IMAGE_INSTRUCTIONS = (
-    "You are a visual artist. Render the user's image request using the image_generation tool. "
-    "Honor aspect ratio, composition, and all scientific placeholder constraints stated in the prompt. "
-    "If the prompt gives placeholder geometry, prioritize that geometry over decorative layout choices."
+    "You are a visual artist creating a premium scientific conference poster. "
+    "Render the user's image request using the image_generation tool. "
+    "Create a beautiful, editorial-quality design with strong visual hierarchy and artistic polish. "
+    "The one non-negotiable requirement: scientific figure areas must be rendered as blank placeholder rectangles "
+    "with [FIG NN] labels, never as real or fake data. "
+    "Figure-containing cards must use light neutral paper-like surfaces; dark cinematic colors may frame or surround them "
+    "but must not fill the chart/plot blocks. Beyond that, use full creative freedom."
 )
 CODEX_VALID_SIZES = {"1024x1024", "1536x1024", "1024x1536", "auto"}
 CODEX_VALID_QUALITIES = {"low", "medium", "high"}

@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -152,6 +153,8 @@ class ChatGPTAccountResponsesProvider:
     min_token_seconds: int = 60
     proxy: str | None = None
     default_image_detail: str = "high"
+    max_retries: int = 2
+    retry_delay_s: float = 3.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -287,15 +290,33 @@ class ChatGPTAccountResponsesProvider:
         if proxy:
             handlers.append(request.ProxyHandler({"http": proxy, "https": proxy}))
         opener = request.build_opener(*handlers)
-        try:
-            with opener.open(req, timeout=self.timeout) as resp:
-                events = list(iter_sse_events(resp))
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-        except error.URLError as exc:
-            raise RuntimeError(f"network error: {exc}") from exc
-        return response_payload_from_sse_events(events)
+        last_exc: Exception | None = None
+        for attempt in range(max(0, int(self.max_retries)) + 1):
+            try:
+                with opener.open(req, timeout=self.timeout) as resp:
+                    events = list(iter_sse_events(resp))
+                return response_payload_from_sse_events(events)
+            except error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                last_exc = RuntimeError(f"HTTP {exc.code}: {detail}")
+                # 4xx errors are normally quota/auth/schema failures and should
+                # remain strict instead of being hidden by repeated retries.
+                if exc.code < 500 and exc.code not in {408, 409, 425, 429}:
+                    raise last_exc from exc
+            except error.URLError as exc:
+                last_exc = RuntimeError(f"network error: {exc}")
+            except (ConnectionResetError, TimeoutError, OSError) as exc:
+                last_exc = RuntimeError(f"network error: {exc}")
+            except RuntimeError as exc:
+                # The SSE stream can fail transiently (for example connection
+                # resets or incomplete reads surfaced by the shared SSE parser).
+                last_exc = exc
+            if attempt < max(0, int(self.max_retries)):
+                time.sleep(float(self.retry_delay_s) * (attempt + 1))
+                continue
+            assert last_exc is not None
+            raise last_exc
+        raise RuntimeError("Responses request failed without a captured exception")
 
 
 def response_payload_from_sse_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

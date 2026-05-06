@@ -29,7 +29,7 @@ class ArxivDownload:
     pdf_path: Path
     eprint_path: Path
     source_dir: Path
-    main_tex: Path
+    main_tex: Path | None
     asset_roots: list[Path]
     metadata_path: Path
 
@@ -139,7 +139,7 @@ def download_arxiv_bundle(
     metadata_path = out / "arxiv_resolution.json"
 
     if cfg_get(dict(config), "arxiv.download_pdf", True):
-        download_url(pdf_url, pdf_path)
+        download_arxiv_pdf(pdf_url, pdf_path, arxiv_id=arxiv_id)
     else:
         raise RuntimeError("arxiv.download_pdf=false is incompatible with strict autoposter")
 
@@ -161,7 +161,7 @@ def download_arxiv_bundle(
             "pdf_path": str(pdf_path),
             "eprint_path": str(eprint_path),
             "source_dir": str(source_dir),
-            "main_tex": str(main_tex),
+            "main_tex": str(main_tex) if main_tex else "",
             "asset_roots": [str(path) for path in asset_roots],
         }
     )
@@ -196,6 +196,51 @@ def download_url(
     if path.stat().st_size == 0:
         raise RuntimeError(f"downloaded empty file from {url}")
     return path
+
+
+def download_arxiv_pdf(url: str, dest: str | Path, *, arxiv_id: str, timeout: int = 180) -> Path:
+    """Download and validate an arXiv PDF.
+
+    arXiv occasionally returns a truncated PDF-looking response rather than HTML
+    or an empty file.  PyMuPDF then fails later with "Invalid number of pages".
+    Strict mode should reject that corrupt download immediately and retry known
+    arXiv PDF endpoints, not continue with a broken paper input.
+    """
+    candidates = [
+        url,
+        f"https://arxiv.org/pdf/{arxiv_id}",
+        f"https://export.arxiv.org/pdf/{arxiv_id}",
+    ]
+    seen: set[str] = set()
+    errors: list[str] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            path = download_url(candidate, dest, timeout=timeout)
+            _validate_pdf_file(path)
+            return path
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+    raise RuntimeError(f"failed to download a valid arXiv PDF for {arxiv_id}: {'; '.join(errors)}")
+
+
+def _validate_pdf_file(path: str | Path) -> None:
+    p = Path(path)
+    head = p.read_bytes()[:16]
+    if not head.lstrip().startswith(b"%PDF-"):
+        raise RuntimeError(f"downloaded file is not a PDF: {p}")
+    try:
+        import fitz  # type: ignore
+
+        doc = fitz.open(p)
+        page_count = doc.page_count
+        doc.close()
+    except Exception as exc:
+        raise RuntimeError(f"downloaded PDF is not readable: {p}: {exc}") from exc
+    if page_count < 1:
+        raise RuntimeError(f"downloaded PDF has no pages: {p}")
 
 
 def _validate_download_url(url: str, *, allowed_hosts: Sequence[str]) -> None:
@@ -263,6 +308,18 @@ def extract_arxiv_source(eprint_path: str | Path, out_dir: str | Path) -> Path:
             safe_extract_tar(tf, out)
         return out
     data = src.read_bytes()
+    if data.lstrip().startswith(b"%PDF-"):
+        # Some arXiv records expose the PDF itself through the e-print/source
+        # endpoint (for example when TeX source is unavailable).  This is still
+        # a valid arXiv response, not a corrupt download.  Keep a marker and let
+        # the strict autoposter continue using the downloaded PDF plus PDF image
+        # extraction as the real-asset source.
+        (out / "SOURCE_IS_PDF.txt").write_text(
+            f"arXiv source endpoint returned a PDF for {src.name}; no TeX source archive was available.\n",
+            encoding="utf-8",
+        )
+        shutil.copy2(src, out / "source.pdf")
+        return out
     try:
         data = gzip.decompress(data)
     except Exception:
@@ -282,11 +339,11 @@ def safe_extract_tar(tf: tarfile.TarFile, out_dir: Path) -> None:
     tf.extractall(out_dir)
 
 
-def find_main_tex(source_dir: str | Path) -> Path:
+def find_main_tex(source_dir: str | Path) -> Path | None:
     source = Path(source_dir)
     tex_files = sorted(p for p in source.rglob("*.tex") if p.is_file())
     if not tex_files:
-        raise RuntimeError(f"No .tex files found in arXiv source directory: {source}")
+        return None
     scored: list[tuple[int, Path]] = []
     for path in tex_files:
         try:
@@ -307,10 +364,10 @@ def find_main_tex(source_dir: str | Path) -> Path:
         score += min(len(text) // 1000, 50)
         scored.append((score, path))
     if not scored:
-        raise RuntimeError(f"Could not read candidate .tex files in {source}")
+        return None
     scored.sort(key=lambda item: item[0], reverse=True)
     if scored[0][0] < 100:
-        raise RuntimeError(f"No convincing main TeX file found in {source}")
+        return None
     return scored[0][1]
 
 
@@ -331,6 +388,4 @@ def find_source_asset_roots(source_dir: str | Path, configured_names: Sequence[s
         if resolved not in seen:
             seen.add(resolved)
             deduped.append(root)
-    if not deduped:
-        raise RuntimeError(f"No source asset roots found in arXiv source directory: {source}")
     return deduped

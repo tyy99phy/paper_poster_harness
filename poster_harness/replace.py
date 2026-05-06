@@ -25,7 +25,18 @@ def replace_placeholders(
     mapping = spec.get('placements') or {}
     placeholders = {p['id']: p for p in spec.get('placeholders', [])}
     clear_mapping = spec.get('_replacement_clear_boxes') or {}
-    render_items: list[tuple[str, Path | None, tuple[int, int, int, int], tuple[int, int, int, int] | None]] = []
+    erase_mapping = spec.get('_replacement_erase_boxes') or {}
+    frame_mapping = spec.get('_replacement_frame_boxes') or {}
+    render_items: list[
+        tuple[
+            str,
+            Path | None,
+            tuple[int, int, int, int],
+            tuple[int, int, int, int],
+            tuple[int, int, int, int],
+            tuple[int, int, int, int],
+        ]
+    ] = []
 
     for fig_id, box in mapping.items():
         ph = placeholders.get(fig_id, {})
@@ -33,11 +44,12 @@ def replace_placeholders(
         if not asset:
             continue
         x0, y0, x1, y1 = [int(round(v * scale)) for v in box]
-        bleed = int(max(2, 3 * scale))
-        x0 = max(0, x0 - bleed)
-        y0 = max(0, y0 - bleed)
-        x1 = min(canvas.width, x1 + bleed)
-        y1 = min(canvas.height, y1 + bleed)
+        x0 = max(0, min(canvas.width, x0))
+        y0 = max(0, min(canvas.height, y0))
+        x1 = max(0, min(canvas.width, x1))
+        y1 = max(0, min(canvas.height, y1))
+        if x1 <= x0 or y1 <= y0:
+            continue
         clear_box = None
         if fig_id in clear_mapping:
             try:
@@ -50,19 +62,48 @@ def replace_placeholders(
                 )
             except Exception:
                 clear_box = None
-        render_items.append((str(fig_id), assets / asset, (x0, y0, x1, y1), clear_box))
+        has_clear_box = bool(clear_box and clear_box[2] > clear_box[0] and clear_box[3] > clear_box[1])
+        if has_clear_box and not _is_contained((x0, y0, x1, y1), clear_box, margin=0):
+            raise ValueError(
+                f"{fig_id} target box {[x0, y0, x1, y1]} is not fully contained by "
+                f"its detected placeholder boundary {list(clear_box)}"
+            )
+        # The cleanup/final-frame rectangle is the hard visual envelope for the
+        # replacement.  Do not run outward border scans or pad outward at export
+        # time: they can mistake nearby section/card borders for placeholder
+        # borders, and even a tiny downward pad can intrude into a neighboring
+        # conclusion strip on dense posters.
+        cleanup_box = clear_box if has_clear_box else (x0, y0, x1, y1)
+        erase_box = _read_optional_box(
+            erase_mapping,
+            str(fig_id),
+            scale=scale,
+            canvas_size=canvas.size,
+        ) or _default_erase_box(cleanup_box, ph, canvas.size, scale=scale)
+        frame_box = _read_optional_box(
+            frame_mapping,
+            str(fig_id),
+            scale=scale,
+            canvas_size=canvas.size,
+        ) or cleanup_box
+        if not _is_contained((x0, y0, x1, y1), frame_box, margin=0):
+            frame_box = _union_box(frame_box, (x0, y0, x1, y1))
+            frame_box = _clamp_box(frame_box, canvas.size)
+        render_items.append((str(fig_id), assets / asset, (x0, y0, x1, y1), cleanup_box, erase_box, frame_box))
+
+    _validate_render_plan(render_items, canvas_size=canvas.size)
 
     if not dry_run:
-        for _, _, _, clear_box in render_items:
-            if clear_box and clear_box[2] > clear_box[0] and clear_box[3] > clear_box[1]:
-                _clear_replacement_region(canvas, clear_box)
+        for _, _, _, _, erase_box, frame_box in render_items:
+            _erase_final_placeholder_region(canvas, erase_box)
+            _draw_final_figure_frame(canvas, frame_box)
 
-    for fig_id, asset_path, box, _ in render_items:
+    for fig_id, asset_path, box, _, _, _ in render_items:
         if dry_run:
             _draw_debug_box(canvas, box, fig_id)
             continue
         assert asset_path is not None
-        paste_fit(canvas, asset_path, box, pad=int(max(2, 4 * scale)))
+        paste_fit(canvas, asset_path, box, pad=0)
 
 
     for overlay in spec.get('text_overlays', []):
@@ -77,12 +118,9 @@ def replace_placeholders(
 def paste_fit(canvas: Image.Image, asset_path: Path, box: tuple[int, int, int, int], pad: int = 4) -> None:
     x0, y0, x1, y1 = box
     w, h = x1 - x0, y1 - y0
-    # First clear the whole target rectangle.  The placeholder artwork uses
-    # dashed borders; a rounded alpha panel alone can leave those dashes visible
-    # in transparent corners after replacement.
+    # The outer cleanup/final frame is drawn before this call.  Here we only
+    # clear the exact image target and paste the contained scientific figure.
     canvas.paste(Image.new("RGB", (w, h), (255, 255, 255)), (x0, y0))
-    panel = _panel((w, h), radius=max(4, min(w, h)//18))
-    canvas.paste(panel.convert('RGB'), (x0, y0), panel.split()[-1])
     im = Image.open(asset_path).convert('RGBA')
     im = _trim_uniform_border(im)
     thumb = ImageOps.contain(im, (max(1, w - 2*pad), max(1, h - 2*pad)), Image.Resampling.LANCZOS)
@@ -95,6 +133,195 @@ def _clear_replacement_region(canvas: Image.Image, box: tuple[int, int, int, int
     x0, y0, x1, y1 = box
     w, h = max(1, x1 - x0), max(1, y1 - y0)
     canvas.paste(Image.new("RGB", (w, h), (255, 255, 255)), (x0, y0))
+
+
+def _read_optional_box(
+    mapping: Any,
+    fig_id: str,
+    *,
+    scale: float,
+    canvas_size: tuple[int, int],
+) -> tuple[int, int, int, int] | None:
+    if not isinstance(mapping, dict) or fig_id not in mapping:
+        return None
+    try:
+        x0, y0, x1, y1 = [int(round(float(v) * scale)) for v in mapping[fig_id]]
+    except Exception:
+        return None
+    box = (
+        max(0, min(canvas_size[0], x0)),
+        max(0, min(canvas_size[1], y0)),
+        max(0, min(canvas_size[0], x1)),
+        max(0, min(canvas_size[1], y1)),
+    )
+    return box if box[2] > box[0] and box[3] > box[1] else None
+
+
+def _default_erase_box(
+    cleanup_box: tuple[int, int, int, int],
+    ph: dict[str, Any],
+    canvas_size: tuple[int, int],
+    *,
+    scale: float,
+) -> tuple[int, int, int, int]:
+    visual_scale = max(float(scale), canvas_size[0] / 1024.0, canvas_size[1] / 1536.0)
+    pad = int(round(6 * visual_scale))
+    if _is_lower_hero_placeholder(
+        ph,
+        _parse_placeholder_aspect(str(ph.get("aspect") or "")) or 1.0,
+        cleanup_box,
+        canvas_size,
+    ):
+        # Never erase downward into a bottom conclusion strip.  The lower-hero
+        # planner supplies a custom erase box when it needs to remove old top
+        # placeholder text.
+        x0, y0, x1, y1 = cleanup_box
+        return _clamp_box((x0 - pad, y0 - pad, x1 + pad, y1), canvas_size)
+    return _pad_box(cleanup_box, pad, canvas_size)
+
+
+def _erase_final_placeholder_region(canvas: Image.Image, box: tuple[int, int, int, int]) -> None:
+    """Erase old placeholder text/dashes without drawing a visible final frame."""
+    x0, y0, x1, y1 = box
+    w, h = max(1, x1 - x0), max(1, y1 - y0)
+    # This is an eraser, not the final visible frame.  Use a full rectangular
+    # clear so antialiased dashed placeholder strokes just outside/at the
+    # detected edge cannot survive in the rounded-corner cutouts of the final
+    # publication frame.
+    canvas.paste(Image.new("RGB", (w, h), (255, 255, 255)), (x0, y0))
+
+
+def _validate_render_plan(
+    items: list[
+        tuple[
+            str,
+            Path | None,
+            tuple[int, int, int, int],
+            tuple[int, int, int, int],
+            tuple[int, int, int, int],
+            tuple[int, int, int, int],
+        ]
+    ],
+    *,
+    canvas_size: tuple[int, int] | None = None,
+) -> None:
+    """Reject unsafe replacement plans instead of silently deforming figures.
+
+    Replacement is a deterministic production stage, not a layout engine.  If
+    two figure targets overlap, shrinking one of them after the fact produces
+    unreadable "stickers" and can hide scientific content.  The correct strict
+    behavior is to reject the generated/detected geometry so the pipeline can
+    choose another variant or report a real error.
+    """
+    for fig_id, _asset, target, cleanup, _erase, _frame in items:
+        if not _is_contained(target, cleanup, margin=0):
+            raise ValueError(
+                f"{fig_id} target box {list(target)} is not fully contained by "
+                f"its placeholder cleanup box {list(cleanup)}"
+            )
+        if canvas_size is not None:
+            margin_x = max(4, int(round(canvas_size[0] * 0.015)))
+            margin_y = max(4, int(round(canvas_size[1] * 0.010)))
+            if (
+                target[0] < margin_x
+                or cleanup[0] < margin_x
+                or target[1] < margin_y
+                or cleanup[1] < margin_y
+                or target[2] > canvas_size[0] - margin_x
+                or cleanup[2] > canvas_size[0] - margin_x
+                or target[3] > canvas_size[1] - margin_y
+                or cleanup[3] > canvas_size[1] - margin_y
+            ):
+                raise ValueError(
+                    f"{fig_id} replacement box target={list(target)} cleanup={list(cleanup)} "
+                    f"is too close to the canvas edge; leave a safe poster gutter"
+                )
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            id_i, _asset_i, box_i, _cleanup_i, _erase_i, _frame_i = items[i]
+            id_j, _asset_j, box_j, _cleanup_j, _erase_j, _frame_j = items[j]
+            overlap = _box_overlap(box_i, box_j)
+            if overlap <= 0:
+                continue
+            min_area = max(1, min(_box_area(box_i), _box_area(box_j)))
+            ratio = overlap / min_area
+            if ratio > 0.03:
+                raise ValueError(
+                    f"{id_i} target box {list(box_i)} overlaps {id_j} "
+                    f"target box {list(box_j)} by {ratio:.1%} of the smaller figure"
+                )
+
+
+def _box_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
+    """Return overlap area in pixels, or 0 if no overlap."""
+    ox0 = max(a[0], b[0])
+    oy0 = max(a[1], b[1])
+    ox1 = min(a[2], b[2])
+    oy1 = min(a[3], b[3])
+    if ox1 <= ox0 or oy1 <= oy0:
+        return 0
+    return (ox1 - ox0) * (oy1 - oy0)
+
+
+def _enforce_containment(
+    box: tuple[int, int, int, int],
+    container: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int]:
+    """Ensure ``box`` is strictly inside ``container``, preserving ratio.
+
+    If ``box`` already fits, return it unchanged.  Otherwise, fit the largest
+    ratio-correct rectangle inside ``container`` centered on ``box``'s center.
+    """
+    if _is_contained(box, container):
+        return box
+    return _fit_box_to_ratio_inside(container, ratio)
+
+
+def _is_contained(
+    inner: tuple[int, int, int, int],
+    outer: tuple[int, int, int, int],
+    margin: int = 2,
+) -> bool:
+    """Check if ``inner`` is strictly inside ``outer`` with a small margin."""
+    return (
+        inner[0] >= outer[0] + margin
+        and inner[1] >= outer[1] + margin
+        and inner[2] <= outer[2] - margin
+        and inner[3] <= outer[3] - margin
+    )
+
+
+def _draw_final_figure_frame(canvas: Image.Image, box: tuple[int, int, int, int]) -> None:
+    """Replace placeholder styling with a clean final figure panel.
+
+    This deliberately uses a solid, publication-style frame rather than dashed
+    placeholder cues.  It is drawn inside the cleanup box only; the real figure
+    itself is pasted later into its stricter contained placement box.
+    """
+    x0, y0, x1, y1 = box
+    w, h = max(1, x1 - x0), max(1, y1 - y0)
+    overlay = Image.new("RGBA", (w, h), (255, 255, 255, 255))
+    d = ImageDraw.Draw(overlay)
+    radius = max(4, min(22, min(w, h) // 18))
+    # A light solid frame gives the replacement a finished look and covers
+    # dashed placeholder borders without extending the pasted figure.
+    d.rounded_rectangle(
+        [0, 0, w - 1, h - 1],
+        radius=radius,
+        fill=(255, 255, 255, 255),
+        outline=(188, 198, 215, 255),
+        width=max(1, min(3, min(w, h) // 180)),
+    )
+    inset = max(2, min(8, min(w, h) // 45))
+    if w > inset * 2 + 2 and h > inset * 2 + 2:
+        d.rounded_rectangle(
+            [inset, inset, w - inset - 1, h - inset - 1],
+            radius=max(2, radius - inset),
+            outline=(232, 236, 244, 255),
+            width=1,
+        )
+    canvas.paste(overlay.convert("RGB"), (x0, y0), overlay.split()[-1])
 
 
 def normalize_placeholder_geometry(
@@ -118,6 +345,8 @@ def normalize_placeholder_geometry(
     placeholders = {str(p.get("id")): p for p in updated.get("placeholders", [])}
     new_placements: dict[str, list[int]] = {}
     clear_boxes: dict[str, list[int]] = {}
+    erase_boxes: dict[str, list[int]] = {}
+    frame_boxes: dict[str, list[int]] = {}
     draw_plans: list[tuple[str, str, str, tuple[int, int, int, int], tuple[int, int, int, int]]] = []
 
     for fig_id, raw_box in placements.items():
@@ -134,17 +363,109 @@ def normalize_placeholder_geometry(
         original_box = (x0, y0, x1, y1)
         label = str(ph.get("label") or fig_id)
         source_box = _find_enclosing_placeholder_panel(canvas, original_box, ratio) or original_box
-        min_size = _minimum_placeholder_size(ratio, label=label)
-        box = _fit_box_to_ratio(source_box, ratio, min_size=min_size, canvas_size=canvas.size)
-        box = _shrink_to_avoid_busy_overlap(canvas, box, source_box, ratio)
-        clear_box = _pad_box(_union_box(source_box, box), 4, canvas.size)
+        source_box = _repair_edge_wide_source_box(source_box, original_box, ratio, canvas.size)
+        source_box = _enforce_canvas_gutter(source_box, canvas.size)
+        raw_source_box = source_box
+        source_box = _constrain_lower_hero_placeholder_box(source_box, ratio, ph, canvas.size)
+        lower_hero = _is_lower_hero_placeholder(ph, ratio, source_box, canvas.size)
+        if redraw:
+            min_size = _minimum_placeholder_size(ratio, label=label)
+            box = _fit_box_to_ratio(source_box, ratio, min_size=min_size, canvas_size=canvas.size)
+            box = _shrink_to_avoid_busy_overlap(canvas, box, source_box, ratio)
+            clear_box = _pad_box(_union_box(source_box, box), 4, canvas.size)
+        else:
+            # Hidden production planning must not move the final real figure
+            # outside the original generated placeholder.  Maximize overlap by
+            # taking the largest ratio-correct rectangle that fits *inside* the
+            # visible placeholder panel.  Then enforce strict containment so
+            # the pasted figure never protrudes beyond the dashed border.
+            box = _fit_box_to_ratio_inside(source_box, ratio)
+            box = _enforce_containment(box, source_box, ratio)
+            clear_box = source_box
+            erase_box = _default_erase_box(source_box, ph, canvas.size, scale=scale)
+            frame_box = source_box
+            if lower_hero:
+                # A lower hero comparison/result slot is often adjacent to a
+                # bottom conclusion band.  It still needs enough erase surface
+                # to remove the old dashed placeholder top/label, but the final
+                # visible frame must not grow downward into the next block.
+                erase_box = (
+                    max(0, raw_source_box[0] - int(round((raw_source_box[2] - raw_source_box[0]) * 0.04))),
+                    raw_source_box[1],
+                    min(canvas.size[0], raw_source_box[2] + int(round((raw_source_box[2] - raw_source_box[0]) * 0.04))),
+                    source_box[3],
+                )
+                frame_pad_x = int(round(max(10, (box[2] - box[0]) * 0.025)))
+                frame_box = _clamp_box(
+                    (
+                        box[0] - frame_pad_x,
+                        box[1],
+                        box[2] + frame_pad_x,
+                        box[3],
+                    ),
+                    canvas.size,
+                )
+            if _is_lower_hero_placeholder(ph, ratio, source_box, canvas.size):
+                pad_x = int(round(max(12, (source_box[2] - source_box[0]) * 0.04)))
+                clear_box = (
+                    max(0, clear_box[0] - pad_x),
+                    clear_box[1],
+                    min(canvas.size[0], clear_box[2] + pad_x),
+                    clear_box[3],
+                )
+            # For square result plots, LLM detection often captures a good
+            # ratio-correct seed that is visually just a little too low/right
+            # inside a decorative result block.  Do not expand to the full
+            # decorative dashed panel (that can cover the conclusion block);
+            # instead apply a small top-left nudge while clearing the original
+            # seed area to avoid leftover placeholder text.
+            source_ratio_error = _ratio_relative_error(_box_ratio(source_box), ratio)
+            if source_box == original_box and source_ratio_error <= 0.12:
+                nudged = _nudge_square_result_box(box, ratio, label, canvas.size)
+                if nudged != box:
+                    # Move the final white publication frame with the square
+                    # plot.  Keeping the old lower edge creates a visibly large
+                    # right/bottom white mat and makes the plot look shifted
+                    # up-left; the frame is a visual replacement envelope, not
+                    # a separate eraser.
+                    dx = nudged[0] - box[0]
+                    dy = nudged[1] - box[1]
+                    clear_box = _clamp_box(
+                        (
+                            clear_box[0] + dx,
+                            clear_box[1] + dy,
+                            clear_box[2] + dx,
+                            clear_box[3] + dy,
+                        ),
+                        canvas.size,
+                    )
+                    frame_box = _clamp_box(
+                        (
+                            frame_box[0] + dx,
+                            frame_box[1] + dy,
+                            frame_box[2] + dx,
+                            frame_box[3] + dy,
+                        ),
+                        canvas.size,
+                    )
+                    # Keep erasing the old detected placeholder region as well
+                    # as the nudged frame, otherwise dashed placeholder strokes
+                    # can remain at the original bottom/right edges.
+                    erase_box = _clamp_box(_union_box(erase_box, frame_box), canvas.size)
+                    box = nudged
         draw_plans.append((str(fig_id), label, str(ph.get("aspect") or ""), clear_box, box))
         if scale != 1:
             new_placements[str(fig_id)] = [int(round(v / scale)) for v in box]
             clear_boxes[str(fig_id)] = [int(round(v / scale)) for v in clear_box]
+            if not redraw:
+                erase_boxes[str(fig_id)] = [int(round(v / scale)) for v in erase_box]
+                frame_boxes[str(fig_id)] = [int(round(v / scale)) for v in frame_box]
         else:
             new_placements[str(fig_id)] = list(box)
             clear_boxes[str(fig_id)] = list(clear_box)
+            if not redraw:
+                erase_boxes[str(fig_id)] = list(erase_box)
+                frame_boxes[str(fig_id)] = list(frame_box)
 
     if redraw:
         for fig_id, label, aspect, clear_box, box in draw_plans:
@@ -154,6 +475,10 @@ def normalize_placeholder_geometry(
     updated["placements"] = new_placements or placements
     if clear_boxes:
         updated["_replacement_clear_boxes"] = clear_boxes
+    if erase_boxes:
+        updated["_replacement_erase_boxes"] = erase_boxes
+    if frame_boxes:
+        updated["_replacement_frame_boxes"] = frame_boxes
     if not redraw:
         return Path(base_image), updated
     out = Path(out_path)
@@ -196,22 +521,213 @@ def audit_generated_placeholder_geometry(
         visible_box = _find_enclosing_placeholder_panel(canvas, detected_box, expected) or detected_box
         actual = _box_ratio(visible_box)
         rel_error = _ratio_relative_error(actual, expected)
-        if rel_error > ratio_tolerance:
+        effective_tolerance = _effective_placeholder_ratio_tolerance(expected, ratio_tolerance)
+        if rel_error > effective_tolerance:
             issues.append(
                 {
                     "id": str(fig_id),
                     "expected_ratio": round(expected, 4),
                     "actual_ratio": round(actual, 4),
                     "relative_error": round(rel_error, 4),
+                    "ratio_tolerance": round(effective_tolerance, 4),
                     "detected_box": list(detected_box),
                     "visible_box": list(visible_box),
                     "message": (
                         f"{fig_id} visible placeholder ratio {actual:.2f}:1 does not match "
-                        f"declared ratio {expected:.2f}:1 within {ratio_tolerance:.0%}"
+                        f"declared ratio {expected:.2f}:1 within {effective_tolerance:.0%}"
+                    ),
+                }
+            )
+        if _is_result_like_square_placeholder(ph, expected) and _box_too_large_for_result_square(
+            visible_box,
+            canvas.size,
+        ):
+            side = min(visible_box[2] - visible_box[0], visible_box[3] - visible_box[1])
+            issues.append(
+                {
+                    "id": str(fig_id),
+                    "expected_ratio": round(expected, 4),
+                    "actual_ratio": round(actual, 4),
+                    "relative_size": round(side / max(1, canvas.width), 4),
+                    "size_tolerance": 0.35,
+                    "detected_box": list(detected_box),
+                    "visible_box": list(visible_box),
+                    "message": (
+                        f"{fig_id} square result placeholder is too large "
+                        f"({side / max(1, canvas.width):.0%} of canvas width); "
+                        "strict mode requires a moderate hero figure slot with surrounding breathing room"
+                    ),
+                }
+            )
+        if _is_result_like_square_placeholder(ph, expected) and _box_too_low_for_result_square(
+            visible_box,
+            canvas.size,
+        ):
+            issues.append(
+                {
+                    "id": str(fig_id),
+                    "expected_ratio": round(expected, 4),
+                    "actual_ratio": round(actual, 4),
+                    "bottom_fraction": round(visible_box[3] / max(1, canvas.height), 4),
+                        "bottom_limit": 0.820,
+                    "detected_box": list(detected_box),
+                    "visible_box": list(visible_box),
+                    "message": (
+                        f"{fig_id} square result placeholder sits too low "
+                        f"(bottom at {visible_box[3] / max(1, canvas.height):.0%} of canvas height); "
+                        "strict mode requires a clear gutter above the bottom summary/conclusion modules"
+                    ),
+                }
+            )
+        surface_metrics = _figure_surface_dark_metrics(canvas, visible_box, seed_box=detected_box)
+        if surface_metrics and surface_metrics["dark_fraction"] > 0.55 and surface_metrics["light_fraction"] < 0.30:
+            issues.append(
+                {
+                    "id": str(fig_id),
+                    "category": "figure_surface",
+                    "dark_fraction": round(surface_metrics["dark_fraction"], 4),
+                    "light_fraction": round(surface_metrics["light_fraction"], 4),
+                    "detected_box": list(detected_box),
+                    "visible_box": list(visible_box),
+                    "sample_box": list(surface_metrics["sample_box"]),
+                    "message": (
+                        f"{fig_id} figure-card surface around the placeholder is too dark "
+                        f"({surface_metrics['dark_fraction']:.0%} dark pixels in the immediate mat/card band); "
+                        "strict mode requires plot/diagram placeholders to sit on light paper-like cards, "
+                        "with dark colors used only as outer accents"
                     ),
                 }
             )
     return issues
+
+
+def _is_result_like_square_placeholder(ph: dict[str, Any], ratio: float) -> bool:
+    if not (0.90 <= ratio <= 1.10):
+        return False
+    low = str(ph.get("label") or "").lower()
+    return any(word in low for word in ("limit", "result", "constraint", "upper", "exclusion"))
+
+
+def _box_too_large_for_result_square(
+    box: tuple[int, int, int, int],
+    canvas_size: tuple[int, int],
+    *,
+    max_canvas_width_fraction: float = 0.35,
+) -> bool:
+    side = min(max(1, box[2] - box[0]), max(1, box[3] - box[1]))
+    return side > canvas_size[0] * max_canvas_width_fraction
+
+
+def _box_too_low_for_result_square(
+    box: tuple[int, int, int, int],
+    canvas_size: tuple[int, int],
+    *,
+    max_bottom_fraction: float = 0.820,
+) -> bool:
+    return box[3] > canvas_size[1] * max_bottom_fraction
+
+
+def _figure_surface_dark_metrics(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+    *,
+    seed_box: tuple[int, int, int, int] | None = None,
+) -> dict[str, Any] | None:
+    """Estimate whether the immediate figure-card band is dark.
+
+    A template can satisfy the blank-placeholder rule while placing that slot in
+    a dramatic dark hero block.  Since real CMS/HEP plots commonly have white
+    backgrounds, final replacement then looks like a pasted sticker.  We sample
+    a ring outside the detected placeholder; good figure-card designs keep this
+    ring light and paper-like even when the outer poster background is dark.
+    """
+    x0, y0, x1, y1 = box
+    w = max(1, x1 - x0)
+    h = max(1, y1 - y0)
+    if w < 16 or h < 16:
+        return None
+    if seed_box and _box_area(box) > _box_area(seed_box) * 1.55 and _box_light_fraction(canvas, box) >= 0.70:
+        # The recovered visible box is already the larger light card/mat around
+        # the seed.  Dark artwork outside that complete mat is acceptable.
+        return None
+    pad = int(round(max(12, min(96, min(w, h) * 0.10))))
+    inner_pad = int(round(max(2, min(12, min(w, h) * 0.015))))
+    outer = _pad_box(box, pad, canvas.size)
+    inner = _pad_box(box, inner_pad, canvas.size)
+    if _box_area(outer) <= _box_area(inner):
+        return None
+    pixels = canvas.load()
+    step = max(1, int(round(max(canvas.size) / 1600)))
+    dark = 0
+    light = 0
+    total = 0
+    ox0, oy0, ox1, oy1 = outer
+    ix0, iy0, ix1, iy1 = inner
+    for y in range(oy0, oy1, step):
+        for x in range(ox0, ox1, step):
+            if ix0 <= x < ix1 and iy0 <= y < iy1:
+                continue
+            total += 1
+            pixel = pixels[x, y]
+            if _is_dark_figure_surface_pixel(pixel):
+                dark += 1
+            if _is_light_figure_surface_pixel(pixel):
+                light += 1
+    if total == 0:
+        return None
+    return {
+        "dark_fraction": dark / total,
+        "light_fraction": light / total,
+        "sample_box": outer,
+    }
+
+
+def _is_dark_figure_surface_pixel(pixel: tuple[int, int, int]) -> bool:
+    r, g, b = pixel
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return lum < 135
+
+
+def _is_light_figure_surface_pixel(pixel: tuple[int, int, int]) -> bool:
+    r, g, b = pixel
+    mx, mn = max(pixel), min(pixel)
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return lum >= 205 and (mx - mn) <= 80
+
+
+def _box_light_fraction(canvas: Image.Image, box: tuple[int, int, int, int]) -> float:
+    x0, y0, x1, y1 = _pad_box(box, 0, canvas.size)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    pixels = canvas.load()
+    step = max(1, int(round(max(canvas.size) / 1600)))
+    light = 0
+    total = 0
+    for y in range(y0, y1, step):
+        for x in range(x0, x1, step):
+            total += 1
+            if _is_light_figure_surface_pixel(pixels[x, y]):
+                light += 1
+    return light / total if total else 0.0
+
+
+def _effective_placeholder_ratio_tolerance(expected_ratio: float, base_tolerance: float) -> float:
+    """Aspect-ratio tolerance for generated placeholder QA.
+
+    Wide scientific plots must remain strict because a 2.5:1 placeholder can
+    become unreadable when drawn as a ribbon or generic wide card.  Square
+    result plots are more forgiving: the final scientific image is still pasted
+    as a true square inside the detected panel, and a slightly landscape
+    decorative panel is acceptable as long as it stays close.
+    """
+    base = max(0.0, float(base_tolerance))
+    if 0.92 <= expected_ratio <= 1.08:
+        return max(base, 0.30)
+    if 1.08 < expected_ratio < 1.50:
+        return max(base, 0.25)
+    if expected_ratio >= 2.0:
+        return max(base, 0.30)
+    return base
 
 
 def _parse_placeholder_aspect(aspect: str) -> float | None:
@@ -360,6 +876,64 @@ def _pad_box(box: tuple[int, int, int, int], pad: int, canvas_size: tuple[int, i
     return max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
 
 
+def _enforce_canvas_gutter(
+    box: tuple[int, int, int, int],
+    canvas_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Keep replacement planning away from canvas edges.
+
+    LLM placeholder detection sometimes reports a box that starts at x=0 when
+    the visible placeholder is actually inset inside a section card.  If we use
+    that box directly, pasted paper figures can be clipped at the canvas edge.
+    This deterministic inset preserves strict no-fallback behavior while keeping
+    final scientific figures inside a safe poster gutter.
+    """
+    x0, y0, x1, y1 = box
+    canvas_w, canvas_h = canvas_size
+    margin_x = max(8, min(160, int(round(canvas_w * 0.030))))
+    margin_y = max(8, min(180, int(round(canvas_h * 0.015))))
+    nx0 = max(x0, margin_x)
+    ny0 = max(y0, margin_y)
+    nx1 = min(x1, canvas_w - margin_x)
+    ny1 = min(y1, canvas_h - margin_y)
+    # Do not create a degenerate box.  If a malformed detection is smaller than
+    # the safe gutters, keep the original so later validation rejects it.
+    if nx1 <= nx0 + 8 or ny1 <= ny0 + 8:
+        return box
+    return nx0, ny0, nx1, ny1
+
+
+def _repair_edge_wide_source_box(
+    source_box: tuple[int, int, int, int],
+    original_box: tuple[int, int, int, int],
+    ratio: float,
+    canvas_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Recover vertical extent when a wide edge detection is truncated.
+
+    The LLM sometimes reports a wide placeholder starting at x=0; border
+    recovery then misses the true bottom dashed edge and leaves a visible blank
+    placeholder strip below the pasted figure.  When a wide figure seed touches
+    the canvas edge, keep a conservative vertical envelope around the original
+    detection while the later canvas-gutter step moves the left edge inward.
+    """
+    if ratio < 1.8:
+        return source_box
+    canvas_w, canvas_h = canvas_size
+    edge_margin = max(8, int(round(canvas_w * 0.02)))
+    if source_box[0] > edge_margin and original_box[0] > edge_margin:
+        return source_box
+    ox0, oy0, ox1, oy1 = original_box
+    original_h = max(1, oy1 - oy0)
+    y_pad = int(round(original_h * 0.22))
+    return (
+        min(source_box[0], ox0),
+        max(0, min(source_box[1], oy0 - y_pad)),
+        max(source_box[2], ox1),
+        min(canvas_h, max(source_box[3], oy1 + y_pad)),
+    )
+
+
 def _find_enclosing_placeholder_panel(
     canvas: Image.Image,
     box: tuple[int, int, int, int],
@@ -372,6 +946,30 @@ def _find_enclosing_placeholder_panel(
     enclosing colored placeholder border when one is visible; if it is uncertain
     it returns ``None`` and the caller keeps the LLM box.
     """
+    raw_error = _ratio_relative_error(_box_ratio(box), ratio)
+    if (
+        0.90 <= ratio <= 1.10
+        and raw_error <= _effective_placeholder_ratio_tolerance(ratio, 0.20)
+        and _box_has_placeholder_edge_evidence(canvas, box)
+    ):
+        # For square result placeholders, the vision model often reports the
+        # actual dashed slot accurately enough.  Do not expand such a good seed
+        # to the wider surrounding light result card/mat; the latter is meant to
+        # be decorative surface, not the scientific replacement rectangle.
+        return None
+
+    dashed_panel = _find_dashed_placeholder_panel(canvas, box, ratio)
+    if dashed_panel is not None:
+        return dashed_panel
+
+    light_panel = _find_light_placeholder_panel(canvas, box, ratio)
+    if light_panel is not None:
+        return light_panel
+
+    color_panel = _find_color_consistent_placeholder_panel(canvas, box, ratio)
+    if color_panel is not None:
+        return color_panel
+
     x0, y0, x1, y1 = box
     width, height = max(1, x1 - x0), max(1, y1 - y0)
     cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
@@ -487,9 +1085,610 @@ def _find_enclosing_placeholder_panel(
     raw_error = _ratio_relative_error(_box_ratio(box), ratio)
     panel_error = _ratio_relative_error(_box_ratio(panel), ratio)
     area_growth = _box_area(panel) / max(1, _box_area(box))
+    if 0.90 <= ratio <= 1.10 and area_growth > 1.35:
+        if (
+            panel[1] < y0 - height * 0.18
+            or panel[3] > y1 + height * 0.18
+            or panel[0] < x0 - width * 0.25
+            or panel[2] > x1 + width * 0.25
+        ):
+            return None
     if area_growth > 1.15 and panel_error > raw_error + 0.08:
         return None
     return panel
+
+
+def _find_light_placeholder_panel(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int] | None:
+    """Recover a light placeholder card around a square result seed.
+
+    Some generated result placeholders use a light rounded rectangle with a
+    dashed border on a dark hero card.  Vision detection can lock onto only the
+    central label area, missing the true right edge; border-only detection can
+    also fail when the dashed line is broken by text/glow.  This pass detects
+    the contiguous light placeholder panel so geometry QA can reject landscape
+    or too-low result boxes before replacement.
+    """
+    if not (0.90 <= ratio <= 1.10):
+        return None
+    x0, y0, x1, y1 = box
+    width, height = max(1, x1 - x0), max(1, y1 - y0)
+    cx = (x0 + x1) // 2
+    scale_hint = max(canvas.width / 1024.0, canvas.height / 1536.0, 1.0)
+    pad_x = int(round(max(140 * scale_hint, width * 0.90)))
+    pad_y = int(round(max(90 * scale_hint, height * 0.45)))
+    sx0 = max(0, x0 - pad_x)
+    sx1 = min(canvas.width, x1 + pad_x)
+    sy0 = max(0, y0 - pad_y)
+    sy1 = min(canvas.height, y1 + pad_y)
+    if sx1 <= sx0 + 12 or sy1 <= sy0 + 12:
+        return None
+
+    step = max(2, int(round(scale_hint)))
+    gap = int(round(max(18, 10 * scale_hint)))
+    min_segment = int(round(max(48 * scale_hint, width * 0.18)))
+    rows: list[tuple[int, tuple[int, int], int]] = []
+    pixels = canvas.load()
+    for y in range(sy0, sy1, step):
+        xs: list[int] = []
+        for x in range(sx0, sx1, step):
+            if _is_light_placeholder_pixel(pixels[x, y]):
+                xs.append(x)
+        for segment in _cluster_segments(xs, gap=gap, min_length=min_segment):
+            overlap = min(segment[1], x1) - max(segment[0], x0)
+            if segment[0] <= cx <= segment[1] or overlap >= min_segment * 0.5:
+                rows.append((y, segment, segment[1] - segment[0]))
+    if not rows:
+        return None
+
+    row_gap = max(step * 4, int(round(6 * scale_hint)))
+    clusters: list[list[tuple[int, tuple[int, int], int]]] = []
+    for row in rows:
+        if not clusters or row[0] - clusters[-1][-1][0] > row_gap:
+            clusters.append([row])
+        else:
+            clusters[-1].append(row)
+
+    seed_area = max(1, width * height)
+    candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+    for cluster in clusters:
+        top = cluster[0][0]
+        bottom = min(canvas.height, cluster[-1][0] + step)
+        left = min(item[1][0] for item in cluster)
+        right = max(item[1][1] for item in cluster)
+        if right <= left or bottom <= top:
+            continue
+        panel = _pad_box((left, top, right, bottom), 0, canvas.size)
+        overlap = _box_overlap(panel, box) / seed_area
+        area_ratio = _box_area(panel) / seed_area
+        if overlap < 0.30 or area_ratio < 0.35:
+            continue
+        # Ignore enormous pale section backgrounds; this is only for the figure
+        # placeholder card itself.
+        if area_ratio > 4.0:
+            continue
+        center_penalty = abs(((panel[0] + panel[2]) / 2) - cx) / max(1, width)
+        score = overlap + 0.15 * min(area_ratio, 2.0) - 0.25 * center_penalty
+        candidates.append((score, panel))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _box_has_placeholder_edge_evidence(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+) -> bool:
+    x0, y0, x1, y1 = _pad_box(box, 0, canvas.size)
+    w = max(1, x1 - x0)
+    h = max(1, y1 - y0)
+    if w < 24 or h < 24:
+        return False
+    pixels = canvas.load()
+    tol = max(3, min(18, int(round(min(w, h) * 0.025))))
+    min_h = max(24, int(round(w * 0.18)))
+    min_v = max(24, int(round(h * 0.18)))
+
+    def row_score(y: int) -> int:
+        if y < 0 or y >= canvas.height:
+            return 0
+        return sum(1 for x in range(x0, x1, 2) if _is_placeholder_line_pixel(pixels[x, y])) * 2
+
+    def col_score(x: int) -> int:
+        if x < 0 or x >= canvas.width:
+            return 0
+        return sum(1 for y in range(y0, y1, 2) if _is_placeholder_line_pixel(pixels[x, y])) * 2
+
+    top_ok = max(row_score(y) for y in range(max(0, y0 - tol), min(canvas.height, y0 + tol + 1))) >= min_h
+    bottom_ok = max(row_score(y) for y in range(max(0, y1 - tol), min(canvas.height, y1 + tol + 1))) >= min_h
+    left_ok = max(col_score(x) for x in range(max(0, x0 - tol), min(canvas.width, x0 + tol + 1))) >= min_v
+    right_ok = max(col_score(x) for x in range(max(0, x1 - tol), min(canvas.width, x1 + tol + 1))) >= min_v
+    return (top_ok and bottom_ok) or (left_ok and right_ok)
+
+
+def _find_dashed_placeholder_panel(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int] | None:
+    """Detect neutral/gray dashed placeholder rectangles around a seed box.
+
+    LLM vision can occasionally return the whole surrounding section card
+    instead of the actual dashed placeholder, especially for wide result slots
+    with text on the left.  The colored-border detector below intentionally
+    ignores neutral gray borders, so this pass searches for long dashed
+    horizontal/vertical line pairs (gray or colored) that enclose the seed
+    center and have a plausible source aspect.  It is conservative: uncertain
+    cases return ``None`` so strict QA can still reject the variant.
+    """
+    x0, y0, x1, y1 = box
+    width, height = max(1, x1 - x0), max(1, y1 - y0)
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    scale_hint = max(canvas.width / 1024.0, canvas.height / 1536.0, 1.0)
+    gap = int(round(max(20, 9 * scale_hint)))
+    row_cluster_gap = int(round(max(5, 3 * scale_hint)))
+    col_cluster_gap = int(round(max(5, 3 * scale_hint)))
+    if 0.90 <= ratio <= 1.10:
+        # Vision detections for square result placeholders often lock onto the
+        # central label/text region or only the left part of a wide decorative
+        # placeholder.  Search farther horizontally so the real dashed border
+        # can be recovered and rejected if it is actually landscape/oversized.
+        pad_x = int(round(max(140 * scale_hint, width * 0.80)))
+        pad_y = int(round(max(90 * scale_hint, height * 0.35)))
+    else:
+        pad_x = int(round(max(90 * scale_hint, width * 0.20)))
+        pad_y = int(round(max(70 * scale_hint, height * 0.20)))
+    sx0 = max(0, x0 - pad_x)
+    sx1 = min(canvas.width, x1 + pad_x)
+    sy0 = max(0, y0 - pad_y)
+    sy1 = min(canvas.height, y1 + pad_y)
+    if sx1 <= sx0 + 12 or sy1 <= sy0 + 12:
+        return None
+
+    min_h_segment = int(round(max(44 * scale_hint, min(width, sx1 - sx0) * 0.12)))
+    rows: list[tuple[int, tuple[int, int], int]] = []
+    for y in range(sy0, sy1):
+        segments = _line_segments_on_row(canvas, y, sx0, sx1, gap=gap, min_length=min_h_segment)
+        for segment in segments:
+            overlap = min(segment[1], x1) - max(segment[0], x0)
+            if segment[0] <= cx <= segment[1] or overlap >= min_h_segment:
+                rows.append((y, segment, segment[1] - segment[0]))
+
+    if len(rows) < 2:
+        return None
+
+    row_groups: list[list[tuple[int, tuple[int, int], int]]] = []
+    for rec in rows:
+        if not row_groups or rec[0] - row_groups[-1][-1][0] > row_cluster_gap:
+            row_groups.append([rec])
+        else:
+            row_groups[-1].append(rec)
+
+    horizontal: list[tuple[int, int, tuple[int, int], int]] = []
+    for group in row_groups:
+        # Prefer segments that actually pass through the seed center; otherwise
+        # take the longest nearby segment in the row cluster.
+        best = max(
+            group,
+            key=lambda item: (
+                1 if item[1][0] <= cx <= item[1][1] else 0,
+                item[2],
+                -abs(((item[1][0] + item[1][1]) / 2) - cx),
+            ),
+        )
+        horizontal.append((group[0][0], group[-1][0], best[1], best[2]))
+
+    raw_ratio_error = _ratio_relative_error(width / height, ratio)
+    max_ratio_error = max(_effective_placeholder_ratio_tolerance(ratio, 0.20) + 0.12, 0.36)
+    seed_area = max(1, width * height)
+    pair_candidates: list[tuple[float, tuple[int, int, int, int], tuple[int, int]]] = []
+
+    for i, top_group in enumerate(horizontal):
+        if top_group[1] >= cy - 3:
+            continue
+        for bottom_group in horizontal[i + 1 :]:
+            if bottom_group[0] <= cy + 3:
+                continue
+            top = top_group[0]
+            bottom = bottom_group[1] + 1
+            panel_h = bottom - top
+            if panel_h < max(int(36 * scale_hint), height * 0.18):
+                continue
+            if panel_h > max(int(760 * scale_hint), height * 1.85):
+                continue
+
+            # A real dashed placeholder has top/bottom horizontal evidence that
+            # overlaps around the seed center.  This prevents section-card
+            # borders or left-column text from being paired with a placeholder
+            # bottom edge.
+            ix0 = max(top_group[2][0], bottom_group[2][0])
+            ix1 = min(top_group[2][1], bottom_group[2][1])
+            if ix1 - ix0 < min_h_segment:
+                continue
+            if not (ix0 - gap <= cx <= ix1 + gap):
+                continue
+            prelim_ratio = (ix1 - ix0) / max(1, panel_h)
+            prelim_ratio_error = _ratio_relative_error(prelim_ratio, ratio)
+            if prelim_ratio_error > max_ratio_error + 0.18:
+                continue
+            prelim_area_ratio = ((ix1 - ix0) * panel_h) / seed_area
+            prelim_center_penalty = (
+                abs(((ix0 + ix1) / 2) - cx) / max(1, width)
+                + abs(((top + bottom) / 2) - cy) / max(1, height)
+            )
+            safe_square_growth = (
+                0.90 <= ratio <= 1.10
+                and prelim_ratio_error <= 0.34
+                and prelim_center_penalty <= 0.35
+                and prelim_area_ratio <= 3.25
+            )
+            if raw_ratio_error <= 0.20 and prelim_area_ratio > 1.18 and not safe_square_growth:
+                continue
+            prelim_edge_penalty = (
+                abs(top - y0) / max(1, height)
+                + 0.25 * abs(bottom - y1) / max(1, height)
+            )
+            prelim_score = (
+                -0.70 * prelim_ratio_error
+                -0.30 * prelim_center_penalty
+                -0.35 * prelim_edge_penalty
+                -0.04 * abs(prelim_area_ratio - 1.0)
+            )
+            x_window = (max(sx0, ix0 - gap), min(sx1, ix1 + gap))
+            pair_candidates.append((prelim_score, (top, bottom, ix0, ix1), x_window))
+
+    candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+    pair_candidates.sort(key=lambda item: item[0], reverse=True)
+    for _prelim_score, pair, x_window in pair_candidates[:12]:
+        top, bottom, _ix0, _ix1 = pair
+        panel_h = bottom - top
+        vx0, vx1 = x_window
+        min_v_segment = int(round(max(36 * scale_hint, panel_h * 0.28)))
+        col_hits: list[int] = []
+        for x in range(vx0, vx1):
+            if _has_vertical_line_segment(
+                canvas,
+                x,
+                top,
+                bottom,
+                gap=gap,
+                min_length=min_v_segment,
+            ):
+                col_hits.append(x)
+        if not col_hits:
+            continue
+        col_groups = _cluster_line_positions(col_hits, max_gap=col_cluster_gap)
+        left_groups = [g for g in col_groups if g[1] <= cx + gap]
+        right_groups = [g for g in col_groups if g[0] >= cx - gap]
+        if not left_groups or not right_groups:
+            continue
+
+        for left_group in left_groups:
+            for right_group in right_groups:
+                if right_group[0] <= left_group[1] + min_h_segment:
+                    continue
+                left = left_group[0]
+                right = right_group[1] + 1
+                panel = _pad_box((left, top, right, bottom), 0, canvas.size)
+                panel_ratio = _box_ratio(panel)
+                ratio_error = _ratio_relative_error(panel_ratio, ratio)
+                if ratio_error > max_ratio_error:
+                    continue
+                area_ratio = _box_area(panel) / seed_area
+                center_penalty = (
+                    abs(((panel[0] + panel[2]) / 2) - cx) / max(1, width)
+                    + abs(((panel[1] + panel[3]) / 2) - cy) / max(1, height)
+                )
+                # When the LLM seed already has roughly the declared
+                # source ratio, this detector is meant to *refine inward*
+                # to the true dashed box, not expand to a surrounding card.
+                if raw_ratio_error <= 0.20 and area_ratio > 1.15:
+                    if 0.90 <= ratio <= 1.10 and raw_ratio_error <= 0.08 and 1.35 < area_ratio < 2.00 and ratio_error <= 0.15:
+                        # If a square result seed is already ratio-correct,
+                        # a much larger near-square dashed/card outline is
+                        # usually the surrounding decorative mat rather than a
+                        # better replacement target.  Expanding to it creates a
+                        # giant low figure and excessive white border.
+                        continue
+                    safe_square_growth = (
+                        0.90 <= ratio <= 1.10
+                        and ratio_error <= 0.34
+                        and center_penalty <= 0.35
+                        and area_ratio <= 3.25
+                    )
+                    if not safe_square_growth:
+                        continue
+                seed_edge_penalty = (
+                    abs(panel[1] - y0) / max(1, height)
+                    + 0.25 * abs(panel[3] - y1) / max(1, height)
+                )
+                # Ratio is a guide, not the only objective: generated
+                # placeholders are allowed some visual looseness, but the
+                # replacement panel must stay near the actual dashed region.
+                score = (
+                    -0.70 * ratio_error
+                    -0.30 * center_penalty
+                    -0.35 * seed_edge_penalty
+                    -0.04 * abs(area_ratio - 1.0)
+                )
+                candidates.append((score, panel))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best = candidates[0][1]
+    if _box_area(best) < seed_area * 0.18:
+        return None
+    return best
+
+
+def _line_segments_on_row(
+    canvas: Image.Image,
+    y: int,
+    x0: int,
+    x1: int,
+    *,
+    gap: int,
+    min_length: int,
+) -> list[tuple[int, int]]:
+    pixels = canvas.load()
+    xs: list[int] = []
+    for x in range(max(0, x0), min(canvas.width, x1), 2):
+        if _is_placeholder_line_pixel(pixels[x, y]):
+            xs.append(x)
+    return _cluster_segments(xs, gap=gap, min_length=min_length)
+
+
+def _has_vertical_line_segment(
+    canvas: Image.Image,
+    x: int,
+    y0: int,
+    y1: int,
+    *,
+    gap: int,
+    min_length: int,
+) -> bool:
+    pixels = canvas.load()
+    ys: list[int] = []
+    for y in range(max(0, y0), min(canvas.height, y1), 2):
+        if _is_placeholder_line_pixel(pixels[x, y]):
+            ys.append(y)
+    return bool(_cluster_segments(ys, gap=gap, min_length=min_length))
+
+
+def _cluster_segments(values: list[int], *, gap: int, min_length: int) -> list[tuple[int, int]]:
+    if not values:
+        return []
+    out: list[tuple[int, int]] = []
+    start = prev = values[0]
+    for value in values[1:]:
+        if value - prev <= gap:
+            prev = value
+        else:
+            if prev - start + 1 >= min_length:
+                out.append((start, prev + 1))
+            start = prev = value
+    if prev - start + 1 >= min_length:
+        out.append((start, prev + 1))
+    return out
+
+
+def _find_color_consistent_placeholder_panel(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int] | None:
+    """Recover the visible placeholder rectangle from its colored border.
+
+    The LLM detector is often directionally correct but can include nearby card
+    edges or section gutters in the y direction.  For generated placeholders the
+    top and bottom dashed borders have a consistent accent color (purple, teal,
+    gold, etc.).  This pass looks for same-color horizontal border pairs that
+    enclose the detected center, then expands x to the visible colored line
+    extent.  It intentionally returns ``None`` when uncertain; callers then use
+    the original LLM box and strict QA can reject the variant if needed.
+    """
+    x0, y0, x1, y1 = box
+    width = max(1, x1 - x0)
+    height = max(1, y1 - y0)
+    if 0.90 <= ratio <= 1.10 and _ratio_relative_error(width / height, ratio) <= 0.20:
+        # Square result placeholders are commonly detected as a useful seed.
+        # A full-panel expansion can create an oversized pasted figure that
+        # intrudes into adjacent blocks; keep the seed and let hidden planning
+        # apply only a tiny conservative nudge if needed.
+        return None
+    cx = (x0 + x1) // 2
+    cy = (y0 + y1) // 2
+
+    score_pad_x = max(8, int(round(width * 0.04)))
+    sx0 = max(0, x0 - score_pad_x)
+    sx1 = min(canvas.width, x1 + score_pad_x)
+    y_pad = max(120, int(round(height * 0.90)))
+    sy0 = max(0, y0 - y_pad)
+    sy1 = min(canvas.height, y1 + y_pad)
+    if sx1 <= sx0 + 8 or sy1 <= sy0 + 8:
+        return None
+
+    pixels = canvas.load()
+    row_scores: list[tuple[int, int]] = []
+    row_threshold = max(18, int(round((sx1 - sx0) * 0.08)))
+    for y in range(sy0, sy1):
+        count = 0
+        for x in range(sx0, sx1, 2):
+            if _is_placeholder_border_pixel(pixels[x, y]):
+                count += 2
+        if count >= row_threshold:
+            row_scores.append((y, count))
+    if not row_scores:
+        return None
+
+    row_groups = _cluster_line_positions([y for y, _ in row_scores], max_gap=6)
+    row_group_max = _group_max_counts(row_groups, row_scores)
+    candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+
+    for top_group in row_groups:
+        if top_group[1] >= cy - 4:
+            continue
+        for bottom_group in row_groups:
+            if bottom_group[0] <= cy + 4:
+                continue
+            top = top_group[0]
+            bottom = bottom_group[1] + 1
+            panel_h = bottom - top
+            if panel_h < max(28, height * 0.30):
+                continue
+            # Allow a detected inner text box to expand, but reject enormous
+            # spans that clearly include another section.
+            if panel_h > max(80, height * 2.4):
+                continue
+
+            top_color = _colored_group_mean(canvas, top_group, sx0, sx1)
+            bottom_color = _colored_group_mean(canvas, bottom_group, sx0, sx1)
+            if top_color is None or bottom_color is None:
+                continue
+            color_distance = _rgb_distance(top_color, bottom_color)
+            if color_distance > 75:
+                continue
+
+            accent = tuple((top_color[i] + bottom_color[i]) / 2 for i in range(3))
+            top_extent = _colored_line_extent(canvas, top_group, accent, box)
+            bottom_extent = _colored_line_extent(canvas, bottom_group, accent, box)
+            if top_extent is None or bottom_extent is None:
+                continue
+
+            left = min(x0, top_extent[0], bottom_extent[0])
+            right = max(x1, top_extent[1], bottom_extent[1])
+            if right <= left + 8:
+                continue
+            panel = _pad_box((left, top, right, bottom), 0, canvas.size)
+            panel_ratio = _box_ratio(panel)
+            ratio_error = _ratio_relative_error(panel_ratio, ratio)
+            if ratio_error > 1.20:
+                continue
+            raw_error = _ratio_relative_error(_box_ratio(box), ratio)
+            area_growth = _box_area(panel) / max(1, _box_area(box))
+            if 1.08 <= ratio <= 1.50 and raw_error <= 0.12 and area_growth > 1.40:
+                # Near-square process placeholders are often detected very
+                # accurately by vision.  Large color-consistent expansions can
+                # jump to the surrounding card/module border and overlap the
+                # adjacent process placeholder; keep the seed in that case.
+                continue
+            if 1.08 <= ratio <= 1.50 and raw_error <= 0.12 and 0.85 <= area_growth <= 1.25:
+                # If a near-square seed already has the right ratio and the
+                # candidate is about the same size, a color match is more likely
+                # a neighboring decorative/card line than a useful correction.
+                # Keep the seed; still allow clear shrink corrections for
+                # over-tall detections (area_growth < 0.85).
+                continue
+
+            center_penalty = (
+                abs(((panel[1] + panel[3]) / 2) - cy) / max(1, height)
+                + abs(((panel[0] + panel[2]) / 2) - cx) / max(1, width)
+            )
+            near_square_placeholder = 0.90 <= ratio <= 1.10
+            safe_square_expansion = (
+                near_square_placeholder
+                and raw_error <= 0.20
+                and ratio_error <= 0.18
+                and center_penalty <= 0.30
+                and area_growth <= 2.10
+            )
+            if (
+                area_growth > 1.15
+                and ratio_error > raw_error + 0.08
+                and not safe_square_expansion
+            ):
+                continue
+            support = (
+                row_group_max.get(top_group, 0)
+                + row_group_max.get(bottom_group, 0)
+            ) / max(1, (sx1 - sx0) * 2)
+            # Prefer color-consistent border pairs and the nearest enclosing
+            # pair.  Ratio matters, but visible placeholder boxes are allowed
+            # to be looser than the declared source-image ratio; the hidden
+            # placement stage fits the real figure inside afterward.
+            score = support - 0.45 * center_penalty - 0.20 * ratio_error - 0.004 * color_distance
+            candidates.append((score, panel))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best = candidates[0][1]
+    if _box_area(best) < _box_area(box) * 0.35:
+        return None
+    return best
+
+
+def _colored_group_mean(
+    canvas: Image.Image,
+    group: tuple[int, int],
+    x0: int,
+    x1: int,
+) -> tuple[float, float, float] | None:
+    pixels = canvas.load()
+    red = green = blue = count = 0
+    for y in range(max(0, group[0]), min(canvas.height - 1, group[1]) + 1):
+        for x in range(max(0, x0), min(canvas.width, x1), 2):
+            pixel = pixels[x, y]
+            if _is_placeholder_border_pixel(pixel):
+                red += pixel[0]
+                green += pixel[1]
+                blue += pixel[2]
+                count += 1
+    if count < 8:
+        return None
+    return red / count, green / count, blue / count
+
+
+def _colored_line_extent(
+    canvas: Image.Image,
+    group: tuple[int, int],
+    accent: tuple[float, float, float],
+    seed_box: tuple[int, int, int, int],
+) -> tuple[int, int] | None:
+    x0, _y0, x1, _y1 = seed_box
+    width = max(1, x1 - x0)
+    cx = (x0 + x1) // 2
+    search_pad = max(120, int(round(width * 0.35)))
+    sx0 = max(0, x0 - search_pad)
+    sx1 = min(canvas.width, x1 + search_pad)
+    pixels = canvas.load()
+    xs: list[int] = []
+    for x in range(sx0, sx1):
+        for y in range(max(0, group[0]), min(canvas.height - 1, group[1]) + 1):
+            pixel = pixels[x, y]
+            if _is_placeholder_border_pixel(pixel) and _rgb_distance(pixel, accent) <= 105:
+                xs.append(x)
+                break
+    if not xs:
+        return None
+    groups = _cluster_line_positions(xs, max_gap=25)
+    if not groups:
+        return None
+    # Pick the same-colored horizontal segment that overlaps the LLM seed most.
+    # This expands inner detections to full dashed borders without jumping to
+    # unrelated detector-art lines in the margins.
+    def key(group: tuple[int, int]) -> tuple[int, int, int]:
+        overlap = max(0, min(group[1], x1) - max(group[0], x0))
+        contains_center = 1 if group[0] <= cx <= group[1] else 0
+        length = group[1] - group[0] + 1
+        return overlap, contains_center, length
+
+    best = max(groups, key=key)
+    if key(best)[0] < min(width * 0.25, 80):
+        return None
+    return best[0], best[1] + 1
+
+
+def _rgb_distance(
+    a: tuple[float, float, float] | tuple[int, int, int],
+    b: tuple[float, float, float] | tuple[int, int, int],
+) -> float:
+    return ((float(a[0]) - float(b[0])) ** 2 + (float(a[1]) - float(b[1])) ** 2 + (float(a[2]) - float(b[2])) ** 2) ** 0.5
 
 
 def _box_ratio(box: tuple[int, int, int, int]) -> float:
@@ -508,6 +1707,31 @@ def _is_placeholder_border_pixel(pixel: tuple[int, int, int]) -> bool:
     # Dashed placeholder borders are intentionally colored; neutral black text
     # and pale white backgrounds should not dominate this mask.
     return (mx - mn) >= 28
+
+
+def _is_placeholder_line_pixel(pixel: tuple[int, int, int]) -> bool:
+    """Pixel predicate for dashed placeholder lines.
+
+    Some image-generation variants draw placeholder borders in neutral gray
+    rather than colored accent strokes.  For line-pair detection we therefore
+    include both colored border pixels and moderately dark neutral gray pixels.
+    Text also satisfies this predicate, but the caller requires long horizontal
+    and vertical dashed-line support, which filters ordinary words/bullets out.
+    """
+    if _is_placeholder_border_pixel(pixel):
+        return True
+    r, g, b = pixel
+    lum = (r + g + b) / 3
+    if lum < 185:
+        return True
+    return False
+
+
+def _is_light_placeholder_pixel(pixel: tuple[int, int, int]) -> bool:
+    r, g, b = pixel
+    mx, mn = max(pixel), min(pixel)
+    lum = (r + g + b) / 3
+    return lum >= 205 and (mx - mn) <= 65
 
 
 def _cluster_line_positions(values: list[int], *, max_gap: int = 2) -> list[tuple[int, int]]:
@@ -601,6 +1825,136 @@ def _shrink_box_to_ratio(box: tuple[int, int, int, int], ratio: float) -> tuple[
     nx0 = int(round(cx - new_w / 2))
     ny0 = int(round(cy - new_h / 2))
     return nx0, ny0, nx0 + new_w, ny0 + new_h
+
+
+def _fit_box_to_ratio_inside(box: tuple[int, int, int, int], ratio: float) -> tuple[int, int, int, int]:
+    """Largest ratio-correct box fully contained by ``box``.
+
+    Used for post-generation replacement planning: real scientific figures
+    should overlap the generated placeholder as much as possible, but never
+    protrude beyond the original placeholder rectangle.
+    """
+    x0, y0, x1, y1 = box
+    width = max(1, x1 - x0)
+    height = max(1, y1 - y0)
+    if ratio <= 0:
+        return x0, y0, x1, y1
+    if width / height > ratio:
+        new_h = height
+        new_w = min(width, max(1, int(round(new_h * ratio))))
+    else:
+        new_w = width
+        new_h = min(height, max(1, int(round(new_w / ratio))))
+    cx = (x0 + x1) / 2
+    cy = (y0 + y1) / 2
+    nx0 = int(round(cx - new_w / 2))
+    ny0 = int(round(cy - new_h / 2))
+    nx1 = nx0 + new_w
+    ny1 = ny0 + new_h
+    # Rounding can push an edge out by one pixel; clamp inward only.
+    if nx0 < x0:
+        nx1 += x0 - nx0
+        nx0 = x0
+    if ny0 < y0:
+        ny1 += y0 - ny0
+        ny0 = y0
+    if nx1 > x1:
+        nx0 -= nx1 - x1
+        nx1 = x1
+    if ny1 > y1:
+        ny0 -= ny1 - y1
+        ny1 = y1
+    return max(x0, nx0), max(y0, ny0), min(x1, max(nx0 + 1, nx1)), min(y1, max(ny0 + 1, ny1))
+
+
+def _nudge_square_result_box(
+    box: tuple[int, int, int, int],
+    ratio: float,
+    label: str,
+    canvas_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Conservatively move square result plots slightly upward.
+
+    This fixes a common visual issue where a square limits/result plot detected
+    by the LLM is ratio-correct but sits a little low in the artistic result
+    block.  Older versions also shrank and moved the plot left, which produced
+    an obvious oversized right/bottom white mat.  Keep the size and x-position
+    stable; only make a small upward move when the plot is in the lower part of
+    the poster.
+    """
+    if not (0.90 <= ratio <= 1.10):
+        return box
+    low = str(label or "").lower()
+    if not any(word in low for word in ("limit", "result", "constraint", "upper")):
+        return box
+    width = max(1, box[2] - box[0])
+    height = max(1, box[3] - box[1])
+    if _ratio_relative_error(width / height, 1.0) > 0.08:
+        return box
+    bottom_fraction = box[3] / max(1, canvas_size[1])
+    if bottom_fraction < 0.74:
+        return box
+    side = min(width, height)
+    shift = int(round(min(70, max(24, side * 0.055))))
+    ny0 = max(0, box[1] - shift)
+    return box[0], ny0, box[2], ny0 + height
+
+
+def _constrain_lower_hero_placeholder_box(
+    box: tuple[int, int, int, int],
+    ratio: float,
+    ph: dict[str, Any],
+    canvas_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Keep lower hero comparison/result figures out of conclusion strips.
+
+    Image models often place the global-comparison/result placeholder in a lower
+    Section 5 card.  Vision detection can include the lower card/conclusion
+    boundary, yielding a replacement frame that visually protrudes into the
+    conclusion strip even though its nominal box is ratio-correct.  For hero
+    result/comparison figures in the lower poster, clip the planning envelope
+    above the lower conclusion zone and let ratio-preserving fit shrink the
+    scientific figure instead of allowing overlap.
+    """
+    if not _is_lower_hero_placeholder(ph, ratio, box, canvas_size):
+        return box
+    canvas_h = max(1, canvas_size[1])
+    bottom_limit = int(round(canvas_h * 0.890))
+    height = max(1, box[3] - box[1])
+    top_inset = int(round(min(120, max(64, height * 0.07))))
+    target_top = box[1] + top_inset
+    target_bottom = min(box[3], bottom_limit)
+    if target_bottom <= target_top + 1:
+        target_bottom = min(canvas_h, target_top + 1)
+    if box[3] <= bottom_limit and target_top <= box[1] + 1:
+        return box
+    clipped = (box[0], target_top, box[2], target_bottom)
+    # If clipping would leave an unusably thin figure, shift the same box upward
+    # instead of crushing the plot.
+    min_h = max(120, int(round((box[2] - box[0]) / max(ratio, 0.1) * 0.55)))
+    if clipped[3] - clipped[1] >= min_h:
+        return clipped
+    shift = box[3] - bottom_limit
+    return _clamp_box((box[0], box[1] - shift, box[2], box[3] - shift), canvas_size)
+
+
+def _is_lower_hero_placeholder(
+    ph: dict[str, Any],
+    ratio: float,
+    box: tuple[int, int, int, int],
+    canvas_size: tuple[int, int],
+) -> bool:
+    if not (1.20 <= ratio <= 2.20):
+        return False
+    label = str(ph.get("label") or "").lower()
+    group = str(ph.get("group") or "").lower()
+    if not (
+        "hero" in group
+        or "result" in group
+        or any(word in label for word in ("comparison", "result", "mass measurement", "electroweak"))
+    ):
+        return False
+    return box[1] >= max(1, canvas_size[1]) * 0.66
 
 
 def _busy_overlap_density(
@@ -741,7 +2095,7 @@ def _draw_dashed_rect(draw: ImageDraw.ImageDraw, box: list[int], *, fill, width:
         draw.line([(x1, y), (x1, min(y + dash, y1))], fill=fill, width=width)
 
 
-def _trim_uniform_border(im: Image.Image, *, tolerance: int = 12, margin: int = 8) -> Image.Image:
+def _trim_uniform_border(im: Image.Image, *, tolerance: int = 18, margin: int = 3) -> Image.Image:
     """Trim near-uniform white/transparent margins before figure replacement.
 
     This does not alter scientific content; it only removes empty border area so
@@ -767,6 +2121,88 @@ def _trim_uniform_border(im: Image.Image, *, tolerance: int = 12, margin: int = 
     if (x1 - x0) < im.width * 0.2 or (y1 - y0) < im.height * 0.2:
         return im
     return im.crop((x0, y0, x1, y1))
+
+
+def audit_figure_containment(
+    *,
+    spec: dict[str, Any],
+    scale: float = 1.0,
+    max_overlap_ratio: float = 0.05,
+) -> list[dict[str, Any]]:
+    """Verify that every figure placement is strictly inside its placeholder.
+
+    Returns a list of issues found:
+    - containment violations: figure box extends beyond placeholder box
+    - overlap violations: two figure boxes overlap beyond the threshold
+    """
+    issues: list[dict[str, Any]] = []
+    placements = spec.get("placements") or {}
+    clear_boxes = spec.get("_replacement_clear_boxes") or {}
+    placeholders = {str(p.get("id")): p for p in spec.get("placeholders", [])}
+
+    fig_boxes: dict[str, tuple[int, int, int, int]] = {}
+    for fig_id, raw_box in placements.items():
+        try:
+            box = tuple(int(round(float(v) * scale)) for v in raw_box)
+        except Exception:
+            continue
+        fig_boxes[str(fig_id)] = box
+
+    for fig_id, box in fig_boxes.items():
+        ph = placeholders.get(fig_id, {})
+        label = str(ph.get("label") or fig_id)
+        # Use the clear box (the detected placeholder boundary) as the
+        # containment envelope.  If no clear box exists, skip the check.
+        raw_clear = clear_boxes.get(fig_id)
+        if raw_clear:
+            try:
+                clear = tuple(int(round(float(v) * scale)) for v in raw_clear)
+            except Exception:
+                continue
+            if not _is_contained(box, clear, margin=0):
+                issues.append({
+                    "severity": "warning",
+                    "category": "figure_containment",
+                    "message": (
+                        f"{fig_id} figure box {list(box)} extends beyond "
+                        f"placeholder boundary {list(clear)}"
+                    ),
+                    "location": f"Section {ph.get('section', '?')} / {fig_id}",
+                    "suggested_fix": (
+                        "Ensure the figure is pasted strictly inside the "
+                        "detected placeholder boundary."
+                    ),
+                })
+
+    # Check for figure-figure overlaps
+    fig_ids = list(fig_boxes.keys())
+    for i in range(len(fig_ids)):
+        for j in range(i + 1, len(fig_ids)):
+            id_i, id_j = fig_ids[i], fig_ids[j]
+            box_i, box_j = fig_boxes[id_i], fig_boxes[id_j]
+            overlap = _box_overlap(box_i, box_j)
+            if overlap <= 0:
+                continue
+            area_i = _box_area(box_i)
+            area_j = _box_area(box_j)
+            min_area = max(1, min(area_i, area_j))
+            ratio = overlap / min_area
+            if ratio > max_overlap_ratio:
+                issues.append({
+                    "severity": "warning",
+                    "category": "figure_overlap",
+                    "message": (
+                        f"{id_i} and {id_j} overlap by {overlap} pixels "
+                        f"({ratio:.1%} of the smaller figure)"
+                    ),
+                    "location": f"{id_i} ↔ {id_j}",
+                    "suggested_fix": (
+                        "Adjust placeholder placements to add a clear gutter "
+                        "between figures, or reduce figure sizes."
+                    ),
+                })
+
+    return issues
 
 
 def upscale_image(input_path: str | Path, out_path: str | Path, factor: float = 2.0, sharpen: bool = True) -> Path:

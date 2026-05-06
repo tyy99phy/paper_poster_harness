@@ -232,6 +232,11 @@ def _qa_mode_instructions(qa_mode: str) -> list[str]:
         "Do not require blank placeholders or visible [FIG NN] labels in final mode.",
         "Check that public text is clean, final figures appear plausible and non-fabricated, and no internal workflow text leaked into the poster.",
         "Flag missing, badly cropped, stretched, or unreadable replaced figures.",
+        "The poster_spec may include placements and _replacement_clear_boxes. Treat _replacement_clear_boxes as the approved final placeholder/cleanup boundary; the old dashed border is normally removed in final mode.",
+        "A white publication-style frame around a real figure is allowed if it stays inside the approved cleanup boundary. Do not fail only because the white frame covers the old placeholder label or dashed border.",
+        "Use deterministic_prechecks as authoritative for coordinate containment/overlap unless the image shows an obvious contradiction. If deterministic_prechecks contain no figure_containment or figure_overlap issue, do not invent speculative critical containment failures from visual uncertainty alone.",
+        "CRITICAL: Fail only when a real scientific figure or its white replacement frame visibly extends outside its approved placeholder/cleanup boundary, is badly cropped, or clearly overlaps another real figure.",
+        "CRITICAL: Check that figures do not overlap with each other. Each figure should have a clear visual gutter separating it from neighbors.",
         "Check that the poster structure remains plausible for a public scientific conference poster.",
     ]
 
@@ -655,6 +660,60 @@ def _deterministic_qa_checks(
                     "suggested_fix": "Manually review the rendered poster or rerun visual detection.",
                 }
             )
+
+    # Check figure containment: placements must be inside clear boxes
+    placements_map = spec.get("placements") or {}
+    clear_map = spec.get("_replacement_clear_boxes") or {}
+    for fig_id, raw_box in placements_map.items():
+        raw_clear = clear_map.get(fig_id)
+        if not raw_clear:
+            continue
+        try:
+            bx0, by0, bx1, by1 = [int(round(float(v))) for v in raw_box]
+            cx0, cy0, cx1, cy1 = [int(round(float(v))) for v in raw_clear]
+        except Exception:
+            continue
+        margin = 2
+        if bx0 < cx0 - margin or by0 < cy0 - margin or bx1 > cx1 + margin or by1 > cy1 + margin:
+            issues.append(
+                {
+                    "severity": "warning",
+                    "category": "figure_containment",
+                    "message": f"{fig_id} placement {list(raw_box)} may extend beyond placeholder boundary {list(raw_clear)}",
+                    "location": f"spec.placements[{fig_id}]",
+                    "suggested_fix": "Ensure figure placement is strictly inside the detected placeholder boundary.",
+                }
+            )
+
+    # Check for figure-figure overlap
+    fig_ids = list(placements_map.keys())
+    for i in range(len(fig_ids)):
+        for j in range(i + 1, len(fig_ids)):
+            id_i, id_j = fig_ids[i], fig_ids[j]
+            try:
+                ax0, ay0, ax1, ay1 = [int(round(float(v))) for v in placements_map[id_i]]
+                bxx0, byy0, bxx1, byy1 = [int(round(float(v))) for v in placements_map[id_j]]
+            except Exception:
+                continue
+            ox0 = max(ax0, bxx0)
+            oy0 = max(ay0, byy0)
+            ox1 = min(ax1, bxx1)
+            oy1 = min(ay1, byy1)
+            if ox1 > ox0 and oy1 > oy0:
+                overlap = (ox1 - ox0) * (oy1 - oy0)
+                area_a = max(1, (ax1 - ax0) * (ay1 - ay0))
+                area_b = max(1, (bxx1 - bxx0) * (byy1 - byy0))
+                ratio = overlap / min(area_a, area_b)
+                if ratio > 0.05:
+                    issues.append(
+                        {
+                            "severity": "warning",
+                            "category": "figure_overlap",
+                            "message": f"{id_i} and {id_j} overlap by {overlap} pixels ({ratio:.1%})",
+                            "location": f"spec.placements",
+                            "suggested_fix": "Add a clear gutter between figure placeholders or reduce figure sizes.",
+                        }
+                    )
 
     passes = not any(issue["severity"] == "critical" for issue in issues)
     checks = {
