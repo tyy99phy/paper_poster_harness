@@ -112,6 +112,39 @@ def build_prompt(spec: dict[str, Any]) -> str:
         "",
     ]
 
+    storyboard = spec.get("storyboard") if isinstance(spec.get("storyboard"), dict) else {}
+    storyboard_sections = _storyboard_section_map(storyboard)
+    if storyboard:
+        lines += [
+            "NARRATIVE STORYBOARD (internal design brief; do not render this heading or the word storyboard):",
+        ]
+        core_message = str(storyboard.get("core_message") or storyboard.get("meta", {}).get("one_sentence_takeaway") or "").strip()
+        if core_message:
+            lines.append(f"- Core message to make visually obvious: {_q(core_message)}")
+        layout_tree = storyboard.get("layout_tree") if isinstance(storyboard.get("layout_tree"), dict) else {}
+        reading_order = layout_tree.get("reading_order") or []
+        if reading_order:
+            lines.append(f"- Reading order should follow section ids: {', '.join(str(item) for item in reading_order)}.")
+        if layout_tree.get("hero_section"):
+            lines.append(f"- Hero section id: {layout_tree.get('hero_section')}; hero visual role: {_q(str(layout_tree.get('hero_visual_role') or 'headline result figure'))}.")
+        if layout_tree.get("layout_intent"):
+            lines.append(f"- Layout intent: {_q(str(layout_tree.get('layout_intent')))}")
+        for sec in storyboard.get("sections") or []:
+            if not isinstance(sec, dict):
+                continue
+            claims = [str(item).strip() for item in sec.get("key_claims") or [] if str(item).strip()]
+            claim_text = "; ".join(claims[:3])
+            lines.append(
+                f"- Section {sec.get('id')}: role={_q(str(sec.get('role') or 'section'))}; "
+                f"text budget={_q(str(sec.get('text_budget') or 'compact bullets'))}; "
+                f"preferred visual={_q(str(sec.get('preferred_visual') or ''))}"
+                + (f"; key claims={_q(claim_text)}" if claim_text else "")
+            )
+        lines += [
+            "- Use this storyboard only to guide hierarchy, reading path, and text compression; render only the public section text specified below.",
+            "",
+        ]
+
     grammar_rules = _style_rule_list(style, "hep_poster_grammar", HEP_POSTER_GRAMMAR)
     density_rules = _style_rule_list(style, "text_density", TEXT_DENSITY_RULES)
     figure_rules = _style_rule_list(style, "figure_composition", FIGURE_COMPOSITION_RULES)
@@ -239,6 +272,14 @@ def build_prompt(spec: dict[str, Any]) -> str:
         sec_figs = [p for p in placeholders if p.get("section") == sid]
         bullet_budget = _section_bullet_budget(sec_figs)
         lines.append(f"Section {sid}, layout: {layout}, title: \"{sid}  {_q(title)}\"")
+        storyboard_sec = storyboard_sections.get(int(sid)) if sid is not None else None
+        if storyboard_sec:
+            if storyboard_sec.get("role"):
+                lines.append(f"Story role: {_q(str(storyboard_sec.get('role')))}")
+            if storyboard_sec.get("synopsis"):
+                lines.append(f"Story synopsis for layout emphasis (do not render verbatim): {_q(str(storyboard_sec.get('synopsis')))}")
+            if storyboard_sec.get("text_budget"):
+                lines.append(f"Story text budget: {_q(str(storyboard_sec.get('text_budget')))}")
         if sec.get("text"):
             if bullet_budget is not None:
                 lines.append(
@@ -266,6 +307,11 @@ def build_prompt(spec: dict[str, Any]) -> str:
                             lines.append(f"  Bullet: {_q(clean)}")
                             rendered_bullets += 1
         if sec_figs:
+            hero_figs = [fig for fig in sec_figs if "hero" in str(fig.get("role") or fig.get("group") or "").lower()]
+            if hero_figs:
+                lines.append(
+                    "Hero visual priority: make this section's hero placeholder visibly dominant within its card while preserving the exact placeholder aspect ratio and light figure surface."
+                )
             ratios = [_parse_aspect_ratio_text(str(fig.get("aspect") or "")) or 1.0 for fig in sec_figs]
             if any(ratio < 0.92 for ratio in ratios):
                 shape_notes = ", ".join(
@@ -418,6 +464,19 @@ def _section_bullet_budget(sec_figs: list[dict[str, Any]]) -> int | None:
     if any(0.92 <= ratio <= 1.08 for ratio in ratios):
         return 2
     return 3
+
+
+def _storyboard_section_map(storyboard: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    out: dict[int, dict[str, Any]] = {}
+    for item in storyboard.get("sections") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            section_id = int(item.get("id"))
+        except Exception:
+            continue
+        out[section_id] = item
+    return out
 
 
 def _style_rule_list(style: dict[str, Any], key: str, defaults: list[str]) -> list[str]:

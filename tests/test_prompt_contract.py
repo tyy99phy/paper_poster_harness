@@ -295,3 +295,33 @@ def test_decorative_constraints_are_rendered_as_positive_guidance():
     assert "DECORATIVE ART GUIDANCE" in prompt
     assert "reserve Feynman diagrams for [FIG NN] placeholders only" in prompt
     assert "abstract geometric motifs" in prompt
+
+
+def test_prompt_includes_storyboard_as_internal_design_brief():
+    spec = {
+        "project": {"title": "T", "topic": "T"},
+        "style": {},
+        "storyboard": {
+            "core_message": "A precision mass measurement tests electroweak consistency.",
+            "sections": [
+                {
+                    "id": 4,
+                    "role": "hero_result",
+                    "synopsis": "The comparison plot carries the headline.",
+                    "key_claims": ["Mass agrees with global context."],
+                    "text_budget": "one sentence + 2 bullets",
+                    "preferred_visual": "global comparison plot",
+                }
+            ],
+            "layout_tree": {"reading_order": [1, 4], "hero_section": 4, "hero_visual_role": "headline comparison"},
+        },
+        "sections": [{"id": 4, "title": "Result", "layout": "hero", "text": []}],
+        "placeholders": [{"id": "FIG 01", "section": 4, "label": "Mass comparison", "aspect": "1.49:1 wide", "role": "hero_result"}],
+        "conclusion": [],
+    }
+    prompt = build_prompt(spec)
+    assert "NARRATIVE STORYBOARD" in prompt
+    assert "Core message to make visually obvious" in prompt
+    assert "Story role: hero_result" in prompt
+    assert "Hero visual priority" in prompt
+    assert "do not render this heading" in prompt

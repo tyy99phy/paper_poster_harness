@@ -50,11 +50,12 @@ AI 图片模型有一个致命问题：它会"发明"看起来很专业的科学
 arXiv / 本地论文
   → 提取文本 + 图片素材
   → LLM 起草 poster_spec（包含版式描述、章节、占位符规格）
+  → LLM 生成 storyboard（叙事主线、阅读顺序、图文角色、读者问题）
   → LLM 从素材中挑选最有价值的图片，分配给 [FIG 01]、[FIG 02] ...
   → 组装完整 prompt，发给生图模型
   → 生图模型画海报（只含空白占位符，不画科学内容）
   → LLM 视觉检测每个占位符的像素坐标
-  → 占位符 QA（检查是否空白、是否可读、比例是否正确）
+  → 占位符 QA（检查是否空白、是否可读、比例和局部 panel 是否合理）
   → 将真实论文图片按坐标插入
   → 4× 超分放大
   → 最终 QA（检查文字是否公开、图片是否正常）
@@ -180,7 +181,7 @@ runs/<run>/
 ├── exports/                # 替换真实图片后的最终海报
 │   ├── *realfigures.png    #   原始尺寸
 │   └── *realfigures-4x.png #   4× 放大版
-├── specs/                  # 各阶段的 spec/selection/manifest
+├── specs/                  # spec/storyboard/selection/manifest
 ├── prompts/                # 组装好的生图 prompt
 ├── qa/                     # 占位符 QA + 最终 QA 报告
 ├── scratch/                # 中间检测结果

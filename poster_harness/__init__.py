@@ -15,6 +15,7 @@ from .llm_stages import (
     draft_spec_from_text,
     qa_poster,
     select_figures,
+    storyboard_from_text,
 )
 from .schemas import (
     default_poster_spec,
@@ -23,6 +24,7 @@ from .schemas import (
     poster_qa_schema,
     poster_spec_schema,
     schema_skeleton,
+    storyboard_schema,
 )
 
 __all__ = [
@@ -43,11 +45,13 @@ __all__ = [
     "extract_json_from_response",
     "extract_json_from_text",
     "draft_spec_from_text",
+    "storyboard_from_text",
     "select_figures",
     "detect_placeholders_from_image",
     "qa_poster",
     "default_poster_spec",
     "poster_spec_schema",
+    "storyboard_schema",
     "figure_selection_schema",
     "placeholder_detection_schema",
     "poster_qa_schema",

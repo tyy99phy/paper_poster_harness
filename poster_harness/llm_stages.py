@@ -20,6 +20,7 @@ from .schemas import (
     placeholder_detection_schema,
     poster_qa_schema,
     poster_spec_schema,
+    storyboard_schema,
 )
 
 
@@ -90,11 +91,62 @@ def draft_spec_from_text(
     return envelope
 
 
+def storyboard_from_text(
+    text: str,
+    assets_manifest: Any = None,
+    *,
+    spec: Mapping[str, Any] | None = None,
+    provider: ChatGPTAccountResponsesProvider | None = None,
+    extra_instructions: str | None = None,
+) -> dict[str, Any]:
+    """Create a compact Paper2Poster-style storyboard before figure selection.
+
+    This is an internal planning artifact, not public poster text.  It gives the
+    downstream selector and image-generation prompt a stable semantic spine:
+    section roles, visual priorities, reading order, and reader-understanding
+    questions.
+    """
+    provider = provider or ChatGPTAccountResponsesProvider()
+    assets = normalize_assets_manifest(assets_manifest)
+    target_spec = _normalize_spec(copy.deepcopy(dict(spec or default_poster_spec(_guess_title(text)))), assets)
+    prompt = _compose_prompt(
+        header="Draft a storyboard JSON for a scientific poster generation pipeline.",
+        instructions=[
+            "Create an internal storyboard that compresses the paper into a poster narrative.",
+            "Do not write design-process or workflow text that should appear on the poster; this is an internal planning artifact.",
+            "Use the existing poster_spec sections as the section scaffold. Preserve section ids and titles where possible.",
+            "For each section, assign a semantic role such as motivation, dataset, method, validation, result, interpretation, or outlook.",
+            "Write concise public-facing synopses and key claims grounded only in the provided paper text.",
+            "Assign text budgets in practical poster terms, e.g. 'title + 2 bullets' or 'one sentence + 3 short bullets'.",
+            "Describe the preferred visual role for each section and map useful assets to target sections when supported by captions/labels.",
+            "Mark one hero section and one hero visual role for the headline result or central method.",
+            "Write 3-6 reader-understanding questions that a good poster should enable a viewer to answer.",
+            "Never invent numeric results, luminosities, limits, channels, or claims not present in the source text/assets.",
+            extra_instructions or "",
+        ],
+        context={
+            "poster_spec_sections": target_spec.get("sections") or [],
+            "poster_project": target_spec.get("project") or {},
+            "assets_manifest": assets,
+            "source_text_excerpt": _truncate(text, 8000),
+        },
+    )
+    envelope = provider.generate_json(
+        stage_name="storyboard_from_text",
+        prompt=prompt,
+        schema=storyboard_schema(),
+        system_prompt=SYSTEM_PROMPT,
+    )
+    envelope["result"] = _normalize_storyboard(envelope["result"], target_spec, assets)
+    return envelope
+
+
 def select_figures(
     text: str,
     assets_manifest: Any,
     *,
     spec: Mapping[str, Any] | None = None,
+    storyboard: Mapping[str, Any] | None = None,
     provider: ChatGPTAccountResponsesProvider | None = None,
     max_figures: int | None = None,
     extra_instructions: str | None = None,
@@ -111,6 +163,8 @@ def select_figures(
             "Assign priority so the headline result/limit/cross-section/significance plot becomes the hero placeholder.",
             "Deprioritize dense diagnostic variants unless they are essential to the scientific claim.",
             "Map each selected asset onto a sequential placeholder_id exactly like FIG 01, FIG 02, ...; do not invent semantic IDs.",
+            "Use storyboard target sections/roles when supplied, but keep the final section id compatible with the poster_spec.",
+            "For every selected figure, include role, target_section, and reason when possible. Use role values like hero_result, supporting_validation, method_flow, context, diagnostic, or table.",
             "The placeholder aspect must match the selected source asset aspect ratio; do not invent a more convenient poster ratio.",
             "If a source plot is very wide, allocate a wider card or full-width band rather than squeezing or changing its aspect.",
             "Give plots enough absolute size for axes, legends, and labels while preserving the source aspect ratio.",
@@ -120,6 +174,7 @@ def select_figures(
         context={
             "max_figures": limit,
             "poster_spec": target_spec,
+            "storyboard": dict(storyboard or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 5000),
         },
@@ -188,7 +243,13 @@ def qa_poster(
     if qa_mode not in {"placeholder", "final"}:
         raise ValueError("qa_mode must be 'placeholder' or 'final'")
     normalized_spec = _normalize_spec(copy.deepcopy(dict(spec)), normalize_assets_manifest(None))
-    prechecks = _deterministic_qa_checks(normalized_spec, prompt=prompt, detected_placeholders=detected_placeholders)
+    prechecks = _deterministic_qa_checks(
+        normalized_spec,
+        prompt=prompt,
+        detected_placeholders=detected_placeholders,
+        image_path=image_path,
+        qa_mode=qa_mode,
+    )
     image_paths = [image_path] if image_path else None
     mode_instructions = _qa_mode_instructions(qa_mode)
     prompt_text = _compose_prompt(
@@ -383,6 +444,118 @@ def _clean_flowchart_item(text: str) -> str:
     return text
 
 
+def _normalize_storyboard(
+    result: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    assets: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    sections_by_id = {int(section.get("id") or idx): dict(section) for idx, section in enumerate(spec.get("sections") or [], start=1)}
+    valid_section_ids = sorted(sections_by_id) or [1]
+    asset_index = {str(asset.get("asset")): dict(asset) for asset in assets}
+
+    meta = dict(result.get("meta") or {})
+    project = dict(spec.get("project") or {})
+    normalized_sections: list[dict[str, Any]] = []
+    raw_sections = list(result.get("sections") or [])
+    if not raw_sections:
+        raw_sections = [
+            {
+                "id": section_id,
+                "title": row.get("title") or f"Section {section_id}",
+                "role": "poster_section",
+                "synopsis": "",
+                "key_claims": [],
+                "text_budget": "one sentence + 2 short bullets",
+                "preferred_visual": "",
+            }
+            for section_id, row in sections_by_id.items()
+        ]
+    for idx, item in enumerate(raw_sections, start=1):
+        row = dict(item)
+        section_id = _coerce_section(row.get("id"), spec.get("sections") or [])
+        seed = sections_by_id.get(section_id, {})
+        normalized_sections.append(
+            {
+                "id": section_id,
+                "title": sanitize_public_text(str(row.get("title") or seed.get("title") or f"Section {section_id}")).strip() or f"Section {section_id}",
+                "role": _compact_token(str(row.get("role") or "poster_section"), default="poster_section"),
+                "synopsis": sanitize_public_text(str(row.get("synopsis") or "")).strip(),
+                "key_claims": _dedupe_strings([sanitize_public_text(str(claim)).strip() for claim in row.get("key_claims") or [] if str(claim).strip()])[:5],
+                "text_budget": str(row.get("text_budget") or "one sentence + 2 short bullets"),
+                "preferred_visual": str(row.get("preferred_visual") or ""),
+                "visual_keywords": _dedupe_strings([str(item).strip() for item in row.get("visual_keywords") or [] if str(item).strip()])[:8],
+            }
+        )
+    # Keep the order stable and avoid duplicate section entries.
+    seen_sections: set[int] = set()
+    deduped_sections: list[dict[str, Any]] = []
+    for row in normalized_sections:
+        if int(row["id"]) in seen_sections:
+            continue
+        seen_sections.add(int(row["id"]))
+        deduped_sections.append(row)
+
+    visual_assets: list[dict[str, Any]] = []
+    for item in result.get("visual_assets") or []:
+        row = dict(item)
+        asset_name = str(row.get("asset") or "")
+        if asset_name and asset_name not in asset_index:
+            continue
+        asset = asset_index.get(asset_name, {})
+        visual_assets.append(
+            {
+                "asset": asset_name,
+                "caption": sanitize_public_text(str(row.get("caption") or asset.get("caption") or asset.get("label") or asset_name)).strip(),
+                "figure_type": _compact_token(str(row.get("figure_type") or asset.get("kind") or "figure"), default="figure"),
+                "relevance": sanitize_public_text(str(row.get("relevance") or "")).strip(),
+                "target_section": _coerce_section(row.get("target_section"), spec.get("sections") or []),
+                "role": _compact_token(str(row.get("role") or "supporting_visual"), default="supporting_visual"),
+            }
+        )
+
+    layout_tree = dict(result.get("layout_tree") or {})
+    reading_order = []
+    for value in layout_tree.get("reading_order") or valid_section_ids:
+        section_id = _coerce_section(value, spec.get("sections") or [])
+        if section_id not in reading_order:
+            reading_order.append(section_id)
+    hero_section = _coerce_section(layout_tree.get("hero_section") or (reading_order[-1] if reading_order else valid_section_ids[-1]), spec.get("sections") or [])
+
+    qa_questions = [
+        sanitize_public_text(str(item)).strip()
+        for item in result.get("qa_questions") or []
+        if str(item).strip()
+    ][:8]
+    if not qa_questions:
+        qa_questions = ["What is the central scientific question?", "What is the headline result?", "Which figure supports the main conclusion?"]
+
+    return {
+        "meta": {
+            "title": str(meta.get("title") or project.get("title") or ""),
+            "authors": str(meta.get("authors") or project.get("authors") or ""),
+            "audience": str(meta.get("audience") or project.get("audience") or "academic conference audience"),
+            "one_sentence_takeaway": sanitize_public_text(str(meta.get("one_sentence_takeaway") or "")).strip(),
+        },
+        "core_message": sanitize_public_text(str(result.get("core_message") or meta.get("one_sentence_takeaway") or project.get("topic") or "")).strip(),
+        "sections": deduped_sections,
+        "visual_assets": visual_assets,
+        "layout_tree": {
+            "reading_order": reading_order,
+            "hero_section": hero_section,
+            "hero_visual_role": str(layout_tree.get("hero_visual_role") or "headline result figure"),
+            "layout_intent": sanitize_public_text(str(layout_tree.get("layout_intent") or "clear top-to-bottom scientific reading path")).strip(),
+            "section_grouping": [str(item).strip() for item in layout_tree.get("section_grouping") or [] if str(item).strip()][:6],
+        },
+        "qa_questions": qa_questions,
+    }
+
+
+def _compact_token(value: str, *, default: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_ -]+", "", value).strip().lower().replace(" ", "_").replace("-", "_")
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or default
+
+
 def _normalize_text_block(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         clean = sanitize_public_text(value).strip()
@@ -438,15 +611,26 @@ def _normalize_figure_selection(
         label = str(row.get("label") or asset.get("label") or placeholder.get("label") or f"Figure {idx}")
         raw_aspect = str(row.get("aspect") or placeholder.get("aspect") or _guess_aspect(asset))
         aspect = _normalize_display_aspect(raw_aspect, asset=asset, label=label)
+        raw_section = row.get("section")
+        if raw_section is None:
+            raw_section = row.get("target_section")
+        if raw_section is None:
+            raw_section = placeholder.get("section")
+        section = _coerce_section(raw_section, spec.get("sections") or [])
+        role = _compact_token(str(row.get("role") or placeholder.get("role") or ("hero_result" if idx == 1 else "supporting_visual")), default=("hero_result" if idx == 1 else "supporting_visual"))
+        reason = str(row.get("reason") or row.get("rationale") or "LLM-selected figure for poster coverage.")
         normalized.append(
             {
                 "placeholder_id": normalize_placeholder_id(idx),
                 "asset": asset_name or str(asset.get("asset") or f"fig{idx:02d}.png"),
-                "section": _coerce_section(row.get("section") or placeholder.get("section"), spec.get("sections") or []),
+                "section": section,
+                "target_section": section,
+                "role": role,
                 "label": label,
                 "aspect": aspect,
                 "priority": int(row.get("priority") or idx),
-                "rationale": str(row.get("rationale") or "LLM-selected figure for poster coverage."),
+                "rationale": reason,
+                "reason": reason,
                 "source_path": str(row.get("source_path") or asset.get("path") or asset_name),
                 "notes": [str(note) for note in row.get("notes") or asset.get("notes") or []],
             }
@@ -606,6 +790,8 @@ def _deterministic_qa_checks(
     *,
     prompt: str | None,
     detected_placeholders: Mapping[str, Any] | None,
+    image_path: str | Path | None = None,
+    qa_mode: str | None = None,
 ) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
     forbidden = _dedupe_strings(list(DEFAULT_FORBIDDEN_PHRASES) + list(spec.get("forbidden_phrases") or []) + list(INTERNAL_DEFAULTS))
@@ -715,12 +901,21 @@ def _deterministic_qa_checks(
                         }
                     )
 
+    panel_checks = _panel_level_qa_checks(
+        spec,
+        detected_placeholders=detected_placeholders,
+        image_path=image_path,
+        qa_mode=qa_mode or "",
+    )
+    issues.extend(panel_checks)
+
     passes = not any(issue["severity"] == "critical" for issue in issues)
     checks = {
         "public_text_clean": not offending_lines,
         "placeholders_accounted_for": not bool(placeholder_ids) or (not placements or all(pid in placements for pid in placeholder_ids)),
         "section_count": len(spec.get("sections") or []),
         "placeholder_count": len(spec.get("placeholders") or []),
+        "panel_level_check_count": len(panel_checks),
     }
     summary = "No critical QA issues found." if passes else "Critical QA issues found; review placeholder metadata."
     score = max(0.0, 1.0 - 0.15 * len([issue for issue in issues if issue["severity"] == "critical"]) - 0.05 * len([issue for issue in issues if issue["severity"] == "warning"]))
@@ -733,6 +928,132 @@ def _deterministic_qa_checks(
         "checks": checks,
         "recommended_repairs": _dedupe_strings(repairs),
     }
+
+
+def _panel_level_qa_checks(
+    spec: Mapping[str, Any],
+    *,
+    detected_placeholders: Mapping[str, Any] | None,
+    image_path: str | Path | None,
+    qa_mode: str,
+) -> list[dict[str, Any]]:
+    """Lightweight local checks around each placement/cleanup panel.
+
+    This is inspired by Paper2Poster's panel-level visual loop, but deliberately
+    deterministic and low-intrusion: it checks local geometry, image bounds, and
+    detector/spec alignment before the LLM QA judges the full poster.
+    """
+    placements = spec.get("placements") or {}
+    if not isinstance(placements, Mapping) or not placements:
+        return []
+    clear_map = spec.get("_replacement_clear_boxes") or {}
+    placeholders = {str(item.get("id")): dict(item) for item in spec.get("placeholders") or []}
+    detected_map = {}
+    detected = dict(detected_placeholders or {})
+    if isinstance(detected.get("placements"), Mapping):
+        detected_map = dict(detected.get("placements") or {})
+    canvas_size: tuple[int, int] | None = None
+    if image_path:
+        try:
+            with Image.open(image_path) as im:
+                canvas_size = im.size
+        except Exception:
+            canvas_size = None
+
+    issues: list[dict[str, Any]] = []
+    for fig_id, raw_box in placements.items():
+        fig_id = str(fig_id)
+        box = _read_numeric_box(raw_box)
+        if not box:
+            continue
+        scope_box = _read_numeric_box(clear_map.get(fig_id)) or box
+        if canvas_size:
+            if not _box_inside_canvas(scope_box, canvas_size) or not _box_inside_canvas(box, canvas_size):
+                issues.append(
+                    {
+                        "severity": "warning",
+                        "category": "panel_geometry",
+                        "message": f"{fig_id} local panel box is outside the rendered poster bounds.",
+                        "location": f"spec.placements[{fig_id}]",
+                        "suggested_fix": "Rerun placeholder detection/normalization so every local figure panel stays inside the image canvas.",
+                    }
+                )
+            min_side = min(box[2] - box[0], box[3] - box[1])
+            if min_side < max(24, min(canvas_size) * 0.025):
+                issues.append(
+                    {
+                        "severity": "warning",
+                        "category": "panel_geometry",
+                        "message": f"{fig_id} local figure crop is very small relative to the poster.",
+                        "location": f"spec.placements[{fig_id}]",
+                        "suggested_fix": "Allocate a larger local panel or choose a less dense figure for this placeholder.",
+                    }
+                )
+
+        ph = placeholders.get(fig_id, {})
+        expected_ratio = _parse_aspect_ratio(str(ph.get("aspect") or ""))
+        if expected_ratio:
+            actual_ratio = (box[2] - box[0]) / max(1, box[3] - box[1])
+            rel_error = abs(actual_ratio / max(expected_ratio, 0.01) - 1.0)
+            if rel_error > 0.18:
+                issues.append(
+                    {
+                        "severity": "warning",
+                        "category": "panel_geometry",
+                        "message": f"{fig_id} placement ratio {actual_ratio:.2f}:1 differs from declared aspect {expected_ratio:.2f}:1.",
+                        "location": f"spec.placements[{fig_id}]",
+                        "suggested_fix": "Use the source asset aspect ratio when planning the local replacement crop.",
+                    }
+                )
+
+        if fig_id in detected_map:
+            detected_box = _read_numeric_box(detected_map.get(fig_id))
+            if detected_box:
+                iou = _box_iou(scope_box, detected_box)
+                # In final mode normalize_placeholder_geometry can intentionally
+                # shrink/shift the replacement target inside the original
+                # placeholder.  Low IoU is therefore a warning, not a failure.
+                threshold = 0.35 if qa_mode == "final" else 0.45
+                if iou < threshold:
+                    issues.append(
+                        {
+                            "severity": "warning",
+                            "category": "panel_detection_alignment",
+                            "message": f"{fig_id} local replacement boundary and detected placeholder differ substantially (IoU={iou:.2f}).",
+                            "location": f"spec._replacement_clear_boxes[{fig_id}]",
+                            "suggested_fix": "Review the placeholder crop; rerun detection or choose another generated variant if the local panel is misidentified.",
+                        }
+                    )
+    return issues
+
+
+def _read_numeric_box(value: Any) -> tuple[int, int, int, int] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)) or len(value) < 4:
+        return None
+    try:
+        x0, y0, x1, y1 = [int(round(float(item))) for item in value[:4]]
+    except Exception:
+        return None
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def _box_inside_canvas(box: tuple[int, int, int, int], canvas_size: tuple[int, int]) -> bool:
+    return box[0] >= 0 and box[1] >= 0 and box[2] <= canvas_size[0] and box[3] <= canvas_size[1]
+
+
+def _box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ox0 = max(a[0], b[0])
+    oy0 = max(a[1], b[1])
+    ox1 = min(a[2], b[2])
+    oy1 = min(a[3], b[3])
+    if ox1 <= ox0 or oy1 <= oy0:
+        return 0.0
+    overlap = (ox1 - ox0) * (oy1 - oy0)
+    area_a = max(1, (a[2] - a[0]) * (a[3] - a[1]))
+    area_b = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+    return overlap / max(1, area_a + area_b - overlap)
 
 
 def _find_forbidden_lines(payload: Mapping[str, Any], forbidden: Sequence[str]) -> list[dict[str, str]]:

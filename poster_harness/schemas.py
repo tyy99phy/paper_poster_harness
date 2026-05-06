@@ -274,7 +274,79 @@ def poster_spec_schema() -> dict[str, Any]:
             },
             "conclusion": {"type": "array", "items": {"type": "string"}},
             "closing": {"type": "string"},
+            "storyboard": {"type": "object", "additionalProperties": True},
             "text_overlays": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        },
+    }
+
+
+def storyboard_schema() -> dict[str, Any]:
+    return {
+        "$schema": JSON_SCHEMA_DRAFT,
+        "type": "object",
+        "additionalProperties": True,
+        "required": ["meta", "core_message", "sections", "visual_assets", "layout_tree", "qa_questions"],
+        "properties": {
+            "meta": {
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {
+                    "title": {"type": "string"},
+                    "authors": {"type": "string"},
+                    "audience": {"type": "string"},
+                    "one_sentence_takeaway": {"type": "string"},
+                },
+            },
+            "core_message": {"type": "string"},
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["id", "title", "role", "synopsis", "key_claims", "text_budget", "preferred_visual"],
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "title": {"type": "string"},
+                        "role": {"type": "string"},
+                        "synopsis": {"type": "string"},
+                        "key_claims": {"type": "array", "items": {"type": "string"}},
+                        "text_budget": {"type": "string"},
+                        "preferred_visual": {"type": "string"},
+                        "visual_keywords": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "visual_assets": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["asset", "caption", "figure_type", "relevance", "target_section", "role"],
+                    "properties": {
+                        "asset": {"type": "string"},
+                        "caption": {"type": "string"},
+                        "figure_type": {"type": "string"},
+                        "relevance": {"type": "string"},
+                        "target_section": {"type": "integer"},
+                        "role": {"type": "string"},
+                    },
+                },
+            },
+            "layout_tree": {
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {
+                    "reading_order": {"type": "array", "items": {"type": "integer"}},
+                    "hero_section": {"type": "integer"},
+                    "hero_visual_role": {"type": "string"},
+                    "layout_intent": {"type": "string"},
+                    "section_grouping": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            "qa_questions": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
         },
     }
 
@@ -296,6 +368,9 @@ def figure_selection_schema() -> dict[str, Any]:
                         "placeholder_id": {"type": "string"},
                         "asset": {"type": "string"},
                         "section": {"type": "integer"},
+                        "target_section": {"type": ["integer", "string"]},
+                        "role": {"type": "string"},
+                        "reason": {"type": "string"},
                         "label": {"type": "string"},
                         "aspect": {"type": "string"},
                         "priority": {"type": "integer"},

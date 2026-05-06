@@ -52,3 +52,35 @@ def test_figure_selection_ids_are_sequential_fig_numbers():
     normalized = _normalize_figure_selection(result, spec, assets, limit=2)
     assert [row["placeholder_id"] for row in normalized["selected_figures"]] == ["FIG 01", "FIG 02"]
     assert [row["asset"] for row in normalized["selected_figures"]] == ["limit.png", "dist.png"]
+
+
+def test_figure_selection_preserves_storyboard_fields():
+    from poster_harness.llm_stages import _normalize_figure_selection
+
+    assets = [{"asset": "mass.png", "width": 300, "height": 200, "aspect": "1.5:1 wide"}]
+    spec = {
+        "sections": [{"id": 1}, {"id": 5}],
+        "placeholders": [{"id": "RESULT", "section": 1}],
+    }
+    result = {
+        "selected_figures": [
+            {
+                "placeholder_id": "RESULT",
+                "asset": "mass.png",
+                "target_section": 5,
+                "label": "Mass comparison",
+                "aspect": "1.5:1 wide",
+                "priority": 1,
+                "role": "hero_result",
+                "reason": "Best headline comparison plot.",
+            }
+        ],
+        "selection_notes": [],
+    }
+    normalized = _normalize_figure_selection(result, spec, assets, limit=1)
+    row = normalized["selected_figures"][0]
+    assert row["section"] == 5
+    assert row["target_section"] == 5
+    assert row["role"] == "hero_result"
+    assert row["reason"] == "Best headline comparison plot."
+    assert row["rationale"] == "Best headline comparison plot."

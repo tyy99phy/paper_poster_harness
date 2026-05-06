@@ -206,8 +206,15 @@ def apply_figure_selection_to_spec(
         placeholder_id = _canonical_placeholder_id(item.get("placeholder_id") or item.get("id") or normalize_placeholder_id(index))
         row = existing.get(placeholder_id, {"id": placeholder_id})
         row["id"] = placeholder_id
-        if item.get("section") is not None:
-            row["section"] = int(_safe_int(item.get("section"), row.get("section") or 1))
+        section_value = item.get("section") if item.get("section") is not None else item.get("target_section")
+        if section_value is not None:
+            row["section"] = int(_safe_int(section_value, row.get("section") or 1))
+            row["target_section"] = row["section"]
+        if item.get("role"):
+            row["role"] = str(item["role"])
+        if item.get("reason") or item.get("rationale"):
+            row["reason"] = str(item.get("reason") or item.get("rationale"))
+            row["rationale"] = str(item.get("rationale") or item.get("reason"))
         if item.get("label"):
             row["label"] = str(item["label"])
         if item.get("aspect"):

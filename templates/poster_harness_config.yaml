@@ -62,6 +62,9 @@ autoposter:
   placeholder_aspect_tolerance: 0.2
   pdf_render_dpi: 220
   max_pages: 12
+  storyboard:
+    enabled: true
+    extra_instructions: ''
   figure_layout_policy: Use the selected source asset aspect ratio as the placeholder
     aspect ratio. Do not warp square plots into wide slots or moderate wide plots
     into arbitrary poster ratios. Readability should come from allocating more absolute

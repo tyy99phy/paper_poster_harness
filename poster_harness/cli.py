@@ -33,6 +33,7 @@ from .llm_stages import (
     draft_spec_from_text,
     qa_poster,
     select_figures,
+    storyboard_from_text,
 )
 from .schemas import DEFAULT_MODEL, default_poster_spec
 
@@ -226,13 +227,29 @@ def cmd_llm_draft_spec(args: argparse.Namespace) -> None:
     print(args.out)
 
 
+def cmd_llm_storyboard(args: argparse.Namespace) -> None:
+    text = _read_text_file(args.text)
+    spec = _load_spec_arg(args.spec) if args.spec else None
+    envelope = storyboard_from_text(
+        text,
+        assets_manifest=_load_optional_config(args.assets_manifest),
+        spec=spec,
+        provider=_llm_provider(args),
+        extra_instructions=args.extra_instructions or "",
+    )
+    _dump_llm_result(envelope, args.out)
+    print(args.out)
+
+
 def cmd_llm_select_figures(args: argparse.Namespace) -> None:
     text = _read_text_file(args.text)
     spec = _load_spec_arg(args.spec) if args.spec else None
+    storyboard = _load_optional_config(args.storyboard) if getattr(args, "storyboard", None) else None
     envelope = select_figures(
         text,
         _load_required_config(args.assets_manifest, "--assets-manifest"),
         spec=spec,
+        storyboard=storyboard,
         provider=_llm_provider(args),
         max_figures=args.max_figures,
     )
@@ -379,10 +396,34 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
     draft_spec_path = dirs["specs"] / "poster_spec.draft.yaml"
     dump_config(draft_spec, draft_spec_path)
 
+    storyboard: dict[str, Any] | None = None
+    storyboard_path: Path | None = None
+    storyboard_cfg = cfg_get(config, "autoposter.storyboard", {})
+    storyboard_enabled = True
+    storyboard_extra = ""
+    if isinstance(storyboard_cfg, Mapping):
+        storyboard_enabled = bool(storyboard_cfg.get("enabled", True))
+        storyboard_extra = str(storyboard_cfg.get("extra_instructions") or "")
+    elif storyboard_cfg is not None:
+        storyboard_enabled = bool(storyboard_cfg)
+    if storyboard_enabled:
+        storyboard_envelope = storyboard_from_text(
+            text,
+            assets_manifest=assets_manifest,
+            spec=draft_spec,
+            provider=provider,
+            extra_instructions=storyboard_extra,
+        )
+        storyboard = dict(storyboard_envelope["result"])
+        storyboard_path = dirs["specs"] / "storyboard.yaml"
+        dump_config(storyboard, storyboard_path)
+        draft_spec["storyboard"] = storyboard
+
     selection_envelope = select_figures(
         text,
         assets_manifest,
         spec=draft_spec,
+        storyboard=storyboard,
         provider=provider,
         max_figures=_opt(args.max_figures, config, "autoposter.max_figures", None),
         extra_instructions=str(cfg_get(config, "autoposter.figure_layout_policy", "") or ""),
@@ -396,6 +437,8 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         figure_selection,
         prune_unselected=not _opt_bool(args.keep_unselected_placeholders, config, "autoposter.keep_unselected_placeholders", False),
     )
+    if storyboard:
+        final_spec["storyboard"] = storyboard
     final_spec = _apply_spec_extras(final_spec, spec_extras)
     spec_path = dirs["specs"] / "poster_spec.yaml"
     dump_config(final_spec, spec_path)
@@ -419,6 +462,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         "source_roots": [str(p) for p in source_roots],
         "assets_manifest": str(assets_manifest_path),
         "draft_spec": str(draft_spec_path),
+        "storyboard": str(storyboard_path) if storyboard_path else "",
         "figure_selection": str(figure_selection_path),
         "poster_spec": str(spec_path),
         "prompt": str(prompt_path),
@@ -1118,11 +1162,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--config")
     p.set_defaults(func=cmd_llm_draft_spec)
 
+    p = sub.add_parser("llm-storyboard", help="draft a structured storyboard from source text and assets")
+    p.add_argument("--text", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--assets-manifest")
+    p.add_argument("--spec")
+    p.add_argument("--extra-instructions")
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--config")
+    p.set_defaults(func=cmd_llm_storyboard)
+
     p = sub.add_parser("llm-select-figures", help="select and map figure assets onto poster placeholders")
     p.add_argument("--text", required=True)
     p.add_argument("--assets-manifest", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--spec")
+    p.add_argument("--storyboard")
     p.add_argument("--max-figures", type=int)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--config")

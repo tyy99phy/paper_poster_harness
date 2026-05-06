@@ -84,6 +84,10 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
         "placeholder_aspect_tolerance": 0.20,
         "pdf_render_dpi": 220,
         "max_pages": 12,
+        "storyboard": {
+            "enabled": True,
+            "extra_instructions": "",
+        },
         "figure_layout_policy": (
             "Use the selected source asset aspect ratio as the placeholder aspect ratio. "
             "Do not warp square plots into wide slots or moderate wide plots into arbitrary poster ratios. "
