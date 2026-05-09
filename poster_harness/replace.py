@@ -35,6 +35,7 @@ def replace_placeholders(
             tuple[int, int, int, int],
             tuple[int, int, int, int],
             tuple[int, int, int, int],
+            bool,
         ]
     ] = []
 
@@ -86,19 +87,27 @@ def replace_placeholders(
             scale=scale,
             canvas_size=canvas.size,
         ) or cleanup_box
+        aspect_ratio = _parse_placeholder_aspect(str(ph.get("aspect") or "")) or _box_ratio((x0, y0, x1, y1))
+        is_square_result = _is_result_like_square_placeholder(ph, aspect_ratio)
+        if is_square_result:
+            erase_box = _intersect_box(erase_box, cleanup_box) or cleanup_box
+            frame_box = _intersect_box(frame_box, cleanup_box) or cleanup_box
         if not _is_contained((x0, y0, x1, y1), frame_box, margin=0):
             frame_box = _union_box(frame_box, (x0, y0, x1, y1))
             frame_box = _clamp_box(frame_box, canvas.size)
-        render_items.append((str(fig_id), assets / asset, (x0, y0, x1, y1), cleanup_box, erase_box, frame_box))
+        render_items.append((str(fig_id), assets / asset, (x0, y0, x1, y1), cleanup_box, erase_box, frame_box, is_square_result))
 
     _validate_render_plan(render_items, canvas_size=canvas.size)
 
     if not dry_run:
-        for _, _, _, _, erase_box, frame_box in render_items:
-            _erase_final_placeholder_region(canvas, erase_box)
+        for _, _, _, _, erase_box, frame_box, is_square_result in render_items:
+            if is_square_result:
+                _erase_placeholder_region_with_sampled_fill(canvas, erase_box)
+            else:
+                _erase_final_placeholder_region(canvas, erase_box)
             _draw_final_figure_frame(canvas, frame_box)
 
-    for fig_id, asset_path, box, _, _, _ in render_items:
+    for fig_id, asset_path, box, _, _, _, _ in render_items:
         if dry_run:
             _draw_debug_box(canvas, box, fig_id)
             continue
@@ -166,9 +175,18 @@ def _default_erase_box(
 ) -> tuple[int, int, int, int]:
     visual_scale = max(float(scale), canvas_size[0] / 1024.0, canvas_size[1] / 1536.0)
     pad = int(round(6 * visual_scale))
+    aspect_ratio = _parse_placeholder_aspect(str(ph.get("aspect") or "")) or _box_ratio(cleanup_box)
+    if _is_result_like_square_placeholder(ph, aspect_ratio):
+        # Square headline/result plots often sit immediately above another
+        # summary/conclusion module.  A symmetric erase pad is visually unsafe:
+        # it creates a plain white rectangle outside the real placeholder even
+        # when the plotted image itself is contained.  For these dense hero
+        # result cards, the final visible envelope must be exactly the detected
+        # placeholder, not a padded cleanup rectangle.
+        return cleanup_box
     if _is_lower_hero_placeholder(
         ph,
-        _parse_placeholder_aspect(str(ph.get("aspect") or "")) or 1.0,
+        aspect_ratio,
         cleanup_box,
         canvas_size,
     ):
@@ -191,6 +209,85 @@ def _erase_final_placeholder_region(canvas: Image.Image, box: tuple[int, int, in
     canvas.paste(Image.new("RGB", (w, h), (255, 255, 255)), (x0, y0))
 
 
+def _erase_placeholder_region_with_sampled_fill(canvas: Image.Image, box: tuple[int, int, int, int]) -> None:
+    """Erase a square-result placeholder without creating a huge white board.
+
+    For dense headline result cards, the original image-generation placeholder
+    is often a dashed rectangle on a cream/gradient card.  Clearing that whole
+    region to pure white makes a giant "white board" that looks larger than the
+    intended placeholder.  Instead, only paint over the actual placeholder
+    artifacts (dark text/dashes) with a sampled local card fill; the smaller
+    publication frame is drawn separately around the real figure.
+    """
+    x0, y0, x1, y1 = box
+    w, h = max(1, x1 - x0), max(1, y1 - y0)
+    crop = canvas.crop((x0, y0, x1, y1)).convert("RGB")
+    mask = _placeholder_artifact_mask(crop)
+    if mask.getbbox() is None:
+        return
+    # The mask is sparse, so a local blurred repair removes glyph/dash pixels
+    # without creating a visible large same-color rectangle.
+    repair = crop.filter(ImageFilter.GaussianBlur(radius=max(3, min(14, min(w, h) // 28))))
+    canvas.paste(repair, (x0, y0), mask)
+
+
+def _placeholder_artifact_mask(crop: Image.Image) -> Image.Image:
+    """Mask only placeholder labels/dashes, not the whole placeholder panel."""
+    rgb = crop.convert("RGB")
+    mask = Image.new("L", rgb.size, 0)
+    px = rgb.load()
+    mp = mask.load()
+    for y in range(rgb.height):
+        for x in range(rgb.width):
+            pixel = px[x, y]
+            if _is_square_placeholder_artifact_pixel(pixel):
+                mp[x, y] = 255
+    # Cover anti-aliased edges around glyphs/dashes without making a large
+    # rectangular patch.  Keep dilation modest; the visible plot frame covers
+    # most central label text anyway.
+    mask = mask.filter(ImageFilter.MaxFilter(7))
+    return mask.filter(ImageFilter.GaussianBlur(radius=0.7))
+
+
+def _is_square_placeholder_artifact_pixel(pixel: tuple[int, int, int]) -> bool:
+    r, g, b = pixel
+    mx, mn = max(pixel), min(pixel)
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    chroma = mx - mn
+    # Placeholder text/dashes are neutral dark gray/black in the generated
+    # layouts.  Avoid broad saturated blue/gold detector artwork in the card.
+    if lum < 225 and chroma < 80:
+        return True
+    if lum < 145:
+        return True
+    return False
+
+
+def _sample_light_card_fill(canvas: Image.Image, box: tuple[int, int, int, int]) -> tuple[int, int, int]:
+    x0, y0, x1, y1 = _pad_box(box, 0, canvas.size)
+    pixels = canvas.load()
+    step = max(1, int(round(min(max(1, x1 - x0), max(1, y1 - y0)) / 90)))
+    samples: list[tuple[int, int, int]] = []
+    for y in range(y0, y1, step):
+        for x in range(x0, x1, step):
+            pixel = pixels[x, y]
+            if _is_placeholder_line_pixel(pixel):
+                continue
+            r, g, b = pixel
+            lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            if lum < 190:
+                continue
+            if max(pixel) - min(pixel) > 95:
+                continue
+            samples.append(pixel)
+    if not samples:
+        return (248, 246, 240)
+    samples.sort(key=lambda p: 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
+    # Use a lower-middle bright sample rather than the maximum; this avoids
+    # turning a cream CMS card into a stark white rectangle.
+    return samples[int(len(samples) * 0.35)]
+
+
 def _validate_render_plan(
     items: list[
         tuple[
@@ -200,6 +297,7 @@ def _validate_render_plan(
             tuple[int, int, int, int],
             tuple[int, int, int, int],
             tuple[int, int, int, int],
+            bool,
         ]
     ],
     *,
@@ -213,7 +311,7 @@ def _validate_render_plan(
     behavior is to reject the generated/detected geometry so the pipeline can
     choose another variant or report a real error.
     """
-    for fig_id, _asset, target, cleanup, _erase, _frame in items:
+    for fig_id, _asset, target, cleanup, _erase, _frame, _is_square_result in items:
         if not _is_contained(target, cleanup, margin=0):
             raise ValueError(
                 f"{fig_id} target box {list(target)} is not fully contained by "
@@ -238,8 +336,8 @@ def _validate_render_plan(
                 )
     for i in range(len(items)):
         for j in range(i + 1, len(items)):
-            id_i, _asset_i, box_i, _cleanup_i, _erase_i, _frame_i = items[i]
-            id_j, _asset_j, box_j, _cleanup_j, _erase_j, _frame_j = items[j]
+            id_i, _asset_i, box_i, _cleanup_i, _erase_i, _frame_i, _is_square_i = items[i]
+            id_j, _asset_j, box_j, _cleanup_j, _erase_j, _frame_j, _is_square_j = items[j]
             overlap = _box_overlap(box_i, box_j)
             if overlap <= 0:
                 continue
@@ -347,6 +445,8 @@ def normalize_placeholder_geometry(
     clear_boxes: dict[str, list[int]] = {}
     erase_boxes: dict[str, list[int]] = {}
     frame_boxes: dict[str, list[int]] = {}
+    preexisting_clear_mapping = updated.get("_replacement_clear_boxes") or {}
+    contract_search_mapping = updated.get("_layout_contract_search_boxes") or {}
     draw_plans: list[tuple[str, str, str, tuple[int, int, int, int], tuple[int, int, int, int]]] = []
 
     for fig_id, raw_box in placements.items():
@@ -365,6 +465,24 @@ def normalize_placeholder_geometry(
         source_box = _find_enclosing_placeholder_panel(canvas, original_box, ratio) or original_box
         source_box = _repair_edge_wide_source_box(source_box, original_box, ratio, canvas.size)
         source_box = _enforce_canvas_gutter(source_box, canvas.size)
+        contract_search_box = _read_optional_box(
+            contract_search_mapping,
+            str(fig_id),
+            scale=scale,
+            canvas_size=canvas.size,
+        )
+        source_box = _apply_layout_contract_search_constraint(
+            source_box,
+            original_box,
+            contract_search_box,
+            ratio,
+        )
+        source_box = _refine_square_result_source_to_dashed_placeholder(
+            canvas,
+            source_box,
+            ph,
+            ratio,
+        )
         raw_source_box = source_box
         source_box = _constrain_lower_hero_placeholder_box(source_box, ratio, ph, canvas.size)
         lower_hero = _is_lower_hero_placeholder(ph, ratio, source_box, canvas.size)
@@ -420,7 +538,11 @@ def normalize_placeholder_geometry(
             # instead apply a small top-left nudge while clearing the original
             # seed area to avoid leftover placeholder text.
             source_ratio_error = _ratio_relative_error(_box_ratio(source_box), ratio)
-            if source_box == original_box and source_ratio_error <= 0.12:
+            if (
+                source_box == original_box
+                and source_ratio_error <= 0.12
+                and str(fig_id) not in preexisting_clear_mapping
+            ):
                 nudged = _nudge_square_result_box(box, ratio, label, canvas.size)
                 if nudged != box:
                     # Move the final white publication frame with the square
@@ -453,6 +575,15 @@ def normalize_placeholder_geometry(
                     # can remain at the original bottom/right edges.
                     erase_box = _clamp_box(_union_box(erase_box, frame_box), canvas.size)
                     box = nudged
+            box, clear_box, erase_box, frame_box = _repair_square_result_replacement_plan(
+                box=box,
+                clear_box=clear_box,
+                erase_box=erase_box,
+                frame_box=frame_box,
+                ph=ph,
+                ratio=ratio,
+                canvas_size=canvas.size,
+            )
         draw_plans.append((str(fig_id), label, str(ph.get("aspect") or ""), clear_box, box))
         if scale != 1:
             new_placements[str(fig_id)] = [int(round(v / scale)) for v in box]
@@ -563,13 +694,14 @@ def audit_generated_placeholder_geometry(
             visible_box,
             canvas.size,
         ):
+            bottom_limit = _RESULT_SQUARE_MAX_BOTTOM_FRACTION
             issues.append(
                 {
                     "id": str(fig_id),
                     "expected_ratio": round(expected, 4),
                     "actual_ratio": round(actual, 4),
                     "bottom_fraction": round(visible_box[3] / max(1, canvas.height), 4),
-                        "bottom_limit": 0.820,
+                    "bottom_limit": bottom_limit,
                     "detected_box": list(detected_box),
                     "visible_box": list(visible_box),
                     "message": (
@@ -618,11 +750,14 @@ def _box_too_large_for_result_square(
     return side > canvas_size[0] * max_canvas_width_fraction
 
 
+_RESULT_SQUARE_MAX_BOTTOM_FRACTION = 0.835
+
+
 def _box_too_low_for_result_square(
     box: tuple[int, int, int, int],
     canvas_size: tuple[int, int],
     *,
-    max_bottom_fraction: float = 0.820,
+    max_bottom_fraction: float = _RESULT_SQUARE_MAX_BOTTOM_FRACTION,
 ) -> bool:
     return box[3] > canvas_size[1] * max_bottom_fraction
 
@@ -870,6 +1005,19 @@ def _union_box(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> tu
     return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
 
 
+def _intersect_box(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+) -> tuple[int, int, int, int] | None:
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
 def _pad_box(box: tuple[int, int, int, int], pad: int, canvas_size: tuple[int, int]) -> tuple[int, int, int, int]:
     x0, y0, x1, y1 = box
     w, h = canvas_size
@@ -932,6 +1080,218 @@ def _repair_edge_wide_source_box(
         max(source_box[2], ox1),
         min(canvas_h, max(source_box[3], oy1 + y_pad)),
     )
+
+
+def _apply_layout_contract_search_constraint(
+    source_box: tuple[int, int, int, int],
+    original_box: tuple[int, int, int, int],
+    search_box: tuple[int, int, int, int] | None,
+    ratio: float,
+) -> tuple[int, int, int, int]:
+    """Use the planned layout search zone to reject obvious over-expansions.
+
+    This is not a fallback placement: the LLM-detected/or pixel-recovered box
+    remains the evidence source.  The contract only prevents border recovery
+    from expanding a placeholder seed into a whole neighboring card/section when
+    the generated art has many similar light/dashed edges.
+    """
+    if search_box is None:
+        return source_box
+    if _box_area(source_box) <= 0 or _box_area(search_box) <= 0:
+        return source_box
+    if _box_area(source_box) <= _box_area(search_box) * 1.12:
+        return source_box
+
+    ix0 = max(source_box[0], search_box[0])
+    iy0 = max(source_box[1], search_box[1])
+    ix1 = min(source_box[2], search_box[2])
+    iy1 = min(source_box[3], search_box[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return source_box
+    clipped = (ix0, iy0, ix1, iy1)
+    # Only clip when the original detection seed still has meaningful support
+    # inside the clipped region; otherwise the contract is probably stale for
+    # this artistic variant and strict QA should reject later.
+    seed_overlap = _box_overlap(clipped, original_box) / max(1, _box_area(original_box))
+    if seed_overlap < 0.35:
+        return source_box
+    source_ratio_error = _ratio_relative_error(_box_ratio(source_box), ratio)
+    clipped_ratio_error = _ratio_relative_error(_box_ratio(clipped), ratio)
+    if clipped_ratio_error > max(0.45, source_ratio_error + 0.25):
+        return source_box
+    if _box_area(clipped) < _box_area(original_box) * 0.75:
+        return source_box
+    return clipped
+
+
+def _refine_square_result_source_to_dashed_placeholder(
+    canvas: Image.Image,
+    source_box: tuple[int, int, int, int],
+    ph: dict[str, Any],
+    ratio: float,
+) -> tuple[int, int, int, int]:
+    """Recover the original dashed placeholder inside a generated result card.
+
+    Vision detection sometimes returns the whole light result-card surface rather
+    than the actual dashed [FIG NN] placeholder drawn by image_generation.  Later
+    replacement then treats our self-drawn white publication panel as the
+    "placeholder", which is exactly the failure mode the user noticed.  This pass
+    re-anchors square result figures to the initial dashed border pixels in the
+    generated layout before any final frame or real image is pasted.
+    """
+    if not _is_result_like_square_placeholder(ph, ratio):
+        return source_box
+    x0, y0, x1, y1 = source_box
+    width = max(1, x1 - x0)
+    height = max(1, y1 - y0)
+    if width < 80 or height < 80:
+        return source_box
+
+    row_groups = _placeholder_line_groups(
+        canvas,
+        source_box,
+        axis="row",
+        threshold=max(80, int(round(width * 0.16))),
+    )
+    if len(row_groups) < 2:
+        return source_box
+    cy = (y0 + y1) / 2
+    top_candidates = [item for item in row_groups if item[0][1] < cy - height * 0.05]
+    bottom_candidates = [item for item in row_groups if item[0][0] > cy + height * 0.05]
+    if not top_candidates or not bottom_candidates:
+        return source_box
+
+    # Ignore an outer card edge at the very top when there is an inner dashed
+    # placeholder row below it.
+    inner_top = [item for item in top_candidates if item[0][0] >= y0 + max(8, height * 0.030)]
+    top_group, _top_count = min(inner_top or top_candidates, key=lambda item: item[0][0])
+    # Ignore an outer card edge at the very bottom when an inner dashed
+    # placeholder row is available.  Among inner candidates, the dashed bottom
+    # line usually has the strongest long support; card/arc edges below it tend
+    # to be shorter/weaker.
+    inner_bottom = [item for item in bottom_candidates if item[0][1] <= y1 - max(8, height * 0.030)]
+    bottom_group, _bottom_count = max(inner_bottom or bottom_candidates, key=lambda item: (item[1], item[0][1]))
+    top = top_group[0]
+    bottom = bottom_group[1] + 1
+    if bottom <= top + max(40, height * 0.40):
+        return source_box
+
+    row_refined = (x0, top, x1, bottom)
+    col_groups = _placeholder_line_groups(
+        canvas,
+        row_refined,
+        axis="col",
+        threshold=max(80, int(round((bottom - top) * 0.14))),
+    )
+    if len(col_groups) < 2:
+        return source_box
+    cx = (x0 + x1) / 2
+    left_candidates = [item for item in col_groups if item[0][1] < cx - width * 0.05]
+    right_candidates = [item for item in col_groups if item[0][0] > cx + width * 0.05]
+    if not left_candidates or not right_candidates:
+        return source_box
+    panel = _choose_square_result_column_pair(
+        left_candidates,
+        right_candidates,
+        top=top,
+        bottom=bottom,
+        source_box=source_box,
+        ratio=ratio,
+    )
+    if panel is None:
+        return source_box
+    if _box_area(panel) < _box_area(source_box) * 0.45:
+        return source_box
+    if _box_overlap(panel, source_box) / max(1, _box_area(panel)) < 0.95:
+        return source_box
+    # The image model may draw a slightly landscape dashed result slot.  That is
+    # acceptable as a source placeholder; the real plot is still fitted as a
+    # square inside it.  Reject only clearly unrelated long lines.
+    if _ratio_relative_error(_box_ratio(panel), ratio) > 0.35:
+        return source_box
+    # Require a meaningful correction; one-pixel line jitter should not churn.
+    edge_delta = max(abs(panel[0] - x0), abs(panel[1] - y0), abs(panel[2] - x1), abs(panel[3] - y1))
+    if edge_delta < max(6, min(width, height) * 0.015):
+        return source_box
+    return panel
+
+
+def _choose_square_result_column_pair(
+    left_candidates: list[tuple[tuple[int, int], int]],
+    right_candidates: list[tuple[tuple[int, int], int]],
+    *,
+    top: int,
+    bottom: int,
+    source_box: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int] | None:
+    x0, _y0, x1, _y1 = source_box
+    source_w = max(1, x1 - x0)
+    panel_h = max(1, bottom - top)
+    edge_tol = max(8, source_w * 0.030)
+    best: tuple[float, tuple[int, int, int, int]] | None = None
+    has_inner_left = any(item[0][0] >= x0 + edge_tol for item in left_candidates)
+    has_inner_right = any(item[0][1] <= x1 - edge_tol for item in right_candidates)
+    for left_group, left_count in left_candidates:
+        for right_group, right_count in right_candidates:
+            left = left_group[0]
+            right = right_group[1] + 1
+            width = right - left
+            if width <= 0:
+                continue
+            if width < source_w * 0.55:
+                continue
+            if width * panel_h < _box_area(source_box) * 0.45:
+                continue
+            rel = _ratio_relative_error(width / panel_h, ratio)
+            if rel > 0.45:
+                continue
+            edge_penalty = 0.0
+            if has_inner_left and left <= x0 + edge_tol:
+                edge_penalty += 0.03
+            if has_inner_right and right >= x1 - edge_tol:
+                edge_penalty += 0.03
+            # Prefer longer continuous line evidence when geometry is otherwise
+            # similar, but don't let an outer card border win purely by strength.
+            strength_bonus = min(0.04, (left_count + right_count) / max(1, panel_h * 2) * 0.03)
+            score = rel + edge_penalty - strength_bonus
+            candidate = (left, top, right, bottom)
+            if best is None or score < best[0]:
+                best = (score, candidate)
+    return best[1] if best else None
+
+
+def _placeholder_line_groups(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+    *,
+    axis: str,
+    threshold: int,
+) -> list[tuple[tuple[int, int], int]]:
+    x0, y0, x1, y1 = _pad_box(box, 0, canvas.size)
+    pixels = canvas.load()
+    scores: list[tuple[int, int]] = []
+    if axis == "row":
+        for y in range(y0, y1):
+            count = 0
+            for x in range(x0, x1, 2):
+                if _is_placeholder_line_pixel(pixels[x, y]):
+                    count += 2
+            if count >= threshold:
+                scores.append((y, count))
+    elif axis == "col":
+        for x in range(x0, x1):
+            count = 0
+            for y in range(y0, y1, 2):
+                if _is_placeholder_line_pixel(pixels[x, y]):
+                    count += 2
+            if count >= threshold:
+                scores.append((x, count))
+    else:
+        return []
+    groups = _cluster_line_positions([pos for pos, _ in scores], max_gap=2)
+    counts = _group_max_counts(groups, scores)
+    return [(group, counts.get(group, 0)) for group in groups]
 
 
 def _find_enclosing_placeholder_panel(
@@ -1900,6 +2260,166 @@ def _nudge_square_result_box(
     return box[0], ny0, box[2], ny0 + height
 
 
+def _repair_square_result_replacement_plan(
+    *,
+    box: tuple[int, int, int, int],
+    clear_box: tuple[int, int, int, int],
+    erase_box: tuple[int, int, int, int],
+    frame_box: tuple[int, int, int, int],
+    ph: dict[str, Any],
+    ratio: float,
+    canvas_size: tuple[int, int],
+) -> tuple[
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+]:
+    """Keep square result replacement plans visually contained.
+
+    This is the deterministic single-figure repair pass used after hidden
+    normalization.  It does not invent a new layout; it only makes the final
+    target/frame/erase rectangles self-consistent with the detected placeholder.
+    The visible white frame/erase envelope stays exactly inside the placeholder,
+    while the real scientific plot is inset slightly.  This is deliberately
+    different from "erasing a protruding white border": the real plot itself is
+    made smaller so the poster keeps a clean margin inside the placeholder.
+    """
+    if not _is_result_like_square_placeholder(ph, ratio):
+        return box, clear_box, erase_box, frame_box
+
+    if not _is_contained(box, clear_box, margin=0):
+        box = _fit_box_to_ratio_inside(clear_box, ratio)
+
+    box = _inset_square_result_target_box(clear_box, ratio)
+
+    # For square result cards, *any* visible white envelope outside the original
+    # placeholder reads as a protruding block.  Clip every edge to the detected
+    # placeholder; do not keep the earlier side/top over-erase.
+    frame_box = _square_result_frame_around_target(box, clear_box)
+    erase_box = _intersect_box(erase_box, clear_box) or clear_box
+    return box, clear_box, erase_box, frame_box
+
+
+def _square_result_frame_around_target(
+    box: tuple[int, int, int, int],
+    clear_box: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    side = min(max(1, box[2] - box[0]), max(1, box[3] - box[1]))
+    pad = max(10, min(42, int(round(side * 0.040))))
+    return _intersect_box(_pad_box(box, pad, (10**9, 10**9)), clear_box) or box
+
+
+def _inset_square_result_target_box(
+    clear_box: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int]:
+    """Return a slightly smaller real-figure target inside a result placeholder."""
+    x0, y0, x1, y1 = clear_box
+    w = max(1, x1 - x0)
+    h = max(1, y1 - y0)
+    side = min(w, h)
+    inset = max(2, min(96, int(round(side * _RESULT_SQUARE_TARGET_INSET_FRACTION))))
+    if w <= inset * 2 + 12 or h <= inset * 2 + 12:
+        return _fit_box_to_ratio_inside(clear_box, ratio)
+    inner = (x0 + inset, y0 + inset, x1 - inset, y1 - inset)
+    return _fit_box_to_ratio_inside(inner, ratio)
+
+
+_RESULT_SQUARE_TARGET_INSET_FRACTION = 0.085
+_RESULT_SQUARE_MIN_INSET_FRACTION = 0.070
+
+
+def _square_result_downward_erase_tolerance(
+    box: tuple[int, int, int, int],
+    canvas_size: tuple[int, int] | None = None,
+) -> int:
+    """Small tolerance for anti-aliased bottom strokes, not visible protrusions."""
+    side = min(max(1, box[2] - box[0]), max(1, box[3] - box[1]))
+    canvas_hint = min(canvas_size or (side, side))
+    return max(3, min(24, int(round(min(side * 0.015, canvas_hint * 0.004)))))
+
+
+def _box_exceeds_outer(
+    inner: tuple[int, int, int, int],
+    outer: tuple[int, int, int, int],
+    *,
+    tolerance: int = 0,
+) -> bool:
+    return (
+        inner[0] < outer[0] - tolerance
+        or inner[1] < outer[1] - tolerance
+        or inner[2] > outer[2] + tolerance
+        or inner[3] > outer[3] + tolerance
+    )
+
+
+def _square_result_inner_margin_issue(
+    fig_id: str,
+    box: tuple[int, int, int, int],
+    clear: tuple[int, int, int, int],
+) -> dict[str, Any] | None:
+    side = min(max(1, clear[2] - clear[0]), max(1, clear[3] - clear[1]))
+    required = int(round(side * _RESULT_SQUARE_MIN_INSET_FRACTION))
+    insets = {
+        "left": box[0] - clear[0],
+        "top": box[1] - clear[1],
+        "right": clear[2] - box[2],
+        "bottom": clear[3] - box[3],
+    }
+    min_inset = min(insets.values())
+    if min_inset >= required:
+        return None
+    return {
+        "severity": "warning",
+        "category": "figure_inner_margin",
+        "id": fig_id,
+        "message": (
+            f"{fig_id} real square-result figure is too close to the placeholder edge "
+            f"(minimum inset {min_inset}px; required at least {required}px)"
+        ),
+        "location": f"spec.placements[{fig_id}]",
+        "insets": insets,
+        "required_inset": required,
+        "suggested_fix": (
+            "Shrink this square result figure target inside its placeholder so the "
+            "final plot has a visible safety margin on all four sides."
+        ),
+    }
+
+
+def _square_result_frame_size_issue(
+    fig_id: str,
+    box: tuple[int, int, int, int],
+    frame: tuple[int, int, int, int],
+    clear: tuple[int, int, int, int],
+) -> dict[str, Any] | None:
+    target_area = max(1, _box_area(box))
+    frame_area = max(1, _box_area(frame))
+    area_ratio = frame_area / target_area
+    clear_area_ratio = frame_area / max(1, _box_area(clear))
+    max_ratio = 1.28
+    max_clear_fraction = 0.90
+    if area_ratio <= max_ratio and clear_area_ratio <= max_clear_fraction:
+        return None
+    return {
+        "severity": "warning",
+        "category": "figure_frame_oversized",
+        "id": fig_id,
+        "message": (
+            f"{fig_id} visible white figure board is too large relative to the "
+            f"real plot target (frame/target area ratio {area_ratio:.2f})"
+        ),
+        "location": f"spec._replacement_frame_boxes[{fig_id}]",
+        "frame_area_ratio": round(area_ratio, 3),
+        "frame_clear_fraction": round(clear_area_ratio, 3),
+        "suggested_fix": (
+            "Keep the broad placeholder erase separate from the visible frame; "
+            "draw the white publication board tightly around the real plot."
+        ),
+    }
+
+
 def _constrain_lower_hero_placeholder_box(
     box: tuple[int, int, int, int],
     ratio: float,
@@ -2138,6 +2658,8 @@ def audit_figure_containment(
     issues: list[dict[str, Any]] = []
     placements = spec.get("placements") or {}
     clear_boxes = spec.get("_replacement_clear_boxes") or {}
+    erase_boxes = spec.get("_replacement_erase_boxes") or {}
+    frame_boxes = spec.get("_replacement_frame_boxes") or {}
     placeholders = {str(p.get("id")): p for p in spec.get("placeholders", [])}
 
     fig_boxes: dict[str, tuple[int, int, int, int]] = {}
@@ -2150,7 +2672,6 @@ def audit_figure_containment(
 
     for fig_id, box in fig_boxes.items():
         ph = placeholders.get(fig_id, {})
-        label = str(ph.get("label") or fig_id)
         # Use the clear box (the detected placeholder boundary) as the
         # containment envelope.  If no clear box exists, skip the check.
         raw_clear = clear_boxes.get(fig_id)
@@ -2173,6 +2694,58 @@ def audit_figure_containment(
                         "detected placeholder boundary."
                     ),
                 })
+            expected = _parse_placeholder_aspect(str(ph.get("aspect") or "")) or _box_ratio(box)
+            if _is_result_like_square_placeholder(ph, expected):
+                margin_issue = _square_result_inner_margin_issue(fig_id, box, clear)
+                if margin_issue:
+                    issues.append(margin_issue)
+                tolerance = _square_result_downward_erase_tolerance(clear)
+                raw_erase = erase_boxes.get(fig_id)
+                if raw_erase:
+                    try:
+                        erase = tuple(int(round(float(v) * scale)) for v in raw_erase)
+                    except Exception:
+                        erase = None
+                    if erase and _box_exceeds_outer(erase, clear, tolerance=tolerance):
+                        issues.append({
+                            "severity": "warning",
+                            "category": "figure_visual_envelope",
+                            "id": fig_id,
+                            "message": (
+                                f"{fig_id} erase box {list(erase)} protrudes outside "
+                                f"the detected square-result placeholder {list(clear)}"
+                            ),
+                            "location": f"spec._replacement_erase_boxes[{fig_id}]",
+                            "suggested_fix": (
+                                "Clip the visible erase envelope to the placeholder and "
+                                "repair only this figure's replacement geometry."
+                            ),
+                        })
+                raw_frame = frame_boxes.get(fig_id)
+                if raw_frame:
+                    try:
+                        frame = tuple(int(round(float(v) * scale)) for v in raw_frame)
+                    except Exception:
+                        frame = None
+                    if frame and _box_exceeds_outer(frame, clear, tolerance=tolerance):
+                        issues.append({
+                            "severity": "warning",
+                            "category": "figure_visual_envelope",
+                            "id": fig_id,
+                            "message": (
+                                f"{fig_id} frame box {list(frame)} protrudes outside "
+                                f"the detected square-result placeholder {list(clear)}"
+                            ),
+                            "location": f"spec._replacement_frame_boxes[{fig_id}]",
+                            "suggested_fix": (
+                                "Keep the final square-result publication frame inside "
+                                "the placeholder envelope."
+                            ),
+                        })
+                    if frame:
+                        frame_issue = _square_result_frame_size_issue(fig_id, box, frame, clear)
+                        if frame_issue:
+                            issues.append(frame_issue)
 
     # Check for figure-figure overlaps
     fig_ids = list(fig_boxes.keys())

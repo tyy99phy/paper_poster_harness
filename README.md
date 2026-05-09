@@ -50,10 +50,11 @@ AI 图片模型有一个致命问题：它会"发明"看起来很专业的科学
 arXiv / 本地论文
   → 提取文本 + 图片素材
   → LLM 起草 poster_spec（包含版式描述、章节、占位符规格）
-  → LLM 生成 storyboard（叙事主线、阅读顺序、图文角色、读者问题）
+  → LLM 生成 storyboard（叙事主线、阅读顺序、图文角色、读者问题、信息密度计划）
   → LLM 从素材中挑选最有价值的图片，分配给 [FIG 01]、[FIG 02] ...
   → 组装完整 prompt，发给生图模型
   → 生图模型画海报（只含空白占位符，不画科学内容）
+  → template critic 检查信息量、艺术性、文字质量、占位符合规性；不合格则带 critique 重新整张生图
   → LLM 视觉检测每个占位符的像素坐标
   → 占位符 QA（检查是否空白、是否可读、比例和局部 panel 是否合理）
   → 将真实论文图片按坐标插入
@@ -88,12 +89,32 @@ image_generation:
   model: gpt-5.5
   size: 1024x1536
   quality: high
-  variants: 3                # 生成几个候选
+  variants: 2                # 每轮生成几个候选
   generated_scale: 4.0       # 生成后立即超分的倍数
   upscale_factor: 4.0        # 最终导出放大倍数
+autoposter:
+  required_successes: 2      # 最终保留几组通过 QA 的海报
+  max_candidate_batches: 3   # 不够时最多再生成几轮候选
 ```
 
-默认生成 3 个候选模板，只导出通过严格占位符 QA 的版本。
+默认最终产出 2 组合格海报供用户选择。框架会先生成候选模板，并启用 template critic；每个候选还要通过 placeholder QA、替图 containment QA 和 final QA。若合格成品不足 2 组，会继续生成下一批候选，直到达到 `required_successes` 或超过 `max_candidate_batches` 后报错。
+
+
+### Template critic / 整张重生图
+
+```yaml
+autoposter:
+  template_critic:
+    enabled: true
+    require_pass: true
+    max_regen_rounds: 1
+    min_overall_score: 0.72
+    min_artistry_score: 0.65
+    min_information_density_score: 0.65
+    min_placeholder_contract_score: 0.75
+```
+
+这个阶段借鉴 Paper2Poster 的 visual-in-the-loop 思路，但仍保留我们的路线：**不手工补文字、不拼接旧图，而是把 critic 反馈交回生图模型重新生成完整 poster**。
 
 ### 样式预设
 
@@ -221,6 +242,7 @@ poster-harness autoposter --config poster_harness.yaml \
 
 说明生图模型在占位符里画了不该画的东西，或者占位符编号不清晰。可以：
 - 增大 `variants`（多生成几个候选）
+- 增大 `autoposter.max_candidate_batches`（允许更多批次补足 2 组合格海报）
 - 调整 prompt（见 `docs/prompt_contract.md`）
 - 降低 `min_detection_confidence`（但可能引入误检）
 
@@ -233,6 +255,7 @@ poster-harness autoposter --config poster_harness.yaml \
 - [prompt 合约说明](docs/prompt_contract.md) — 生图模型需要遵守的占位符规则
 - [质量策略](docs/quality_policy.md) — 从初稿到打印级海报的质量分级
 - [账号认证](docs/account_auth.md) — 认证文件的格式和刷新机制
+- [Paper2Poster 吸收策略](docs/paper2poster_lessons.md) — 信息密度、多次生图、分层导出的设计取舍
 
 ## License
 

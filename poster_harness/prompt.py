@@ -21,9 +21,11 @@ HEP_POSTER_GRAMMAR = [
 
 TEXT_DENSITY_RULES = [
     "Compress prose into poster bullets: short noun phrases, ideally under 11 words each.",
+    "Maintain Paper2Poster-style information richness: enough compact facts to answer the central reader questions, not just decorative headings.",
     "Avoid microscopic paragraphs, footnote blocks, dense equations, and reference lists in the rendered poster.",
     "Prefer 2-4 bullets per card and at most one short sentence per text block; preserve meaning without adding new science.",
-    "If text competes with a result figure, shrink text first and enlarge the figure placeholder.",
+    "Use public fact chips and numeric badges for explicitly grounded dataset/result facts; do not invent numbers.",
+    "If text competes with a result figure, shrink or omit lower-priority text first and enlarge/preserve the figure placeholder.",
 ]
 
 FIGURE_COMPOSITION_RULES = [
@@ -105,6 +107,7 @@ def build_prompt(spec: dict[str, Any]) -> str:
         "- Start from a beautiful editorial composition, not from a slide deck or wireframe.",
         "- Use abstract, non-data artwork outside placeholders: gradients, light trails, detector-like geometry, atmospheric glow, soft depth, and subtle material texture.",
         "- Decorative icons/badges outside placeholders must be generic only (stars, checks, arrows, abstract circles). Do not put physics symbols, particle labels, equations, ΔL=2, μ/ν/q/W/N, axes, vertices, or event-display schematics in decorative badges.",
+        "- Flowcharts, summary pills, and callout badges must not turn scientific shorthand into icons. Use plain words in normal text (for example 'dimuon' or 'muon-sector limit'), never standalone μμ/ν/W/N/ΔL/equation badges or pictograms.",
         "- Give the poster varied visual mass: one dominant hero region, secondary supporting modules, small badges, shaped callouts, and breathing room.",
         "- Section blocks may be rounded rectangles, capsules, circular badges, vertical sidebars, L-shaped wraps, staggered panels, or translucent overlays when this improves hierarchy.",
         "- Keep every scientific figure placeholder itself a clean rectangle on a light paper-like figure card, but make the surrounding poster expressive and premium.",
@@ -120,7 +123,7 @@ def build_prompt(spec: dict[str, Any]) -> str:
         ]
         core_message = str(storyboard.get("core_message") or storyboard.get("meta", {}).get("one_sentence_takeaway") or "").strip()
         if core_message:
-            lines.append(f"- Core message to make visually obvious: {_q(core_message)}")
+            lines.append(f"- Core message to make visually obvious: {_q(_design_brief_safe_text(core_message))}")
         layout_tree = storyboard.get("layout_tree") if isinstance(storyboard.get("layout_tree"), dict) else {}
         reading_order = layout_tree.get("reading_order") or []
         if reading_order:
@@ -128,22 +131,27 @@ def build_prompt(spec: dict[str, Any]) -> str:
         if layout_tree.get("hero_section"):
             lines.append(f"- Hero section id: {layout_tree.get('hero_section')}; hero visual role: {_q(str(layout_tree.get('hero_visual_role') or 'headline result figure'))}.")
         if layout_tree.get("layout_intent"):
-            lines.append(f"- Layout intent: {_q(str(layout_tree.get('layout_intent')))}")
+            lines.append(f"- Layout intent: {_q(_design_brief_safe_text(str(layout_tree.get('layout_intent'))))}")
         for sec in storyboard.get("sections") or []:
             if not isinstance(sec, dict):
                 continue
-            claims = [str(item).strip() for item in sec.get("key_claims") or [] if str(item).strip()]
+            claims = [_design_brief_safe_text(str(item).strip()) for item in sec.get("key_claims") or [] if str(item).strip()]
             claim_text = "; ".join(claims[:3])
+            preferred_visual = _design_brief_safe_text(str(sec.get("preferred_visual") or ""))
             lines.append(
                 f"- Section {sec.get('id')}: role={_q(str(sec.get('role') or 'section'))}; "
                 f"text budget={_q(str(sec.get('text_budget') or 'compact bullets'))}; "
-                f"preferred visual={_q(str(sec.get('preferred_visual') or ''))}"
+                f"preferred visual={_q(preferred_visual)}"
                 + (f"; key claims={_q(claim_text)}" if claim_text else "")
             )
         lines += [
             "- Use this storyboard only to guide hierarchy, reading path, and text compression; render only the public section text specified below.",
+            "- Storyboard science terms are semantic guidance only: never render them as standalone icons, circular badges, particle-symbol marks, fake diagrams, or flowchart pictograms outside [FIG NN] placeholders.",
             "",
         ]
+
+    information_plan = storyboard.get("information_plan") if isinstance(storyboard.get("information_plan"), dict) else {}
+    lines += _information_density_prompt_lines(style, information_plan)
 
     grammar_rules = _style_rule_list(style, "hep_poster_grammar", HEP_POSTER_GRAMMAR)
     density_rules = _style_rule_list(style, "text_density", TEXT_DENSITY_RULES)
@@ -177,6 +185,13 @@ def build_prompt(spec: dict[str, Any]) -> str:
         f"- Color grammar: {_sentence(style.get('color_grammar', 'primary signal = blue; secondary signal = warm red; use consistently'))}",
         "- Avoid old poster rectangular-crop feeling. Make it feel designed from scratch.",
         "",
+    ]
+    layout_contract = spec.get("layout_contract") if isinstance(spec.get("layout_contract"), dict) else {}
+    if layout_contract:
+        lines += _layout_contract_prompt_lines(layout_contract)
+        lines.append("")
+
+    lines += [
         "Top title band text:",
         f"Main title: \"{_q(project.get('title', 'Untitled Scientific Poster'))}\"",
         f"Author line: \"{_q(project.get('authors', ''))}\"",
@@ -354,7 +369,8 @@ def build_prompt(spec: dict[str, Any]) -> str:
                 lines.append(
                     "Near-square placeholder section design: "
                     f"{near_square_shapes}; each dashed rectangle should look almost square, only slightly wider than tall. "
-                    "Do not use 1.5:1, 16:10, or generic landscape tiles for these placeholders."
+                    "For paired near-square placeholders, each visible dashed box must be wider than tall (for 1.2:1, height is about 83% of width), not portrait or square-tall. "
+                    "Do not use 1.5:1, 16:10, portrait, or generic landscape tiles for these placeholders."
                 )
             elif len(sec_figs) >= 2:
                 lines.append(
@@ -379,8 +395,9 @@ def build_prompt(spec: dict[str, Any]) -> str:
             else:
                 lines.append("Draw this as a simple public text-only analysis flowchart, not a source-figure placeholder:")
             lines.append("- Render only concise node labels and arrows derived from the following items; do NOT render instruction sentences verbatim.")
+            lines.append("- Flowchart style is text-only: rounded text boxes plus connecting arrows only. No circular node icons, no pictograms, no mini charts, no particle/equation symbols, and no symbol badges.")
             for item in sec["flowchart"]:
-                lines.append(f"- Node label: \"{_q(str(item))}\"")
+                lines.append(f"- Node label: \"{_q(_flowchart_label_text(str(item)))}\"")
         if sec.get("caption") and not sec_figs:
             clean_caption = sanitize_public_text(str(sec["caption"]), spec.get("forbidden_phrases")).strip()
             if clean_caption:
@@ -407,6 +424,7 @@ def build_prompt(spec: dict[str, Any]) -> str:
         "- Use modern rounded cards, subtle shadows, scientific background art, glow/depth effects, and coherent accent colors.",
         "- Use sophisticated typography and palette: editorial sans-serif type, disciplined type scale, deep atmospheric background, cobalt/violet/gold accents, and warm-white content cards.",
         "- Never use dark-filled blocks for chart/plot/diagram sections; if the surrounding poster is dark, put every figure on a large light paper card or mat.",
+        "- If you use summary pills or badges, keep their icons generic and their labels word-based; do not use standalone physics-symbol badges such as μμ, ν, W, N, ΔL, or equation fragments.",
         "- Preserve enough whitespace for later replacement; no decorative artwork may overlap a placeholder rectangle.",
         "- Keep placeholder-to-placeholder gutters obvious; final real figures must fit inside their own dashed boxes without protruding into neighboring modules.",
         "- Visually group many placeholders into one hero result, supporting analysis figures, and smaller diagnostics rather than equal tiles.",
@@ -429,6 +447,77 @@ def _positive_decorative_guidance(text: str) -> str:
     if lowered.startswith("do not "):
         return "Use abstract decorative design instead; " + stripped[7:]
     return stripped
+
+
+def _layout_contract_prompt_lines(contract: dict[str, Any]) -> list[str]:
+    rows = [
+        "LAYOUT CONTRACT (soft visual prior; replacement QA will check it):",
+        "- Coordinates below are normalized poster fractions [x0, y0, x1, y1], not pixel art instructions.",
+        "- Keep each visible dashed [FIG NN] rectangle roughly inside its planned zone/search zone and in the named section, while preserving artistic freedom for card shape, glow, ribbons, and surrounding decoration.",
+        "- Do not use these coordinates as a reason to draw fake figure content; they only reserve blank placeholder rectangles for later real source figures.",
+    ]
+    for item in contract.get("placeholders") or []:
+        if not isinstance(item, dict):
+            continue
+        fig_id = str(item.get("id") or "").strip()
+        if not fig_id:
+            continue
+        rows.append(
+            f"- [{fig_id}]: planned placeholder zone {_format_norm_box(item.get('zone'))}; "
+            f"search zone {_format_norm_box(item.get('search_zone'))}; "
+            f"aspect {item.get('aspect') or item.get('expected_aspect')}; "
+            f"label \"{_q(str(item.get('label') or 'figure'))}\"."
+        )
+    return rows
+
+
+def _format_norm_box(value: Any) -> str:
+    if not isinstance(value, (list, tuple)) or len(value) < 4:
+        return "[unspecified]"
+    return "[" + ", ".join(f"{float(v):.2f}" for v in value[:4]) + "]"
+
+
+def _flowchart_label_text(text: str) -> str:
+    """Make flowchart labels less likely to become physics-symbol icons.
+
+    Public scientific shorthand can still appear in ordinary prose, but flowchart
+    nodes are graphically close to icons.  Expanding compact symbols here keeps
+    the node text semantic and discourages standalone μμ/particle badges.
+    """
+    value = str(text or "").strip()
+    replacements = [
+        (r"same-sign\s*μμ", "same-sign dimuon"),
+        (r"\bμμ\b", "dimuon"),
+        (r"\bμ\s*μ\b", "dimuon"),
+        (r"\bmu\s*mu\b", "dimuon"),
+        (r"\bν\b", "neutrino"),
+        (r"\bnu\b", "neutrino"),
+    ]
+    for pattern, repl in replacements:
+        value = re.sub(pattern, repl, value, flags=re.IGNORECASE)
+    return value
+
+
+def _design_brief_safe_text(text: str) -> str:
+    """Sanitize internal storyboard prose before it enters the image prompt.
+
+    The storyboard is not rendered verbatim, but visual models may still convert
+    compact physics notation into decorative icons.  Use word forms for the
+    highest-risk symbols while preserving the meaning for layout planning.
+    """
+    value = str(text or "")
+    replacements = {
+        "μμ": "dimuon",
+        "μ μ": "dimuon",
+        "μ/ν/q/W/N": "muon/neutrino/quark/W-boson/heavy-neutrino symbols",
+        "ν": "neutrino",
+        "ΔL": "lepton-number change",
+        "|VμN|²": "muon-heavy-neutrino mixing squared",
+        "|V_{μN}|²": "muon-heavy-neutrino mixing squared",
+    }
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+    return value
 
 
 def _parse_aspect_ratio_text(aspect: str) -> float | None:
@@ -477,6 +566,46 @@ def _storyboard_section_map(storyboard: dict[str, Any]) -> dict[int, dict[str, A
             continue
         out[section_id] = item
     return out
+
+
+def _information_density_prompt_lines(style: dict[str, Any], information_plan: dict[str, Any]) -> list[str]:
+    density_target = str(
+        style.get("information_density")
+        or information_plan.get("density_target")
+        or "Paper2Poster-rich but readable: 14-24 concise public information units, no paragraphs"
+    ).strip()
+    data_badges = [str(item).strip() for item in information_plan.get("data_badges") or [] if str(item).strip()][:8]
+    display_facts = [str(item).strip() for item in information_plan.get("display_facts") or [] if str(item).strip()][:18]
+    must_answer = [str(item).strip() for item in information_plan.get("must_answer_questions") or [] if str(item).strip()][:8]
+    visual_story_units = [str(item).strip() for item in information_plan.get("visual_story_units") or [] if str(item).strip()][:8]
+
+    lines = [
+        "INFORMATION DENSITY TARGET:",
+        f"- Target: {_q(density_target)}.",
+        "- Do not make the poster a sparse cover illustration. It should communicate enough public content for a conference viewer to understand the paper's motivation, method, key figures, and conclusion.",
+        "- Prefer compact information architecture: 4-6 section modules, 12-20 total short bullets/fact chips, 3-6 small badges, and a concise conclusion strip.",
+        "- Keep public facts legible and truthful. If the image model cannot fit a fact clearly, omit the lowest-priority fact rather than shrinking text to unreadable size or inventing abbreviations.",
+        "- Numeric badges are allowed only for numbers explicitly present in the supplied public text/assets; never invent luminosities, energies, masses, limits, years, or confidence levels.",
+        "- Use figure placeholders as information anchors: each figure card should have a short nearby public headline explaining why the future real figure matters, without describing fake drawn contents.",
+    ]
+    if data_badges:
+        lines.append("- Candidate public data/fact badges to render when space allows:")
+        for item in data_badges:
+            lines.append(f"  • {_q(_design_brief_safe_text(item))}")
+    if display_facts:
+        lines.append("- Candidate high-value public facts/claims to distribute across modules:")
+        for item in display_facts[:12]:
+            lines.append(f"  • {_q(_design_brief_safe_text(item))}")
+    if visual_story_units:
+        lines.append("- Visual story units to make obvious through hierarchy, not fake scientific drawings:")
+        for item in visual_story_units:
+            lines.append(f"  • {_q(_design_brief_safe_text(item))}")
+    if must_answer:
+        lines.append("- A viewer should be able to answer these from the final poster; use them to prioritize content, not as rendered questions:")
+        for item in must_answer[:6]:
+            lines.append(f"  • {_q(_design_brief_safe_text(item))}")
+    lines.append("")
+    return lines
 
 
 def _style_rule_list(style: dict[str, Any], key: str, defaults: list[str]) -> list[str]:

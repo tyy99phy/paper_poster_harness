@@ -9,6 +9,10 @@ from typing import Any, Iterable, Mapping, Sequence
 from PIL import Image
 
 from .extract import make_contact_sheet
+from .layout_contract import (
+    attach_layout_contract_boxes,
+    evaluate_layout_contract_alignment,
+)
 from .schemas import normalize_placeholder_id
 
 
@@ -261,6 +265,16 @@ def apply_detections_to_spec(
             continue
         placements[placeholder_id] = [int(round(v)) for v in bbox]
     updated["placements"] = placements
+    image_size = detections.get("image_size") if isinstance(detections, Mapping) else None
+    if image_size and isinstance(updated.get("layout_contract"), Mapping):
+        updated = attach_layout_contract_boxes(updated, image_size)
+        issues = evaluate_layout_contract_alignment(
+            updated.get("layout_contract"),
+            placements,
+            image_size,
+        )
+        if issues:
+            updated["_layout_contract_issues"] = issues
     return updated
 
 

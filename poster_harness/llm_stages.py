@@ -19,6 +19,7 @@ from .schemas import (
     normalize_placeholder_id,
     placeholder_detection_schema,
     poster_qa_schema,
+    poster_template_critic_schema,
     poster_spec_schema,
     storyboard_schema,
 )
@@ -62,8 +63,9 @@ def draft_spec_from_text(
             "Preserve the existing harness structure: project, style, sections, placeholders, placements, conclusion, closing.",
             "Keep 4-6 sections unless the source clearly needs a different count.",
             "Follow HEP poster rhetoric: motivation/context, dataset/object selection, analysis/background strategy, key results, interpretation/summary.",
-            "Keep rendered text sparse: prefer short public bullets over paragraphs; avoid references, dense equations, and implementation prose.",
-            "Each section should have at most one short body sentence plus 2-4 high-value bullets unless the source requires otherwise.",
+            "Keep rendered text compact but information-rich: prefer short public bullets, data badges, and one-line claims over paragraphs.",
+            "Do not make a sparse cover image. Aim for 14-24 public information units across the poster: section claims, badges, concise bullets, and conclusion takeaways.",
+            "Each section should have at most one short body sentence plus 2-4 high-value bullets unless the source requires otherwise; use more sections or badges rather than long paragraphs.",
             "Each placeholder must have id, section, label, aspect, and asset filename.",
             "Plan one hero placeholder for the headline result/limit/cross-section plot and 2-3 supporting placeholders for strategy/background/context.",
             "Captions must be public-facing scientific descriptions, not design instructions; avoid wording like 'Use...', 'Draw...', 'Place...', or 'Bottom strip should...'.",
@@ -120,7 +122,10 @@ def storyboard_from_text(
             "Assign text budgets in practical poster terms, e.g. 'title + 2 bullets' or 'one sentence + 3 short bullets'.",
             "Describe the preferred visual role for each section and map useful assets to target sections when supported by captions/labels.",
             "Mark one hero section and one hero visual role for the headline result or central method.",
-            "Write 3-6 reader-understanding questions that a good poster should enable a viewer to answer.",
+            "Add an information_plan object with: density_target, data_badges, must_answer_questions, display_facts, and visual_story_units.",
+            "The information_plan should preserve Paper2Poster-style information richness: enough concise facts for a reader to understand motivation, method, dataset, headline result, and interpretation without reading the paper.",
+            "Prefer public numeric badges only when the numbers are explicitly present in source text/assets; otherwise use qualitative fact badges.",
+            "Write 4-8 reader-understanding questions that a good poster should enable a viewer to answer.",
             "Never invent numeric results, luminosities, limits, channels, or claims not present in the source text/assets.",
             extra_instructions or "",
         ],
@@ -277,6 +282,55 @@ def qa_poster(
     return envelope
 
 
+def critique_poster_template(
+    spec: Mapping[str, Any],
+    *,
+    prompt: str,
+    image_path: str | Path,
+    provider: ChatGPTAccountResponsesProvider | None = None,
+    extra_instructions: str | None = None,
+) -> dict[str, Any]:
+    """Critique a generated placeholder poster before real-figure replacement.
+
+    This stage is deliberately a *regeneration* critic, not a repair/overlay
+    planner.  If information density, artistry, text quality, or placeholder
+    contract quality is weak, it returns concise prompt repairs that should be
+    fed into another full image-generation attempt.
+    """
+    provider = provider or ChatGPTAccountResponsesProvider()
+    path = Path(image_path)
+    normalized_spec = _normalize_spec(copy.deepcopy(dict(spec)), normalize_assets_manifest(None))
+    prompt_text = _compose_prompt(
+        header="Critique this generated scientific poster template before figure replacement.",
+        instructions=[
+            "This is the pre-replacement template. Scientific figures must still be blank [FIG NN] placeholders; do not penalize placeholders merely for being blank.",
+            "Judge whether the complete generated poster is already strong enough to proceed to deterministic real-figure replacement.",
+            "Evaluate five dimensions: artistic/editorial quality, information density, placeholder contract cleanliness, text legibility/typos, and figure-card integration.",
+            "Use storyboard.information_plan and storyboard.qa_questions as the information target: the poster should visibly contain enough compact public facts/badges/bullets to answer the central reader questions.",
+            "Do not require deterministic text overlays or manual post-editing. If text/information is weak, propose prompt repairs for regenerating the whole poster with image_generation.",
+            "Fail if the poster is merely decorative, too sparse, PPT-like, has serious text corruption, leaks internal workflow text, has dark figure blocks, or contains fake scientific plots/diagrams outside placeholders.",
+            "Fail if any placeholder appears to contain real/fake scientific content, is missing/duplicated, unreadable, or clearly violates its declared aspect ratio.",
+            "Keep prompt_repairs concrete, short, and directly usable as additional image-generation instructions.",
+            extra_instructions or "",
+        ],
+        context={
+            "poster_spec": normalized_spec,
+            "render_prompt_excerpt": _truncate(prompt, 9000),
+            "acceptance_rule": "Pass only if this template should proceed to placeholder detection and replacement without manual intervention.",
+        },
+    )
+    envelope = provider.generate_json(
+        stage_name="critique_poster_template",
+        prompt=prompt_text,
+        schema=poster_template_critic_schema(),
+        system_prompt=SYSTEM_PROMPT,
+        image_paths=[path],
+        image_detail="high",
+    )
+    envelope["result"] = _normalize_template_critique(envelope["result"])
+    return envelope
+
+
 def _qa_mode_instructions(qa_mode: str) -> list[str]:
     if qa_mode == "placeholder":
         return [
@@ -299,6 +353,7 @@ def _qa_mode_instructions(qa_mode: str) -> list[str]:
         "CRITICAL: Fail only when a real scientific figure or its white replacement frame visibly extends outside its approved placeholder/cleanup boundary, is badly cropped, or clearly overlaps another real figure.",
         "CRITICAL: Check that figures do not overlap with each other. Each figure should have a clear visual gutter separating it from neighbors.",
         "Check that the poster structure remains plausible for a public scientific conference poster.",
+        "If the poster_spec includes storyboard.qa_questions or storyboard.information_plan.must_answer_questions, verify that the visible poster appears information-rich enough to answer the central public questions; warn if it is merely decorative or too sparse.",
     ]
 
 
@@ -513,6 +568,8 @@ def _normalize_storyboard(
             }
         )
 
+    information_plan = _normalize_information_plan(result.get("information_plan") or {}, result, deduped_sections)
+
     layout_tree = dict(result.get("layout_tree") or {})
     reading_order = []
     for value in layout_tree.get("reading_order") or valid_section_ids:
@@ -546,8 +603,119 @@ def _normalize_storyboard(
             "layout_intent": sanitize_public_text(str(layout_tree.get("layout_intent") or "clear top-to-bottom scientific reading path")).strip(),
             "section_grouping": [str(item).strip() for item in layout_tree.get("section_grouping") or [] if str(item).strip()][:6],
         },
+        "information_plan": information_plan,
         "qa_questions": qa_questions,
     }
+
+
+def _normalize_information_plan(raw: Any, result: Mapping[str, Any], sections: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    plan = dict(raw or {}) if isinstance(raw, Mapping) else {}
+
+    def clean_items(values: Any, *, limit: int) -> list[str]:
+        cleaned: list[str] = []
+        for item in values or []:
+            if isinstance(item, Mapping):
+                label = sanitize_public_text(str(item.get("label") or item.get("name") or "")).strip()
+                value = sanitize_public_text(str(item.get("value") or item.get("text") or item.get("fact") or "")).strip()
+                text = f"{label}: {value}" if label and value else (label or value)
+            else:
+                text = sanitize_public_text(str(item)).strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+            if len(cleaned) >= limit:
+                break
+        return cleaned
+
+    display_facts = clean_items(plan.get("display_facts") or plan.get("key_facts") or [], limit=18)
+    if not display_facts:
+        for section in sections:
+            for claim in section.get("key_claims") or []:
+                clean = sanitize_public_text(str(claim)).strip()
+                if clean and clean not in display_facts:
+                    display_facts.append(clean)
+                if len(display_facts) >= 18:
+                    break
+            if len(display_facts) >= 18:
+                break
+
+    must_answer = clean_items(plan.get("must_answer_questions") or result.get("qa_questions") or [], limit=8)
+    return {
+        "density_target": sanitize_public_text(str(plan.get("density_target") or "Paper2Poster-rich but readable: 14-24 concise public information units, no paragraphs")).strip(),
+        "data_badges": clean_items(plan.get("data_badges") or plan.get("badges") or [], limit=8),
+        "display_facts": display_facts,
+        "must_answer_questions": must_answer,
+        "visual_story_units": clean_items(plan.get("visual_story_units") or [], limit=8),
+    }
+
+
+def _normalize_template_critique(result: Mapping[str, Any]) -> dict[str, Any]:
+    raw_scores = dict(result.get("scores") or {})
+    score_keys = [
+        "overall",
+        "artistry",
+        "information_density",
+        "placeholder_contract",
+        "text_quality",
+        "figure_integration",
+    ]
+    scores: dict[str, float] = {}
+    for key in score_keys:
+        scores[key] = _clamp_score(raw_scores.get(key), default=0.0)
+    if not scores["overall"]:
+        nonzero = [scores[key] for key in score_keys[1:] if scores[key] > 0]
+        scores["overall"] = sum(nonzero) / len(nonzero) if nonzero else 0.0
+
+    issues: list[dict[str, str]] = []
+    for item in result.get("issues") or []:
+        row = dict(item or {})
+        severity = str(row.get("severity") or "warning").lower()
+        if severity not in {"critical", "warning", "info"}:
+            severity = "warning"
+        message = sanitize_public_text(str(row.get("message") or "")).strip()
+        if not message:
+            continue
+        issues.append(
+            {
+                "severity": severity,
+                "category": str(row.get("category") or "template_quality"),
+                "message": message,
+                "location": str(row.get("location") or ""),
+                "suggested_prompt_repair": sanitize_public_text(str(row.get("suggested_prompt_repair") or "")).strip(),
+            }
+        )
+    prompt_repairs = [
+        sanitize_public_text(str(item)).strip()
+        for item in result.get("prompt_repairs") or []
+        if str(item).strip()
+    ][:8]
+    for issue in issues:
+        repair = issue.get("suggested_prompt_repair", "")
+        if repair and repair not in prompt_repairs:
+            prompt_repairs.append(repair)
+        if len(prompt_repairs) >= 8:
+            break
+    checks = dict(result.get("checks") or {})
+    passes = bool(result.get("passes")) and not any(issue["severity"] == "critical" for issue in issues)
+    return {
+        "passes": passes,
+        "summary": sanitize_public_text(str(result.get("summary") or "")).strip(),
+        "scores": scores,
+        "issues": issues,
+        "checks": {str(key): bool(value) for key, value in checks.items()},
+        "prompt_repairs": prompt_repairs,
+    }
+
+
+def _clamp_score(value: Any, *, default: float) -> float:
+    try:
+        score = float(value)
+    except Exception:
+        return default
+    if score > 1.0 and score <= 10.0:
+        score = score / 10.0
+    if score > 10.0 and score <= 100.0:
+        score = score / 100.0
+    return max(0.0, min(1.0, score))
 
 
 def _compact_token(value: str, *, default: str) -> str:
@@ -896,7 +1064,7 @@ def _deterministic_qa_checks(
                             "severity": "warning",
                             "category": "figure_overlap",
                             "message": f"{id_i} and {id_j} overlap by {overlap} pixels ({ratio:.1%})",
-                            "location": f"spec.placements",
+                            "location": "spec.placements",
                             "suggested_fix": "Add a clear gutter between figure placeholders or reduce figure sizes.",
                         }
                     )

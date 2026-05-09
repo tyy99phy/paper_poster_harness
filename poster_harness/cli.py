@@ -4,6 +4,7 @@ import argparse
 import copy
 import shutil
 import re
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -24,11 +25,13 @@ from .config import (
 )
 from .extract import extract_pdf_images, extract_text, extract_pptx_media, render_pdf_pages
 from .latex_utils import clean_latex_inline, extract_latex_braced
+from .layout_contract import build_layout_contract
 from .prompt import build_prompt, sanitize_public_text
 from .replace import audit_generated_placeholder_geometry, audit_figure_containment, normalize_placeholder_geometry, replace_placeholders, upscale_image
 from .image_backend import generate_images_from_config
 from .llm import ChatGPTAccountResponsesProvider
 from .llm_stages import (
+    critique_poster_template,
     detect_placeholders_from_image,
     draft_spec_from_text,
     qa_poster,
@@ -106,7 +109,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
     out.mkdir(parents=True, exist_ok=True)
     inp = Path(args.input)
     text_path = out / "extracted_text.txt"
-    text = extract_text(inp, text_path)
+    extract_text(inp, text_path)
     print(text_path)
     if inp.suffix.lower() == ".pptx":
         media_dir = out / "media"
@@ -286,6 +289,18 @@ def cmd_llm_qa(args: argparse.Namespace) -> None:
     print(args.out)
 
 
+def cmd_llm_template_critic(args: argparse.Namespace) -> None:
+    envelope = critique_poster_template(
+        _load_spec_arg(args.spec),
+        prompt=_read_prompt_arg(args.prompt) or "",
+        image_path=args.image,
+        provider=_llm_provider(args),
+        extra_instructions=args.extra or "",
+    )
+    _dump_llm_result(envelope, args.out)
+    print(args.out)
+
+
 def cmd_autoposter(args: argparse.Namespace) -> None:
     config = load_harness_config(args.config)
     provider = _provider_from_config(config, model=args.model or cfg_get(config, "llm.model", DEFAULT_MODEL))
@@ -385,7 +400,10 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
 
     style_name = args.style or cfg_get(config, "autoposter.style", "generic")
     project_overrides, style_overrides, spec_extras = _style_preset(style_name, config)
-    draft_envelope = draft_spec_from_text(
+    draft_envelope = _call_llm_stage_with_retries(
+        "draft_spec_from_text",
+        config,
+        draft_spec_from_text,
         text,
         assets_manifest=assets_manifest,
         provider=provider,
@@ -407,7 +425,10 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
     elif storyboard_cfg is not None:
         storyboard_enabled = bool(storyboard_cfg)
     if storyboard_enabled:
-        storyboard_envelope = storyboard_from_text(
+        storyboard_envelope = _call_llm_stage_with_retries(
+            "storyboard_from_text",
+            config,
+            storyboard_from_text,
             text,
             assets_manifest=assets_manifest,
             spec=draft_spec,
@@ -419,7 +440,10 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         dump_config(storyboard, storyboard_path)
         draft_spec["storyboard"] = storyboard
 
-    selection_envelope = select_figures(
+    selection_envelope = _call_llm_stage_with_retries(
+        "select_figures",
+        config,
+        select_figures,
         text,
         assets_manifest,
         spec=draft_spec,
@@ -440,6 +464,17 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
     if storyboard:
         final_spec["storyboard"] = storyboard
     final_spec = _apply_spec_extras(final_spec, spec_extras)
+    layout_contract_path: Path | None = None
+    if bool(cfg_get(config, "autoposter.layout_contract.enabled", True)):
+        contract_w, contract_h = _image_size_from_config(args.size or cfg_get(config, "image_generation.size", "1024x1536"))
+        layout_contract = build_layout_contract(
+            final_spec,
+            canvas_width=contract_w,
+            canvas_height=contract_h,
+        )
+        final_spec["layout_contract"] = layout_contract
+        layout_contract_path = dirs["specs"] / "layout_contract.yaml"
+        dump_config(layout_contract, layout_contract_path)
     spec_path = dirs["specs"] / "poster_spec.yaml"
     dump_config(final_spec, spec_path)
 
@@ -464,6 +499,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         "draft_spec": str(draft_spec_path),
         "storyboard": str(storyboard_path) if storyboard_path else "",
         "figure_selection": str(figure_selection_path),
+        "layout_contract": str(layout_contract_path) if layout_contract_path else "",
         "poster_spec": str(spec_path),
         "prompt": str(prompt_path),
         "generated": [],
@@ -473,191 +509,489 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
     if not assets_manifest.get("assets"):
         raise RuntimeError("autoposter: no usable image assets found; strict mode will not continue without real figure assets")
 
+    required_successes = max(
+        1,
+        int(_opt(getattr(args, "poster_sets", None), config, "autoposter.required_successes", 2) or 2),
+    )
+    max_candidate_batches = max(1, int(cfg_get(config, "autoposter.max_candidate_batches", 3) or 3))
+    run_manifest["required_successes"] = required_successes
+    run_manifest["max_candidate_batches"] = max_candidate_batches
+    run_manifest["poster_sets"] = []
+    run_manifest.setdefault("generated_candidates", [])
+    generated_scale = float(cfg_get(config, "image_generation.generated_scale", 1.0) or 1.0)
+
+    placeholder_failures: list[str] = []
+    template_failures: list[str] = []
+    candidate_index = 0
+    base_basename = args.basename or f"{paper.stem}-placeholder-layout"
     try:
-        generated = generate_images_from_config(
-            prompt=prompt,
-            out_dir=dirs["generated"],
-            basename=args.basename or f"{paper.stem}-placeholder-layout",
-            config=config,
-            model=args.image_model or cfg_get(config, "image_generation.model", "gpt-5.5"),
-            size=args.size or cfg_get(config, "image_generation.size", "1024x1536"),
-            quality=args.quality or cfg_get(config, "image_generation.quality", "high"),
-            account=args.account or cfg_get(config, "image_generation.account.account", ""),
-            n=int(_opt(args.variants, config, "image_generation.variants", 1)),
-        )
+        for batch_index in range(max_candidate_batches):
+            if len(run_manifest["poster_sets"]) >= required_successes:
+                break
+            batch_args = copy.copy(args)
+            if batch_index > 0:
+                batch_args.basename = f"{base_basename}-batch{batch_index + 1}"
+            generated, prompt, batch_template_failures = _generate_templates_with_critic(
+                prompt=prompt,
+                final_spec=final_spec,
+                paper_stem=paper.stem,
+                dirs=dirs,
+                config=config,
+                args=batch_args,
+                provider=provider,
+                run_manifest=run_manifest,
+                root=root,
+            )
+            template_failures.extend(batch_template_failures)
+            if not generated:
+                detail = "; ".join(batch_template_failures) if batch_template_failures else "no image-generation template passed template critic"
+                placeholder_failures.append(f"batch {batch_index + 1}: {detail}")
+                continue
+            run_manifest["generated_candidates"].extend(str(p) for p in generated)
+            for image_path in generated:
+                if len(run_manifest["poster_sets"]) >= required_successes:
+                    break
+                candidate_index += 1
+                candidate_exports = _process_generated_template_candidate(
+                    image_path=Path(image_path),
+                    index=candidate_index,
+                    final_spec=final_spec,
+                    prompt=prompt,
+                    dirs=dirs,
+                    config=config,
+                    args=args,
+                    provider=provider,
+                    generated_scale=generated_scale,
+                    run_manifest=run_manifest,
+                    placeholder_failures=placeholder_failures,
+                )
+                if not candidate_exports:
+                    continue
+                poster_set = {
+                    "index": len(run_manifest["poster_sets"]) + 1,
+                    "template": str(image_path),
+                    "exports": candidate_exports,
+                }
+                run_manifest["poster_sets"].append(poster_set)
+                run_manifest["exports"].extend(candidate_exports)
     except Exception:
         dump_config(run_manifest, root / "run_manifest.yaml")
         raise
-    generated_scale = float(cfg_get(config, "image_generation.generated_scale", 1.0) or 1.0)
-    native_generated: list[Path] = []
-    if generated_scale > 1:
-        generated, native_generated = _promote_generated_templates_to_scale(generated, factor=generated_scale)
-        if native_generated:
-            run_manifest["generated_native"] = [str(p) for p in native_generated]
-        run_manifest["generated_scale"] = generated_scale
-    run_manifest["generated"] = [str(p) for p in generated]
-    if not generated:
-        raise RuntimeError("autoposter: image generation returned no images")
 
-    placeholder_failures: list[str] = []
-    for index, image_path in enumerate(generated, start=1):
-        stem = Path(image_path).stem
-        detection_envelope = detect_placeholders_from_image(
-            image_path,
-            expected_placeholders=final_spec.get("placeholders") or [],
-            provider=provider,
-        )
-        detections = dict(detection_envelope["result"])
-        detections_path = dirs["scratch"] / f"{stem}.detections.yaml"
-        dump_config(detections, detections_path)
-
-        spec_with_placements = apply_detections_to_spec(
-            copy.deepcopy(final_spec),
-            detections,
-            min_confidence=float(_opt(args.min_detection_confidence, config, "autoposter.min_detection_confidence", 0.15)),
-        )
-        geometry_issues = audit_generated_placeholder_geometry(
-            base_image=image_path,
-            spec=spec_with_placements,
-            ratio_tolerance=float(cfg_get(config, "autoposter.placeholder_aspect_tolerance", 0.20)),
-        )
-        if geometry_issues:
-            geometry_issue_path = dirs["qa"] / f"{stem}.placeholder-geometry.qa.yaml"
-            dump_config({"passes": False, "issues": geometry_issues}, geometry_issue_path)
-            run_manifest["qa"].append(str(geometry_issue_path))
-            placeholder_failures.append(
-                f"{image_path}: failed deterministic placeholder geometry QA; see {geometry_issue_path}"
-            )
-            continue
-        qa_image_path = Path(image_path)
-        if bool(cfg_get(config, "autoposter.normalize_placeholder_geometry", True)):
-            redraw_geometry = bool(cfg_get(config, "autoposter.redraw_normalized_placeholders", False))
-            qa_image_path, spec_with_placements = normalize_placeholder_geometry(
-                base_image=image_path,
-                spec=spec_with_placements,
-                out_path=dirs["generated"] / f"{stem}-geometry-normalized.png",
-                redraw=redraw_geometry,
-            )
-            _overwrite_detection_boxes(detections, spec_with_placements.get("placements") or {})
-            dump_config(detections, detections_path)
-        placed_spec_path = dirs["specs"] / f"poster_spec.{index:02d}.with_placements.yaml"
-        dump_config(spec_with_placements, placed_spec_path)
-        placements = spec_with_placements.get("placements") or {}
-        if not placements:
-            raise RuntimeError(f"autoposter: no valid placeholder placements detected for {image_path}")
-
-        placeholder_qa_envelope = qa_poster(
-            spec_with_placements,
-            prompt=prompt,
-            image_path=qa_image_path,
-            detected_placeholders=detections,
-            provider=provider,
-            qa_mode="placeholder",
-        )
-        placeholder_qa_result = dict(placeholder_qa_envelope["result"])
-        placeholder_qa_path = dirs["qa"] / f"{stem}.placeholder.qa.yaml"
-        dump_config(placeholder_qa_result, placeholder_qa_path)
-        run_manifest["qa"].append(str(placeholder_qa_path))
-        if not bool(placeholder_qa_result.get("passes")):
-            placeholder_failures.append(
-                f"{image_path}: failed strict placeholder QA; see {placeholder_qa_path}"
-            )
-            continue
-
-        export_path = dirs["exports"] / f"{stem}-realfigures.png"
-        # Use the original generated poster as the final visual base.  Geometry
-        # normalization is a hidden replacement plan, not a second visible
-        # placeholder layer; this avoids white normalized boxes that do not align
-        # with the model's original card art.
-        replacement_base_path = Path(image_path)
-        try:
-            replace_placeholders(
-                base_image=replacement_base_path,
-                spec=spec_with_placements,
-                asset_dir=dirs["assets"],
-                out_path=export_path,
-            )
-        except Exception as exc:
-            placeholder_failures.append(
-                f"{image_path}: failed deterministic replacement; {exc}"
-            )
-            continue
-        # Run deterministic containment audit on the replacement plan.
-        containment_issues = audit_figure_containment(spec=spec_with_placements)
-        if containment_issues:
-            containment_path = dirs["qa"] / f"{stem}.containment.qa.yaml"
-            dump_config({"passes": False, "issues": containment_issues}, containment_path)
-            run_manifest["qa"].append(str(containment_path))
-            placeholder_failures.append(
-                f"{image_path}: failed deterministic figure containment QA; see {containment_path}"
-            )
-            continue
-        candidate_exports = [str(export_path)]
-        qa_image = export_path
-        upscale_factor = float(_opt(args.upscale_factor, config, "image_generation.upscale_factor", 4.0) or 0)
-        if upscale_factor and upscale_factor > 1:
-            upscaled_path = dirs["exports"] / f"{stem}-realfigures-{int(upscale_factor)}x.png"
-            if generated_scale >= upscale_factor:
-                _link_or_copy(export_path, upscaled_path)
-            else:
-                # For the production high-res export, upscale the generated
-                # template first and paste real scientific figures directly at
-                # the target coordinates. This keeps paper figures sharper than
-                # enlarging the already-composited result.
-                extra_scale = upscale_factor / max(1.0, generated_scale)
-                upscaled_base_path = dirs["generated"] / f"{stem}-production-base-{int(upscale_factor)}x.png"
-                upscale_image(replacement_base_path, upscaled_base_path, factor=extra_scale)
-                try:
-                    replace_placeholders(
-                        base_image=upscaled_base_path,
-                        spec=spec_with_placements,
-                        asset_dir=dirs["assets"],
-                        out_path=upscaled_path,
-                        scale=extra_scale,
-                    )
-                except Exception as exc:
-                    placeholder_failures.append(
-                        f"{image_path}: failed deterministic high-resolution replacement; {exc}"
-                    )
-                    continue
-            candidate_exports.append(str(upscaled_path))
-            qa_image = upscaled_path
-
-        qa_envelope = qa_poster(
-            spec_with_placements,
-            prompt=prompt,
-            image_path=qa_image,
-            detected_placeholders=detections,
-            provider=provider,
-            qa_mode="final",
-        )
-        qa_result = dict(qa_envelope["result"])
-        qa_path = dirs["qa"] / f"{stem}.final.qa.yaml"
-        dump_config(qa_result, qa_path)
-        run_manifest["qa"].append(str(qa_path))
-        if not bool(qa_result.get("passes")):
-            for failed_export in candidate_exports:
-                try:
-                    Path(failed_export).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            placeholder_failures.append(
-                f"{export_path}: failed strict final QA; see {qa_path}"
-            )
-            continue
-        run_manifest["exports"].extend(candidate_exports)
-
-    if not run_manifest["exports"]:
+    if len(run_manifest["poster_sets"]) < required_successes:
         run_manifest_path = root / "run_manifest.yaml"
         dump_config(run_manifest, run_manifest_path)
-        detail = "; ".join(placeholder_failures) if placeholder_failures else "no exportable generated image"
-        raise RuntimeError(f"autoposter: no generated poster passed strict QA ({detail})")
+        details = [*template_failures, *placeholder_failures]
+        detail = "; ".join(details[-12:]) if details else "no exportable generated image"
+        raise RuntimeError(
+            f"autoposter: collected only {len(run_manifest['poster_sets'])}/{required_successes} "
+            f"strict-QA poster sets ({detail})"
+        )
 
     run_manifest_path = root / "run_manifest.yaml"
+    run_manifest["generated"] = [str(item["template"]) for item in run_manifest["poster_sets"]]
     dump_config(run_manifest, run_manifest_path)
     print(run_manifest_path)
-    for item in run_manifest["exports"] or run_manifest["generated"]:
-        print(item)
+    for poster_set in run_manifest["poster_sets"]:
+        print(f"poster_set_{poster_set['index']}: {poster_set['template']}")
+        for item in poster_set["exports"]:
+            print(item)
+
+
+def _process_generated_template_candidate(
+    *,
+    image_path: Path,
+    index: int,
+    final_spec: Mapping[str, Any],
+    prompt: str,
+    dirs: Mapping[str, Path],
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+    provider: ChatGPTAccountResponsesProvider,
+    generated_scale: float,
+    run_manifest: dict[str, Any],
+    placeholder_failures: list[str],
+) -> list[str] | None:
+    """Run detection, replacement, and QA for one generated placeholder layout."""
+    stem = Path(image_path).stem
+    detection_envelope = _call_llm_stage_with_retries(
+        "detect_placeholders_from_image",
+        config,
+        detect_placeholders_from_image,
+        image_path,
+        expected_placeholders=final_spec.get("placeholders") or [],
+        provider=provider,
+    )
+    detections = dict(detection_envelope["result"])
+    detections_path = dirs["scratch"] / f"{stem}.detections.yaml"
+    dump_config(detections, detections_path)
+
+    spec_with_placements = apply_detections_to_spec(
+        copy.deepcopy(dict(final_spec)),
+        detections,
+        min_confidence=float(_opt(args.min_detection_confidence, config, "autoposter.min_detection_confidence", 0.15)),
+    )
+    layout_contract_issues = list(spec_with_placements.get("_layout_contract_issues") or [])
+    if layout_contract_issues and bool(cfg_get(config, "autoposter.layout_contract.reject_misaligned", True)):
+        layout_contract_qa_path = dirs["qa"] / f"{stem}.layout-contract.qa.yaml"
+        dump_config({"passes": False, "issues": layout_contract_issues}, layout_contract_qa_path)
+        run_manifest["qa"].append(str(layout_contract_qa_path))
+        placeholder_failures.append(
+            f"{image_path}: failed deterministic layout-contract QA; see {layout_contract_qa_path}"
+        )
+        return None
+    geometry_issues = audit_generated_placeholder_geometry(
+        base_image=image_path,
+        spec=spec_with_placements,
+        ratio_tolerance=float(cfg_get(config, "autoposter.placeholder_aspect_tolerance", 0.20)),
+    )
+    if geometry_issues:
+        geometry_issue_path = dirs["qa"] / f"{stem}.placeholder-geometry.qa.yaml"
+        dump_config({"passes": False, "issues": geometry_issues}, geometry_issue_path)
+        run_manifest["qa"].append(str(geometry_issue_path))
+        placeholder_failures.append(
+            f"{image_path}: failed deterministic placeholder geometry QA; see {geometry_issue_path}"
+        )
+        return None
+    qa_image_path = Path(image_path)
+    if bool(cfg_get(config, "autoposter.normalize_placeholder_geometry", True)):
+        redraw_geometry = bool(cfg_get(config, "autoposter.redraw_normalized_placeholders", False))
+        qa_image_path, spec_with_placements = normalize_placeholder_geometry(
+            base_image=image_path,
+            spec=spec_with_placements,
+            out_path=dirs["generated"] / f"{stem}-geometry-normalized.png",
+            redraw=redraw_geometry,
+        )
+        _overwrite_detection_boxes(detections, spec_with_placements.get("placements") or {})
+        dump_config(detections, detections_path)
+    placed_spec_path = dirs["specs"] / f"poster_spec.{index:02d}.with_placements.yaml"
+    dump_config(spec_with_placements, placed_spec_path)
+    placements = spec_with_placements.get("placements") or {}
+    if not placements:
+        raise RuntimeError(f"autoposter: no valid placeholder placements detected for {image_path}")
+
+    placeholder_qa_envelope = _call_llm_stage_with_retries(
+        "qa_poster_placeholder",
+        config,
+        qa_poster,
+        spec_with_placements,
+        prompt=prompt,
+        image_path=qa_image_path,
+        detected_placeholders=detections,
+        provider=provider,
+        qa_mode="placeholder",
+    )
+    placeholder_qa_result = dict(placeholder_qa_envelope["result"])
+    placeholder_qa_path = dirs["qa"] / f"{stem}.placeholder.qa.yaml"
+    dump_config(placeholder_qa_result, placeholder_qa_path)
+    run_manifest["qa"].append(str(placeholder_qa_path))
+    if not bool(placeholder_qa_result.get("passes")):
+        placeholder_failures.append(
+            f"{image_path}: failed strict placeholder QA; see {placeholder_qa_path}"
+        )
+        return None
+
+    export_path = dirs["exports"] / f"{stem}-realfigures.png"
+    # Use the original generated poster as the final visual base.  Geometry
+    # normalization is a hidden replacement plan, not a second visible
+    # placeholder layer; this avoids white normalized boxes that do not align
+    # with the model's original card art.
+    replacement_base_path = Path(image_path)
+    try:
+        replace_placeholders(
+            base_image=replacement_base_path,
+            spec=spec_with_placements,
+            asset_dir=dirs["assets"],
+            out_path=export_path,
+        )
+    except Exception as exc:
+        placeholder_failures.append(
+            f"{image_path}: failed deterministic replacement; {exc}"
+        )
+        return None
+    # Run deterministic containment audit on the replacement plan.
+    containment_issues = audit_figure_containment(spec=spec_with_placements)
+    if containment_issues:
+        containment_path = dirs["qa"] / f"{stem}.containment.qa.yaml"
+        dump_config({"passes": False, "issues": containment_issues}, containment_path)
+        run_manifest["qa"].append(str(containment_path))
+        placeholder_failures.append(
+            f"{image_path}: failed deterministic figure containment QA; see {containment_path}"
+        )
+        return None
+    candidate_exports = [str(export_path)]
+    qa_image = export_path
+    upscale_factor = float(_opt(args.upscale_factor, config, "image_generation.upscale_factor", 4.0) or 0)
+    if upscale_factor and upscale_factor > 1:
+        upscaled_path = dirs["exports"] / f"{stem}-realfigures-{int(upscale_factor)}x.png"
+        if generated_scale >= upscale_factor:
+            _link_or_copy(export_path, upscaled_path)
+        else:
+            # For the production high-res export, upscale the generated
+            # template first and paste real scientific figures directly at
+            # the target coordinates. This keeps paper figures sharper than
+            # enlarging the already-composited result.
+            extra_scale = upscale_factor / max(1.0, generated_scale)
+            upscaled_base_path = dirs["generated"] / f"{stem}-production-base-{int(upscale_factor)}x.png"
+            upscale_image(replacement_base_path, upscaled_base_path, factor=extra_scale)
+            try:
+                replace_placeholders(
+                    base_image=upscaled_base_path,
+                    spec=spec_with_placements,
+                    asset_dir=dirs["assets"],
+                    out_path=upscaled_path,
+                    scale=extra_scale,
+                )
+            except Exception as exc:
+                placeholder_failures.append(
+                    f"{image_path}: failed deterministic high-resolution replacement; {exc}"
+                )
+                return None
+        candidate_exports.append(str(upscaled_path))
+        qa_image = upscaled_path
+
+    qa_envelope = _call_llm_stage_with_retries(
+        "qa_poster_final",
+        config,
+        qa_poster,
+        spec_with_placements,
+        prompt=prompt,
+        image_path=qa_image,
+        detected_placeholders=detections,
+        provider=provider,
+        qa_mode="final",
+    )
+    qa_result = dict(qa_envelope["result"])
+    qa_path = dirs["qa"] / f"{stem}.final.qa.yaml"
+    dump_config(qa_result, qa_path)
+    run_manifest["qa"].append(str(qa_path))
+    if not bool(qa_result.get("passes")):
+        for failed_export in candidate_exports:
+            try:
+                Path(failed_export).unlink(missing_ok=True)
+            except Exception:
+                pass
+        placeholder_failures.append(
+            f"{export_path}: failed strict final QA; see {qa_path}"
+        )
+        return None
+    return candidate_exports
+
+
+def _call_llm_stage_with_retries(
+    stage_name: str,
+    config: Mapping[str, Any],
+    func,
+    *args,
+    **kwargs,
+):
+    """Retry the same LLM stage on transient transport errors.
+
+    This is not a fallback or a weaker path: the exact same LLM stage is called
+    again when the local ChatGPT/Codex transport drops a connection.
+    """
+    retries = max(0, int(cfg_get(dict(config), "autoposter.llm_stage_retries", 2) or 0))
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= retries or not _looks_transient_llm_error(exc):
+                raise
+            delay = min(20.0, 2.5 * (attempt + 1))
+            print(f"WARNING: {stage_name} transient error on attempt {attempt + 1}/{retries + 1}: {exc}; retrying in {delay:.1f}s")
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
+def _looks_transient_llm_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "network error",
+            "urlopen error",
+            "remote end closed",
+            "502",
+            "503",
+            "504",
+        )
+    )
+
+
+def _generate_templates_with_critic(
+    *,
+    prompt: str,
+    final_spec: Mapping[str, Any],
+    paper_stem: str,
+    dirs: Mapping[str, Path],
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+    provider: ChatGPTAccountResponsesProvider,
+    run_manifest: dict[str, Any],
+    root: Path,
+) -> tuple[list[Path], str, list[str]]:
+    critic_enabled = _opt_bool(
+        getattr(args, "template_critic", None),
+        config,
+        "autoposter.template_critic.enabled",
+        True,
+    )
+    max_regen_rounds = 0
+    if critic_enabled:
+        max_regen_rounds = int(
+            _opt(
+                getattr(args, "template_regens", None),
+                config,
+                "autoposter.template_critic.max_regen_rounds",
+                1,
+            )
+            or 0
+        )
+    generated_scale = float(cfg_get(dict(config), "image_generation.generated_scale", 1.0) or 1.0)
+    base_basename = args.basename or f"{paper_stem}-placeholder-layout"
+    current_prompt = prompt
+    template_failures: list[str] = []
+    run_manifest["generated_scale"] = generated_scale
+    run_manifest.setdefault("generated_all", [])
+    run_manifest.setdefault("template_critiques", [])
+    if critic_enabled:
+        run_manifest["template_critic"] = {
+            "enabled": True,
+            "max_regen_rounds": max_regen_rounds,
+            "require_pass": bool(cfg_get(dict(config), "autoposter.template_critic.require_pass", True)),
+        }
+
+    for round_index in range(max_regen_rounds + 1):
+        round_basename = base_basename if round_index == 0 else f"{base_basename}-regen{round_index}"
+        if round_index > 0:
+            prompt_path = dirs["prompts"] / f"poster_prompt.regen{round_index}.txt"
+            prompt_path.write_text(current_prompt, encoding="utf-8")
+            run_manifest.setdefault("regen_prompts", []).append(str(prompt_path))
+        generated = generate_images_from_config(
+            prompt=current_prompt,
+            out_dir=dirs["generated"],
+            basename=round_basename,
+            config=config,
+            model=args.image_model or cfg_get(dict(config), "image_generation.model", "gpt-5.5"),
+            size=args.size or cfg_get(dict(config), "image_generation.size", "1024x1536"),
+            quality=args.quality or cfg_get(dict(config), "image_generation.quality", "high"),
+            account=args.account or cfg_get(dict(config), "image_generation.account.account", ""),
+            n=int(_opt(args.variants, config, "image_generation.variants", 1)),
+        )
+        if not generated:
+            raise RuntimeError("autoposter: image generation returned no images")
+        native_generated: list[Path] = []
+        if generated_scale > 1:
+            generated, native_generated = _promote_generated_templates_to_scale(generated, factor=generated_scale)
+            if native_generated:
+                run_manifest.setdefault("generated_native", []).extend(str(p) for p in native_generated)
+        run_manifest["generated_all"].extend(str(p) for p in generated)
+
+        if not critic_enabled:
+            run_manifest["generated"] = [str(p) for p in generated]
+            return generated, current_prompt, template_failures
+
+        accepted: list[Path] = []
+        round_repairs: list[str] = []
+        for image_path in generated:
+            stem = Path(image_path).stem
+            critique_envelope = _call_llm_stage_with_retries(
+                "critique_poster_template",
+                config,
+                critique_poster_template,
+                final_spec,
+                prompt=current_prompt,
+                image_path=image_path,
+                provider=provider,
+                extra_instructions=str(cfg_get(dict(config), "autoposter.template_critic.extra_instructions", "") or ""),
+            )
+            critique = dict(critique_envelope["result"])
+            critique_path = dirs["qa"] / f"{stem}.template-critic.qa.yaml"
+            dump_config(critique, critique_path)
+            run_manifest["qa"].append(str(critique_path))
+            run_manifest["template_critiques"].append(str(critique_path))
+            if _template_critic_accepts(critique, config):
+                accepted.append(Path(image_path))
+            else:
+                summary = str(critique.get("summary") or "template critic rejected generated poster")
+                template_failures.append(f"{image_path}: failed template critic; see {critique_path}; {summary}")
+                round_repairs.extend(_template_critic_repairs(critique))
+        if accepted:
+            run_manifest["generated"] = [str(p) for p in accepted]
+            return accepted, current_prompt, template_failures
+
+        if round_index < max_regen_rounds:
+            current_prompt = _prompt_with_template_critic_repairs(
+                prompt,
+                repairs=round_repairs,
+                round_index=round_index + 1,
+            )
+            dump_config(run_manifest, root / "run_manifest.yaml")
+
+    run_manifest["generated"] = []
+    return [], current_prompt, template_failures
+
+
+def _template_critic_accepts(critique: Mapping[str, Any], config: Mapping[str, Any]) -> bool:
+    scores = dict(critique.get("scores") or {})
+    if bool(cfg_get(dict(config), "autoposter.template_critic.require_pass", True)) and not bool(critique.get("passes")):
+        return False
+    thresholds = {
+        "overall": float(cfg_get(dict(config), "autoposter.template_critic.min_overall_score", 0.72) or 0.0),
+        "artistry": float(cfg_get(dict(config), "autoposter.template_critic.min_artistry_score", 0.65) or 0.0),
+        "information_density": float(cfg_get(dict(config), "autoposter.template_critic.min_information_density_score", 0.65) or 0.0),
+        "placeholder_contract": float(cfg_get(dict(config), "autoposter.template_critic.min_placeholder_contract_score", 0.75) or 0.0),
+    }
+    for key, threshold in thresholds.items():
+        if float(scores.get(key) or 0.0) < threshold:
+            return False
+    return True
+
+
+def _template_critic_repairs(critique: Mapping[str, Any]) -> list[str]:
+    repairs = [str(item).strip() for item in critique.get("prompt_repairs") or [] if str(item).strip()]
+    for issue in critique.get("issues") or []:
+        if not isinstance(issue, Mapping):
+            continue
+        repair = str(issue.get("suggested_prompt_repair") or "").strip()
+        if repair and repair not in repairs:
+            repairs.append(repair)
+    if not repairs:
+        repairs = [
+            "Regenerate the whole poster with stronger editorial HEP artistry, richer compact public facts, cleaner placeholder boxes, and more legible typography."
+        ]
+    return repairs[:10]
+
+
+def _prompt_with_template_critic_repairs(base_prompt: str, *, repairs: list[str], round_index: int) -> str:
+    unique_repairs: list[str] = []
+    for repair in repairs:
+        clean = sanitize_public_text(str(repair)).strip()
+        if clean and clean not in unique_repairs:
+            unique_repairs.append(clean)
+        if len(unique_repairs) >= 10:
+            break
+    if not unique_repairs:
+        unique_repairs = [
+            "Increase information density with compact public facts and badges while keeping all scientific figures as blank placeholders.",
+            "Make the poster feel more like a premium HEP conference poster and less like a slide deck.",
+        ]
+    repair_lines = "\n".join(f"- {item}" for item in unique_repairs)
+    return (
+        base_prompt.rstrip()
+        + "\n\n"
+        + f"REGENERATION CRITIQUE ROUND {round_index} (apply these changes to the whole poster; do not mention this critique in the poster):\n"
+        + repair_lines
+        + "\n- Regenerate a complete fresh poster, not a patched or cropped collage.\n"
+    )
 
 
 def _llm_provider(args: argparse.Namespace):
@@ -738,6 +1072,15 @@ def _opt(value: Any, config: Mapping[str, Any], dotted: str, default: Any = None
 
 def _opt_bool(value: Any, config: Mapping[str, Any], dotted: str, default: bool) -> bool:
     return bool(value if value is not None else cfg_get(dict(config), dotted, default))
+
+
+def _image_size_from_config(value: Any) -> tuple[int, int]:
+    text = str(value or "").strip().lower()
+    match = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", text)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    # Codex image_generation portrait default.
+    return 1024, 1536
 
 
 def _default_run_dir(paper: str | None, config: Mapping[str, Any], resolution: Mapping[str, Any] | None) -> str:
@@ -1204,6 +1547,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--config")
     p.set_defaults(func=cmd_llm_qa)
 
+    p = sub.add_parser("llm-template-critic", help="critique a generated placeholder poster before replacement")
+    p.add_argument("--spec", required=True)
+    p.add_argument("--image", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--prompt")
+    p.add_argument("--extra", help="extra template critic instructions")
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--config")
+    p.set_defaults(func=cmd_llm_template_critic)
+
     p = sub.add_parser("autoposter", help="one-command paper/assets → spec → prompt → optional generation/replacement pipeline")
     p.add_argument("--config", help="YAML/JSON harness config; defaults to POSTER_HARNESS_CONFIG or built-in strict config")
     p.add_argument("--query", help="natural-language paper query; LLM uses web_search to resolve arXiv")
@@ -1214,6 +1567,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--assets-dir", action="append", default=[], help="extra directory of real figure assets; can be repeated")
     p.add_argument("--style", help="style preset from config, e.g. cms-hep or generic")
     p.add_argument("--variants", type=int, help="number of image-generation variants")
+    p.add_argument("--poster-sets", type=int, help="number of strict-QA poster sets to collect; default 2")
     p.add_argument("--max-figures", type=int)
     p.add_argument("--max-assets", type=int)
     p.add_argument("--min-image-width", type=int)
@@ -1238,6 +1592,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--account", help="ChatGPT account email for image_generation.backend=chatgpt_account")
     p.add_argument("--basename")
     p.add_argument("--upscale-factor", type=float)
+    p.add_argument("--template-critic", dest="template_critic", action="store_true", default=None, help="enable VLM template critic before replacement")
+    p.add_argument("--no-template-critic", dest="template_critic", action="store_false")
+    p.add_argument("--template-regens", type=int, help="maximum full-poster regeneration rounds after template critic rejection")
     p.set_defaults(func=cmd_autoposter)
 
     args = parser.parse_args(argv)

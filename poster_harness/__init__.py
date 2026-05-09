@@ -9,8 +9,10 @@ from .config import load_harness_config, write_default_harness_config
 from .account_auth import load_account_auth, find_account_auth_file, list_account_auth_files
 from .auth_login import run_browser_login
 from .image_backend import generate_images_from_config
+from .layout_contract import build_layout_contract
 from .llm import ChatGPTAccountResponsesProvider, extract_json_from_response, extract_json_from_text
 from .llm_stages import (
+    critique_poster_template,
     detect_placeholders_from_image,
     draft_spec_from_text,
     qa_poster,
@@ -22,6 +24,7 @@ from .schemas import (
     figure_selection_schema,
     placeholder_detection_schema,
     poster_qa_schema,
+    poster_template_critic_schema,
     poster_spec_schema,
     schema_skeleton,
     storyboard_schema,
@@ -33,6 +36,7 @@ __all__ = [
     "find_account_auth_file",
     "list_account_auth_files",
     "generate_images_from_config",
+    "build_layout_contract",
     "run_browser_login",
     "load_harness_config",
     "write_default_harness_config",
@@ -47,6 +51,7 @@ __all__ = [
     "draft_spec_from_text",
     "storyboard_from_text",
     "select_figures",
+    "critique_poster_template",
     "detect_placeholders_from_image",
     "qa_poster",
     "default_poster_spec",
@@ -55,5 +60,6 @@ __all__ = [
     "figure_selection_schema",
     "placeholder_detection_schema",
     "poster_qa_schema",
+    "poster_template_critic_schema",
     "schema_skeleton",
 ]

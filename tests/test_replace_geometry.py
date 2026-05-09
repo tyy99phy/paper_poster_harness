@@ -3,7 +3,12 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageDraw
 
-from poster_harness.replace import audit_generated_placeholder_geometry, normalize_placeholder_geometry, replace_placeholders
+from poster_harness.replace import (
+    audit_figure_containment,
+    audit_generated_placeholder_geometry,
+    normalize_placeholder_geometry,
+    replace_placeholders,
+)
 
 
 def test_normalize_placeholder_geometry_matches_declared_aspects(tmp_path: Path):
@@ -53,8 +58,149 @@ def test_square_result_in_landscape_seed_is_centered_not_nudged(tmp_path: Path):
         out_path=tmp_path / "out.png",
         redraw=False,
     )
-    assert updated["placements"]["FIG 01"] == [120, 100, 240, 220]
+    assert updated["placements"]["FIG 01"] == [130, 110, 230, 210]
     assert updated["_replacement_clear_boxes"]["FIG 01"] == [100, 100, 260, 220]
+
+
+def test_square_result_single_figure_repair_caps_downward_erase(tmp_path: Path):
+    base = tmp_path / "base.png"
+    Image.new("RGB", (500, 1000), "white").save(base)
+    spec = {
+        "placeholders": [
+            {
+                "id": "FIG 01",
+                "label": "95% CL upper limit result",
+                "aspect": "1:1 square",
+                "asset": "fig.png",
+            },
+        ],
+        # Lower-poster square result: hidden normalization nudges it upward.  The
+        # old placeholder area may still need erasing, but the white erase mat
+        # must not extend below the repaired square/result envelope.
+        "placements": {
+            "FIG 01": [150, 760, 350, 960],
+        },
+    }
+    _, updated = normalize_placeholder_geometry(
+        base_image=base,
+        spec=spec,
+        out_path=tmp_path / "out.png",
+        redraw=False,
+    )
+    box = updated["placements"]["FIG 01"]
+    clear = updated["_replacement_clear_boxes"]["FIG 01"]
+    erase = updated["_replacement_erase_boxes"]["FIG 01"]
+    frame = updated["_replacement_frame_boxes"]["FIG 01"]
+    assert box[3] <= 960
+    assert erase[0] >= clear[0]
+    assert erase[1] >= clear[1]
+    assert erase[2] <= clear[2]
+    assert erase[3] <= clear[3]
+    assert frame[0] >= clear[0]
+    assert frame[1] >= clear[1]
+    assert frame[2] <= clear[2]
+    assert frame[3] <= clear[3]
+    assert not audit_figure_containment(spec=updated)
+
+
+def test_audit_flags_square_result_visual_envelope_protrusion():
+    spec = {
+        "placeholders": [
+            {
+                "id": "FIG 01",
+                "label": "95% CL upper limit result",
+                "aspect": "1:1 square",
+                "asset": "fig.png",
+            },
+        ],
+        "placements": {"FIG 01": [100, 100, 200, 200]},
+        "_replacement_clear_boxes": {"FIG 01": [100, 100, 200, 200]},
+        "_replacement_erase_boxes": {"FIG 01": [94, 88, 206, 248]},
+        "_replacement_frame_boxes": {"FIG 01": [100, 100, 200, 200]},
+    }
+    issues = audit_figure_containment(spec=spec)
+    assert any(issue.get("category") == "figure_visual_envelope" for issue in issues)
+
+
+def test_audit_flags_square_result_without_enough_inner_margin():
+    spec = {
+        "placeholders": [
+            {
+                "id": "FIG 01",
+                "label": "95% CL upper limit result",
+                "aspect": "1:1 square",
+                "asset": "fig.png",
+            },
+        ],
+        "placements": {"FIG 01": [140, 140, 1060, 1060]},
+        "_replacement_clear_boxes": {"FIG 01": [100, 100, 1100, 1100]},
+        "_replacement_erase_boxes": {"FIG 01": [100, 100, 1100, 1100]},
+        "_replacement_frame_boxes": {"FIG 01": [100, 100, 1100, 1100]},
+    }
+    issues = audit_figure_containment(spec=spec)
+    assert any(issue.get("category") == "figure_inner_margin" for issue in issues)
+
+
+def test_audit_flags_square_result_white_board_that_is_too_large():
+    spec = {
+        "placeholders": [
+            {
+                "id": "FIG 01",
+                "label": "95% CL upper limit result",
+                "aspect": "1:1 square",
+                "asset": "fig.png",
+            },
+        ],
+        "placements": {"FIG 01": [250, 250, 850, 850]},
+        "_replacement_clear_boxes": {"FIG 01": [100, 100, 1000, 1000]},
+        "_replacement_erase_boxes": {"FIG 01": [100, 100, 1000, 1000]},
+        "_replacement_frame_boxes": {"FIG 01": [100, 100, 1000, 1000]},
+    }
+    issues = audit_figure_containment(spec=spec)
+    assert any(issue.get("category") == "figure_frame_oversized" for issue in issues)
+
+
+def test_hidden_normalize_uses_inner_dashed_result_placeholder_not_outer_card(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (640, 640), (246, 244, 238))
+    draw = ImageDraw.Draw(im)
+    # Outer light result card returned by a simulated vision detection.
+    draw.rounded_rectangle([80, 80, 560, 560], radius=24, fill=(250, 248, 242), outline=(210, 170, 70), width=3)
+    # The actual initial image_generation placeholder is the inner dashed box.
+    for x in range(120, 520, 30):
+        draw.line([(x, 150), (min(x + 14, 520), 150)], fill=(95, 85, 75), width=3)
+        draw.line([(x, 510), (min(x + 14, 520), 510)], fill=(95, 85, 75), width=3)
+    for y in range(150, 510, 30):
+        draw.line([(120, y), (120, min(y + 14, 510))], fill=(95, 85, 75), width=3)
+        draw.line([(520, y), (520, min(y + 14, 510))], fill=(95, 85, 75), width=3)
+    im.save(base)
+    spec = {
+        "placeholders": [
+            {
+                "id": "FIG 01",
+                "label": "95% CL upper limit result",
+                "aspect": "1:1 square",
+                "asset": "fig.png",
+            }
+        ],
+        "placements": {"FIG 01": [80, 80, 560, 560]},
+    }
+    _, updated = normalize_placeholder_geometry(
+        base_image=base,
+        spec=spec,
+        out_path=tmp_path / "planned.png",
+        redraw=False,
+    )
+    clear = updated["_replacement_clear_boxes"]["FIG 01"]
+    box = updated["placements"]["FIG 01"]
+    assert clear[0] <= 125 and clear[0] >= 110
+    assert clear[1] <= 155 and clear[1] >= 140
+    assert clear[2] >= 515 and clear[2] <= 525
+    assert clear[3] >= 505 and clear[3] <= 515
+    assert box[0] > clear[0]
+    assert box[1] > clear[1]
+    assert box[2] < clear[2]
+    assert box[3] < clear[3]
 
 
 def test_lower_hero_moderate_landscape_is_kept_above_conclusion_zone(tmp_path: Path):
@@ -179,7 +325,7 @@ def test_replace_clears_full_original_placeholder_region(tmp_path: Path):
     asset_dir.mkdir()
     Image.new("RGB", (80, 80), "red").save(asset_dir / "fig.png")
     spec = {
-        "placeholders": [{"id": "FIG 01", "label": "Result", "aspect": "1:1 square", "asset": "fig.png"}],
+        "placeholders": [{"id": "FIG 01", "label": "Square diagnostic", "aspect": "1:1 square", "asset": "fig.png"}],
         "placements": {"FIG 01": [70, 35, 150, 115]},
         "_replacement_clear_boxes": {"FIG 01": [30, 30, 190, 125]},
     }
@@ -196,7 +342,7 @@ def test_replace_never_pastes_real_figure_outside_placeholder_box(tmp_path: Path
     asset_dir.mkdir()
     Image.new("RGB", (80, 80), "red").save(asset_dir / "fig.png")
     spec = {
-        "placeholders": [{"id": "FIG 01", "label": "Result", "aspect": "1:1 square", "asset": "fig.png"}],
+        "placeholders": [{"id": "FIG 01", "label": "Square diagnostic", "aspect": "1:1 square", "asset": "fig.png"}],
         "placements": {"FIG 01": [60, 30, 120, 90]},
         # Clear a larger visible placeholder panel, but the actual real figure
         # still must stay within the placement box.
@@ -263,7 +409,7 @@ def test_replace_rectangular_erase_covers_antialiased_dashes_on_detected_edge(tm
     asset_dir.mkdir()
     Image.new("RGB", (80, 80), "red").save(asset_dir / "fig.png")
     spec = {
-        "placeholders": [{"id": "FIG 01", "label": "Result", "aspect": "1:1 square", "asset": "fig.png"}],
+        "placeholders": [{"id": "FIG 01", "label": "Square diagnostic", "aspect": "1:1 square", "asset": "fig.png"}],
         "placements": {"FIG 01": [70, 45, 150, 125]},
         "_replacement_clear_boxes": {"FIG 01": [40, 30, 180, 130]},
         "_replacement_erase_boxes": {"FIG 01": [40, 30, 182, 132]},
@@ -274,6 +420,45 @@ def test_replace_rectangular_erase_covers_antialiased_dashes_on_detected_edge(tm
     result = Image.open(out).convert("RGB")
     assert result.getpixel((180, 130)) != (170, 120, 25)
     assert result.getpixel((181, 131)) == (255, 255, 255)
+
+
+def test_square_result_erase_does_not_create_large_uniform_rectangle(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (320, 260), "white")
+    draw = ImageDraw.Draw(im)
+    # A gentle cream gradient in the generated result card.  Pixels away from
+    # placeholder glyphs should survive replacement; otherwise the eraser has
+    # created a visible same-colored rectangular slab.
+    for y in range(260):
+        for x in range(320):
+            im.putpixel((x, y), (246 + min(6, x // 70), 240 + min(8, y // 45), 228))
+    for x in range(50, 270, 24):
+        draw.line([(x, 40), (min(x + 12, 270), 40)], fill=(80, 80, 80), width=2)
+        draw.line([(x, 220), (min(x + 12, 270), 220)], fill=(80, 80, 80), width=2)
+    for y in range(40, 220, 24):
+        draw.line([(50, y), (50, min(y + 12, 220))], fill=(80, 80, 80), width=2)
+        draw.line([(270, y), (270, min(y + 12, 220))], fill=(80, 80, 80), width=2)
+    draw.text((130, 120), "[FIG 01]", fill=(25, 25, 25))
+    untouched = im.getpixel((65, 90))
+    im.save(base)
+    asset_dir = tmp_path / "assets"
+    asset_dir.mkdir()
+    Image.new("RGB", (80, 80), "red").save(asset_dir / "fig.png")
+    spec = {
+        "placeholders": [
+            {"id": "FIG 01", "label": "95% CL upper limit result", "aspect": "1:1 square", "asset": "fig.png"}
+        ],
+        "placements": {"FIG 01": [115, 85, 205, 175]},
+        "_replacement_clear_boxes": {"FIG 01": [50, 40, 270, 220]},
+        "_replacement_erase_boxes": {"FIG 01": [50, 40, 270, 220]},
+        "_replacement_frame_boxes": {"FIG 01": [105, 75, 215, 185]},
+    }
+    out = tmp_path / "out.png"
+    replace_placeholders(base_image=base, spec=spec, asset_dir=asset_dir, out_path=out)
+    result = Image.open(out).convert("RGB")
+    assert result.getpixel((65, 90)) == untouched
+    # But a dashed artifact pixel should be repaired.
+    assert result.getpixel((50, 40)) != (80, 80, 80)
 
 
 def test_normalize_can_plan_geometry_without_redrawing_visible_placeholders(tmp_path: Path):
@@ -670,3 +855,19 @@ def test_hidden_normalize_square_uses_dashed_bottom_not_lower_section_card(tmp_p
     assert clear[3] <= 515
     assert box[3] <= clear[3]
     assert abs(((box[2] - box[0]) / (box[3] - box[1])) - 1.0) < 0.03
+
+
+def test_audit_allows_square_result_just_above_summary_boundary(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (1000, 1500), "white")
+    draw = ImageDraw.Draw(im)
+    # Bottom at 82.7% of canvas: visually above the lower summary band and should
+    # not be rejected by an overly brittle boundary check.
+    draw.rectangle([400, 940, 700, 1240], outline=(170, 120, 25), width=2)
+    im.save(base)
+    spec = {
+        "placeholders": [{"id": "FIG 01", "label": "95% CL upper limit result", "aspect": "1:1 square"}],
+        "placements": {"FIG 01": [400, 940, 700, 1240]},
+    }
+    issues = audit_generated_placeholder_geometry(base_image=base, spec=spec, ratio_tolerance=0.20)
+    assert not [issue for issue in issues if "too low" in issue["message"]]

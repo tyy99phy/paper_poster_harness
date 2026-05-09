@@ -325,3 +325,29 @@ def test_prompt_includes_storyboard_as_internal_design_brief():
     assert "Story role: hero_result" in prompt
     assert "Hero visual priority" in prompt
     assert "do not render this heading" in prompt
+
+
+def test_prompt_includes_information_density_plan_from_storyboard():
+    spec = {
+        "project": {"title": "T", "topic": "T"},
+        "style": {"information_density": "rich but readable"},
+        "storyboard": {
+            "information_plan": {
+                "density_target": "Paper2Poster-rich",
+                "data_badges": ["13 TeV dataset", {"label": "Channel", "value": "same-sign dimuon"}],
+                "display_facts": ["The analysis targets vector-boson fusion topology."],
+                "must_answer_questions": ["What is the headline result?"],
+                "visual_story_units": ["hero result card plus supporting strategy card"],
+            }
+        },
+        "sections": [],
+        "placeholders": [],
+        "conclusion": [],
+    }
+    prompt = build_prompt(spec)
+    assert "INFORMATION DENSITY TARGET" in prompt
+    assert "rich but readable" in prompt
+    assert "Do not make the poster a sparse cover illustration" in prompt
+    assert "13 TeV dataset" in prompt
+    assert "same-sign dimuon" in prompt
+    assert "What is the headline result?" in prompt

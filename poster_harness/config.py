@@ -55,7 +55,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
         "model": "gpt-5.5",
         "size": "1024x1536",
         "quality": "high",
-        "variants": 3,
+        "variants": 2,
         "generated_scale": 4.0,
         "upscale_factor": 4.0,
         "account": {
@@ -82,6 +82,23 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
         "normalize_placeholder_geometry": True,
         "redraw_normalized_placeholders": False,
         "placeholder_aspect_tolerance": 0.20,
+        "required_successes": 2,
+        "max_candidate_batches": 3,
+        "llm_stage_retries": 2,
+        "layout_contract": {
+            "enabled": True,
+            "reject_misaligned": True,
+        },
+        "template_critic": {
+            "enabled": True,
+            "require_pass": True,
+            "max_regen_rounds": 1,
+            "min_overall_score": 0.72,
+            "min_artistry_score": 0.65,
+            "min_information_density_score": 0.65,
+            "min_placeholder_contract_score": 0.75,
+            "extra_instructions": "",
+        },
         "pdf_render_dpi": 220,
         "max_pages": 12,
         "storyboard": {
@@ -150,6 +167,11 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
                     "Never place a plot or diagram on a dark navy, black, purple, or saturated block. "
                     "Use shadows, outlines, halos, and side accents for drama while keeping the chart surface light."
                 ),
+                "information_density": (
+                    "Paper2Poster-rich editorial density: 14-24 concise public information units across the poster, "
+                    "3-6 grounded fact badges, 4-6 section modules, and one compact conclusion strip. "
+                    "Prefer short claims and fact chips over paragraphs; omit lower-priority facts before sacrificing legibility or placeholder geometry."
+                ),
             },
             "extras": {
                 "decorative_art_constraints": [
@@ -206,6 +228,11 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
                     "All scientific figure areas, including the headline limit/result card, must use warm-white or pearl figure-card interiors. "
                     "Do not make the plot-containing block dark; use a light inset card/mat with subtle gray outline, soft shadow, and optional gold/CMS-blue outer frame. "
                     "This ensures white-background CMS plots blend into the poster instead of looking like pasted stickers."
+                ),
+                "information_density": (
+                    "Paper2Poster-rich HEP density: preserve enough public facts for a viewer to answer what was measured/searched, "
+                    "which dataset/channel/strategy was used, what the headline result says, and which figures support it. "
+                    "Use 12-20 short bullets/fact chips total plus 3-6 grounded badges; never invent CMS numbers or shrink text to illegibility."
                 ),
             },
             "extras": {

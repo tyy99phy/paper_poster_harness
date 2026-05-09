@@ -84,3 +84,24 @@ def test_figure_selection_preserves_storyboard_fields():
     assert row["role"] == "hero_result"
     assert row["reason"] == "Best headline comparison plot."
     assert row["rationale"] == "Best headline comparison plot."
+
+
+
+def test_storyboard_information_plan_normalization():
+    from poster_harness.llm_stages import _normalize_storyboard
+
+    spec = {"project": {"title": "T"}, "sections": [{"id": 1, "title": "Result"}]}
+    result = {
+        "meta": {},
+        "core_message": "Headline result",
+        "sections": [{"id": 1, "title": "Result", "role": "result", "synopsis": "", "key_claims": ["Public claim"], "text_budget": "2 bullets", "preferred_visual": "plot"}],
+        "visual_assets": [],
+        "layout_tree": {"reading_order": [1], "hero_section": 1},
+        "information_plan": {"data_badges": [{"label": "Dataset", "value": "13 TeV"}], "must_answer_questions": ["What is measured?"]},
+        "qa_questions": ["What is measured?"],
+    }
+    normalized = _normalize_storyboard(result, spec, [])
+    plan = normalized["information_plan"]
+    assert "Dataset: 13 TeV" in plan["data_badges"]
+    assert "Public claim" in plan["display_facts"]
+    assert "What is measured?" in plan["must_answer_questions"]

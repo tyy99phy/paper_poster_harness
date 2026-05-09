@@ -35,5 +35,7 @@ The deterministic harness owns:
 1. `poster_spec.yaml` defines `placeholders` with `id`, `section`, `label`, `aspect`, and source `asset`.
 2. The image model draws only labeled placeholder boxes; it must not invent plot contents.
 3. `llm-detect-placeholders` returns pixel boxes for those IDs.
-4. The replacement stage inserts the real assets into those boxes.
-5. QA checks that public text is clean and placeholders are accounted for.
+4. The template critic checks the whole generated poster for information density, artistic quality, text legibility, and placeholder contract compliance.
+5. If the critic rejects all candidates and regeneration rounds remain, the harness appends critic repairs to the prompt and regenerates a complete fresh poster.
+6. The replacement stage inserts the real assets into those boxes.
+7. QA checks that public text is clean and placeholders are accounted for.

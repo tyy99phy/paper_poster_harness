@@ -285,7 +285,7 @@ def storyboard_schema() -> dict[str, Any]:
         "$schema": JSON_SCHEMA_DRAFT,
         "type": "object",
         "additionalProperties": True,
-        "required": ["meta", "core_message", "sections", "visual_assets", "layout_tree", "qa_questions"],
+        "required": ["meta", "core_message", "sections", "visual_assets", "layout_tree", "information_plan", "qa_questions"],
         "properties": {
             "meta": {
                 "type": "object",
@@ -341,6 +341,17 @@ def storyboard_schema() -> dict[str, Any]:
                     "hero_visual_role": {"type": "string"},
                     "layout_intent": {"type": "string"},
                     "section_grouping": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            "information_plan": {
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {
+                    "density_target": {"type": "string"},
+                    "data_badges": {"type": "array", "items": {"type": ["string", "object"], "additionalProperties": True}},
+                    "display_facts": {"type": "array", "items": {"type": "string"}},
+                    "must_answer_questions": {"type": "array", "items": {"type": "string"}},
+                    "visual_story_units": {"type": "array", "items": {"type": "string"}},
                 },
             },
             "qa_questions": {
@@ -473,6 +484,59 @@ def poster_qa_schema() -> dict[str, Any]:
                 },
             },
             "recommended_repairs": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
+def poster_template_critic_schema() -> dict[str, Any]:
+    return {
+        "$schema": JSON_SCHEMA_DRAFT,
+        "type": "object",
+        "additionalProperties": True,
+        "required": ["passes", "summary", "scores", "issues", "prompt_repairs"],
+        "properties": {
+            "passes": {"type": "boolean"},
+            "summary": {"type": "string"},
+            "scores": {
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {
+                    "overall": {"type": "number"},
+                    "artistry": {"type": "number"},
+                    "information_density": {"type": "number"},
+                    "placeholder_contract": {"type": "number"},
+                    "text_quality": {"type": "number"},
+                    "figure_integration": {"type": "number"},
+                },
+            },
+            "issues": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["severity", "category", "message"],
+                    "properties": {
+                        "severity": {"type": "string", "enum": ["critical", "warning", "info"]},
+                        "category": {"type": "string"},
+                        "message": {"type": "string"},
+                        "location": {"type": "string"},
+                        "suggested_prompt_repair": {"type": "string"},
+                    },
+                },
+            },
+            "checks": {
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {
+                    "information_plan_visible": {"type": "boolean"},
+                    "art_direction_strong": {"type": "boolean"},
+                    "placeholder_contract_clean": {"type": "boolean"},
+                    "text_legible": {"type": "boolean"},
+                    "no_internal_text": {"type": "boolean"},
+                    "no_fake_science": {"type": "boolean"},
+                },
+            },
+            "prompt_repairs": {"type": "array", "items": {"type": "string"}},
         },
     }
 
