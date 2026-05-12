@@ -362,6 +362,100 @@ def storyboard_schema() -> dict[str, Any]:
     }
 
 
+def physics_quiz_schema() -> dict[str, Any]:
+    return {
+        "$schema": JSON_SCHEMA_DRAFT,
+        "type": "object",
+        "additionalProperties": True,
+        "required": ["quiz_items", "coverage_notes"],
+        "properties": {
+            "quiz_items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["id", "aspect", "question", "answer", "poster_priority", "source_evidence"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "aspect": {"type": "string"},
+                        "question": {"type": "string"},
+                        "options": {"type": "array", "items": {"type": "string"}},
+                        "answer": {"type": "string"},
+                        "poster_priority": {"type": "string", "enum": ["must", "should", "could"]},
+                        "source_evidence": {"type": "string"},
+                        "target_section": {"type": ["integer", "string"]},
+                        "recommended_copy": {"type": "string"},
+                        "linked_assets": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "coverage_notes": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
+def copy_deck_schema() -> dict[str, Any]:
+    return {
+        "$schema": JSON_SCHEMA_DRAFT,
+        "type": "object",
+        "additionalProperties": True,
+        "required": ["copy_units", "coverage_notes"],
+        "properties": {
+            "copy_units": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["id", "target_section", "type", "text", "max_chars", "priority", "evidence", "quiz_ids"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "target_section": {"type": ["integer", "string"]},
+                        "type": {
+                            "type": "string",
+                            "enum": [
+                                "hero_headline",
+                                "section_title",
+                                "subhead",
+                                "bullet",
+                                "badge",
+                                "figure_headline",
+                                "selection_cut",
+                                "region_matrix",
+                                "fit_strategy",
+                                "uncertainty",
+                                "conclusion",
+                                "callout",
+                            ],
+                        },
+                        "text": {"type": "string"},
+                        "max_chars": {"type": "integer"},
+                        "priority": {"type": "string", "enum": ["must", "should", "could"]},
+                        "evidence": {"type": "string"},
+                        "quiz_ids": {"type": "array", "items": {"type": "string"}},
+                        "placeholder_id": {"type": "string"},
+                        "placement_hint": {"type": "string"},
+                        "render_style": {"type": "string"},
+                    },
+                },
+            },
+            "section_copy": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "properties": {
+                        "section": {"type": ["integer", "string"]},
+                        "role": {"type": "string"},
+                        "must_units": {"type": "array", "items": {"type": "string"}},
+                        "target_density": {"type": "string"},
+                    },
+                },
+            },
+            "coverage_notes": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
 def figure_selection_schema() -> dict[str, Any]:
     return {
         "$schema": JSON_SCHEMA_DRAFT,

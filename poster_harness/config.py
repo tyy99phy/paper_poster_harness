@@ -92,7 +92,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
         "template_critic": {
             "enabled": True,
             "require_pass": True,
-            "max_regen_rounds": 1,
+            "max_regen_rounds": 2,
             "min_overall_score": 0.72,
             "min_artistry_score": 0.65,
             "min_information_density_score": 0.65,
@@ -103,6 +103,21 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
         "max_pages": 12,
         "storyboard": {
             "enabled": True,
+            "extra_instructions": "",
+        },
+        "physics_quiz": {
+            "enabled": True,
+            "max_questions": 20,
+            "extra_instructions": "",
+        },
+        "copy_deck": {
+            "enabled": True,
+            "max_units": 34,
+            "extra_instructions": "",
+        },
+        "flowchart_rewrite": {
+            "enabled": True,
+            "text_char_limit": 24000,
             "extra_instructions": "",
         },
         "figure_layout_policy": (

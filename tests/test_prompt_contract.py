@@ -106,7 +106,7 @@ def test_prompt_has_exact_source_aspect_instruction():
     prompt = build_prompt(spec)
     assert "[FIG 01]: blank rectangular placeholder only" in prompt
     assert "aspect ratio \"1:1 square\"" in prompt
-    assert "28-33% of the canvas width" in prompt
+    assert "30-34% of the canvas width" in prompt
     assert "above the bottom summary/conclusion modules" in prompt
     assert "square light/white fill" in prompt
     assert "surrounding figure card/mat must also be light" in prompt
@@ -351,3 +351,279 @@ def test_prompt_includes_information_density_plan_from_storyboard():
     assert "13 TeV dataset" in prompt
     assert "same-sign dimuon" in prompt
     assert "What is the headline result?" in prompt
+
+
+def test_prompt_uses_copy_deck_as_authoritative_public_text():
+    spec = {
+        "project": {"title": "T", "topic": "T"},
+        "style": {},
+        "sections": [
+            {
+                "id": 1,
+                "title": "Result",
+                "layout": "hero",
+                "text": [{"title": "Old", "body": ["Old paragraph should not render"], "bullets": ["Old bullet"]}],
+            }
+        ],
+        "placeholders": [{"id": "FIG 01", "section": 1, "label": "Observed limit", "aspect": "1:1 square"}],
+        "physics_quiz": {
+            "quiz_items": [
+                {
+                    "id": "Q01",
+                    "aspect": "headline_result",
+                    "question": "What is the headline result?",
+                    "answer": "No significant excess is observed.",
+                    "poster_priority": "must",
+                }
+            ]
+        },
+        "copy_deck": {
+            "copy_units": [
+                {
+                    "id": "C01",
+                    "target_section": 1,
+                    "type": "hero_headline",
+                    "text": "No significant excess is observed",
+                    "max_chars": 42,
+                    "priority": "must",
+                    "quiz_ids": ["Q01"],
+                },
+                {
+                    "id": "C02",
+                    "target_section": 1,
+                    "type": "figure_headline",
+                    "text": "Observed and expected limits",
+                    "max_chars": 36,
+                    "priority": "should",
+                    "placeholder_id": "FIG 01",
+                    "quiz_ids": ["Q01"],
+                },
+            ],
+            "coverage_notes": ["Must cover the headline result."],
+        },
+        "conclusion": [],
+    }
+    prompt = build_prompt(spec)
+    assert "PHYSICS QUIZ COVERAGE TARGET" in prompt
+    assert "PUBLIC COPY DECK" in prompt
+    assert "No significant excess is observed" in prompt
+    assert "Observed and expected limits" in prompt
+    assert "Authoritative copy deck text for this section" in prompt
+    assert "do not render C/Q IDs or evidence" in prompt
+    assert "Old paragraph should not render" not in prompt
+    assert "Old bullet" not in prompt
+
+
+def test_copy_deck_section_title_replaces_section_heading_not_body_text():
+    spec = {
+        "project": {"title": "T", "topic": "T"},
+        "style": {},
+        "sections": [{"id": 2, "title": "Analysis strategy", "layout": "card", "text": []}],
+        "placeholders": [],
+        "copy_deck": {
+            "copy_units": [
+                {
+                    "id": "C01",
+                    "target_section": 2,
+                    "type": "section_title",
+                    "text": "02 Dataset and event signature",
+                    "max_chars": 32,
+                    "priority": "must",
+                    "evidence": "section plan",
+                    "quiz_ids": [],
+                },
+                {
+                    "id": "C02",
+                    "target_section": 2,
+                    "type": "selection_cut",
+                    "text": "VBF jets: |Δηjj| > 2.5, mjj > 750 GeV",
+                    "max_chars": 54,
+                    "priority": "must",
+                    "evidence": "selection",
+                    "quiz_ids": [],
+                },
+            ],
+            "coverage_notes": [],
+        },
+        "conclusion": [],
+    }
+    prompt = build_prompt(spec)
+    assert 'Section 2, layout: card, title: "02 Dataset and event signature"' in prompt
+    assert "Visible section heading is taken from the copy deck" in prompt
+    assert 'section_title, priority=must' not in prompt
+    assert 'selection_cut, priority=must' in prompt
+    assert "VBF jets" in prompt
+
+
+def test_copy_deck_specialist_units_suppress_generic_flowchart():
+    spec = {
+        "project": {"title": "T", "topic": "T"},
+        "style": {},
+        "sections": [
+            {
+                "id": 2,
+                "title": "Analysis strategy",
+                "layout": "card",
+                "text": [],
+                "flowchart": ["pp collisions", "candidate events", "SR/CR", "fit"],
+            }
+        ],
+        "placeholders": [],
+        "copy_deck": {
+            "copy_units": [
+                {
+                    "id": "C01",
+                    "target_section": 2,
+                    "type": "region_matrix",
+                    "text": "SR: 2 SS μ; WZ CR: 3μ with OS pair near mZ",
+                    "max_chars": 56,
+                    "priority": "must",
+                    "evidence": "regions",
+                    "quiz_ids": [],
+                }
+            ],
+            "coverage_notes": [],
+        },
+        "conclusion": [],
+    }
+    prompt = build_prompt(spec)
+    assert "region_matrix, priority=must" in prompt
+    assert "SR: 2 SS μ; WZ CR" in prompt
+    assert "Node label" not in prompt
+    assert "pp collisions" not in prompt
+
+
+def test_copy_deck_specialist_units_allow_concrete_rewritten_flowchart():
+    spec = {
+        "project": {"title": "T", "topic": "T"},
+        "style": {},
+        "sections": [
+            {
+                "id": 2,
+                "title": "Analysis strategy",
+                "layout": "card",
+                "text": [],
+                "flowchart": [
+                    "Run 2 138 fb-1 pp at 13 TeV",
+                    ">=2 same-sign muons: pT>30 GeV, |eta|<2.4",
+                    "WZ CR | top CR | nonprompt estimate",
+                    "Profile-likelihood CLs fit",
+                ],
+            }
+        ],
+        "placeholders": [],
+        "copy_deck": {
+            "copy_units": [
+                {
+                    "id": "C01",
+                    "target_section": 2,
+                    "type": "region_matrix",
+                    "text": "SR: 2 SS μ; WZ CR: 3μ with OS pair near mZ",
+                    "max_chars": 56,
+                    "priority": "must",
+                    "evidence": "regions",
+                    "quiz_ids": [],
+                }
+            ],
+            "coverage_notes": [],
+        },
+        "conclusion": [],
+    }
+    prompt = build_prompt(spec)
+    assert "polished public text-only HEP analysis schematic" in prompt
+    assert "Node label" in prompt
+    assert "pT>30 GeV" in prompt
+    assert "Profile-likelihood CLs fit" in prompt
+
+
+def test_square_hero_layout_suppresses_summary_strip_and_optional_fit_chips():
+    spec = {
+        "project": {"title": "T", "topic": "T"},
+        "style": {},
+        "sections": [
+            {
+                "id": 5,
+                "title": "Results",
+                "layout": "large lower hero result card plus summary strip",
+                "text": [],
+            }
+        ],
+        "placeholders": [
+            {
+                "id": "FIG 01",
+                "section": 5,
+                "label": "Observed result limit",
+                "aspect": "1:1 square",
+                "role": "hero_result",
+            }
+        ],
+        "copy_deck": {
+            "copy_units": [
+                {
+                    "id": "C01",
+                    "target_section": 5,
+                    "type": "hero_headline",
+                    "text": "No significant excess",
+                    "max_chars": 42,
+                    "priority": "must",
+                    "evidence": "result",
+                    "quiz_ids": [],
+                },
+                {
+                    "id": "C02",
+                    "target_section": 5,
+                    "type": "fit_strategy",
+                    "text": "Profile likelihood with nuisance parameters",
+                    "max_chars": 60,
+                    "priority": "should",
+                    "evidence": "method",
+                    "quiz_ids": [],
+                },
+            ],
+            "coverage_notes": [],
+        },
+        "conclusion": [],
+    }
+    prompt = build_prompt(spec)
+    section_line = next(line for line in prompt.splitlines() if line.startswith("Section 5,"))
+    assert "square-first hero layout" in section_line
+    assert "plus summary strip" not in section_line
+    assert "No significant excess" in prompt
+    assert "Profile likelihood with nuisance parameters" not in prompt
+
+
+def test_single_copy_deck_conclusion_is_augmented_with_public_conclusions():
+    spec = {
+        "project": {"title": "T", "topic": "T"},
+        "style": {},
+        "sections": [{"id": 5, "title": "Results", "layout": "card", "text": []}],
+        "placeholders": [],
+        "copy_deck": {
+            "copy_units": [
+                {
+                    "id": "C01",
+                    "target_section": 5,
+                    "type": "conclusion",
+                    "text": "Leading high-mass LHC constraints",
+                    "max_chars": 60,
+                    "priority": "must",
+                    "evidence": "result",
+                    "quiz_ids": [],
+                }
+            ],
+            "coverage_notes": [],
+        },
+        "conclusion": [
+            "No significant excess is observed.",
+            "First collider limit on the effective dimuon Majorana mass.",
+            "Do not use this placeholder explanation.",
+        ],
+        "forbidden_phrases": ["placeholder explanation"],
+    }
+    prompt = build_prompt(spec)
+    section_block = prompt[prompt.index("Section 5,") : prompt.index("Conclusion box")]
+    assert "Leading high-mass LHC constraints" not in section_block
+    assert "Leading high-mass LHC constraints" in prompt
+    assert "No significant excess is observed." in prompt
+    assert "First collider limit on the effective dimuon Majorana mass." in prompt
+    assert "placeholder explanation" not in prompt

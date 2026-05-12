@@ -30,6 +30,11 @@ def build_layout_contract(
     sections = _sections_in_reading_order(spec)
     section_zones = _section_zones(sections)
     placeholders = [dict(item) for item in spec.get("placeholders") or [] if isinstance(item, Mapping)]
+    hero_sections = _hero_placeholder_sections(placeholders, spec)
+    for sid in hero_sections:
+        zone = section_zones.get(sid)
+        if zone and zone[3] > 0.86:
+            section_zones[sid] = _hero_result_zone(zone)
 
     by_section: dict[int, list[dict[str, Any]]] = {}
     for item in placeholders:
@@ -42,7 +47,7 @@ def build_layout_contract(
     planned_placeholders: list[dict[str, Any]] = []
     for sid, figs in by_section.items():
         section_zone = section_zones.get(sid) or _fallback_section_zone(sid)
-        slots = _slots_for_section(section_zone, figs)
+        slots = _slots_for_section(section_zone, figs, canvas_width=canvas_width, canvas_height=canvas_height)
         for fig, slot in zip(figs, slots):
             ratio = _parse_aspect_ratio(str(fig.get("aspect") or "")) or 1.0
             search_zone = _intersection_norm(
@@ -249,12 +254,63 @@ def _fallback_section_zone(section_id: int) -> NormBox:
     return x0, y0, x1, y1
 
 
-def _slots_for_section(section_zone: NormBox, figs: Sequence[Mapping[str, Any]]) -> list[NormBox]:
+def _hero_placeholder_sections(placeholders: Sequence[Mapping[str, Any]], spec: Mapping[str, Any]) -> set[int]:
+    out: set[int] = set()
+    storyboard = spec.get("storyboard") if isinstance(spec.get("storyboard"), Mapping) else {}
+    layout_tree = storyboard.get("layout_tree") if isinstance(storyboard.get("layout_tree"), Mapping) else {}
+    try:
+        if layout_tree.get("hero_section") is not None:
+            out.add(int(layout_tree.get("hero_section")))
+    except Exception:
+        pass
+    for item in placeholders:
+        try:
+            sid = int(item.get("section") or item.get("target_section") or 0)
+        except Exception:
+            continue
+        if _is_hero_placeholder(item):
+            out.add(sid)
+    return out
+
+
+def _is_hero_placeholder(fig: Mapping[str, Any]) -> bool:
+    role = str(fig.get("role") or "").lower()
+    label = str(fig.get("label") or "").lower()
+    return "hero" in role or any(word in label for word in ("limit", "result", "constraint", "measurement", "exclusion"))
+
+
+def _hero_result_zone(original: NormBox) -> NormBox:
+    """Keep bottom-row hero results above the conclusion strip.
+
+    LLM storyboards sometimes put the hero result in section 5 while describing
+    that section as "lower-right hero result plus bottom summary strip".  The
+    fixed section-5 default zone is a bottom full-width strip, which pushes a
+    square limit placeholder into the conclusion area.  Reserve a lower-right
+    result zone above the lower fifth instead; the public conclusion remains
+    handled by the separate conclusion box in the prompt.
+    """
+
+    x0, _y0, x1, _y1 = original
+    if x1 - x0 > 0.65:
+        return 0.515, 0.535, 0.965, 0.835
+    if x0 >= 0.50:
+        return x0, 0.535, x1, 0.835
+    return x0, 0.535, min(0.965, x1 + 0.18), 0.835
+
+
+def _slots_for_section(
+    section_zone: NormBox,
+    figs: Sequence[Mapping[str, Any]],
+    *,
+    canvas_width: int = 1024,
+    canvas_height: int = 1536,
+) -> list[NormBox]:
     if not figs:
         return []
     n = len(figs)
     if n == 1:
-        return [_single_slot(section_zone, figs[0])]
+        return [_single_slot(section_zone, figs[0], canvas_width=canvas_width, canvas_height=canvas_height)]
+    norm_ratio_scale = _norm_ratio_scale(canvas_width=canvas_width, canvas_height=canvas_height)
     if n == 2:
         x0, y0, x1, y1 = section_zone
         w = x1 - x0
@@ -264,7 +320,15 @@ def _slots_for_section(section_zone: NormBox, figs: Sequence[Mapping[str, Any]])
         gap = 0.035 * w
         mid = (lx0 + lx1) / 2
         containers = [(lx0, ly0, mid - gap / 2, ly1), (mid + gap / 2, ly0, lx1, ly1)]
-        return [_fit_norm_box(container, _parse_aspect_ratio(str(fig.get("aspect") or "")) or 1.0, fill=0.92) for container, fig in zip(containers, figs)]
+        return [
+            _fit_norm_box(
+                container,
+                _parse_aspect_ratio(str(fig.get("aspect") or "")) or 1.0,
+                fill=0.92,
+                norm_ratio_scale=norm_ratio_scale,
+            )
+            for container, fig in zip(containers, figs)
+        ]
 
     x0, y0, x1, y1 = section_zone
     w = x1 - x0
@@ -287,40 +351,73 @@ def _slots_for_section(section_zone: NormBox, figs: Sequence[Mapping[str, Any]])
             gx0 + c * (cell_w + gap_x) + cell_w,
             gy0 + r * (cell_h + gap_y) + cell_h,
         )
-        out.append(_fit_norm_box(cell, _parse_aspect_ratio(str(fig.get("aspect") or "")) or 1.0, fill=0.90))
+        out.append(
+            _fit_norm_box(
+                cell,
+                _parse_aspect_ratio(str(fig.get("aspect") or "")) or 1.0,
+                fill=0.90,
+                norm_ratio_scale=norm_ratio_scale,
+            )
+        )
     return out
 
 
-def _single_slot(section_zone: NormBox, fig: Mapping[str, Any]) -> NormBox:
+def _single_slot(
+    section_zone: NormBox,
+    fig: Mapping[str, Any],
+    *,
+    canvas_width: int = 1024,
+    canvas_height: int = 1536,
+) -> NormBox:
     x0, y0, x1, y1 = section_zone
     w = x1 - x0
     h = y1 - y0
     ratio = _parse_aspect_ratio(str(fig.get("aspect") or "")) or 1.0
+    norm_ratio_scale = _norm_ratio_scale(canvas_width=canvas_width, canvas_height=canvas_height)
+    physical_section_aspect = (w * max(1, canvas_width)) / max(0.001, h * max(1, canvas_height))
     label = str(fig.get("label") or "").lower()
     role = str(fig.get("role") or "").lower()
     hero = "hero" in role or any(word in label for word in ("limit", "result", "constraint", "measurement", "exclusion"))
-    if hero and 0.75 <= ratio <= 1.35 and w > h:
+    if hero and 0.75 <= ratio <= 1.35 and physical_section_aspect > 1.0:
         container = (x0 + 0.46 * w, y0 + 0.18 * h, x1 - 0.045 * w, y1 - 0.08 * h)
-        return _fit_norm_box(container, ratio, fill=0.96)
+        return _fit_norm_box(container, ratio, fill=0.96, norm_ratio_scale=norm_ratio_scale)
     if ratio >= 2.0:
         container = (x0 + 0.04 * w, y0 + 0.50 * h, x1 - 0.04 * w, y1 - 0.08 * h)
-        return _fit_norm_box(container, ratio, fill=0.98)
+        return _fit_norm_box(container, ratio, fill=0.98, norm_ratio_scale=norm_ratio_scale)
     container = (x0 + 0.08 * w, y0 + 0.40 * h, x1 - 0.08 * w, y1 - 0.08 * h)
-    return _fit_norm_box(container, ratio, fill=0.94)
+    return _fit_norm_box(container, ratio, fill=0.94, norm_ratio_scale=norm_ratio_scale)
 
 
-def _fit_norm_box(container: NormBox, ratio: float, *, fill: float = 0.94) -> NormBox:
+def _fit_norm_box(
+    container: NormBox,
+    ratio: float,
+    *,
+    fill: float = 0.94,
+    norm_ratio_scale: float = 1.5,
+) -> NormBox:
+    """Fit a pixel-aspect-ratio box inside a normalized coordinate container.
+
+    Normalized poster coordinates are not square pixels: on a 1024×1536 portrait
+    canvas, a box with ``dx == dy`` is physically 2:3, not 1:1.  To preserve a
+    source-image pixel aspect ratio ``width / height == ratio``, the normalized
+    width/height must be ``ratio * canvas_height / canvas_width``.
+    """
     x0, y0, x1, y1 = container
     cw = max(0.001, x1 - x0)
     ch = max(0.001, y1 - y0)
+    norm_ratio = max(0.05, ratio) * max(0.05, norm_ratio_scale)
     width = cw * fill
-    height = width / max(0.05, ratio)
+    height = width / norm_ratio
     if height > ch * fill:
         height = ch * fill
-        width = height * max(0.05, ratio)
+        width = height * norm_ratio
     cx = (x0 + x1) / 2
     cy = (y0 + y1) / 2
     return _clamp_norm((cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2))
+
+
+def _norm_ratio_scale(*, canvas_width: int = 1024, canvas_height: int = 1536) -> float:
+    return max(1, int(canvas_height)) / max(1, int(canvas_width))
 
 
 def _parse_aspect_ratio(aspect: str) -> float | None:

@@ -11,6 +11,11 @@ from poster_harness.replace import (
 )
 
 
+def _count_dark_pixels(image: Image.Image) -> int:
+    rgb = image.convert("RGB")
+    return sum(1 for pixel in rgb.getdata() if sum(pixel) / 3 < 80)
+
+
 def test_normalize_placeholder_geometry_matches_declared_aspects(tmp_path: Path):
     base = tmp_path / "base.png"
     Image.new("RGB", (1024, 1536), "white").save(base)
@@ -439,6 +444,9 @@ def test_square_result_erase_does_not_create_large_uniform_rectangle(tmp_path: P
         draw.line([(50, y), (50, min(y + 12, 220))], fill=(80, 80, 80), width=2)
         draw.line([(270, y), (270, min(y + 12, 220))], fill=(80, 80, 80), width=2)
     draw.text((130, 120), "[FIG 01]", fill=(25, 25, 25))
+    draw.text((82, 196), "Public callout", fill=(20, 20, 20))
+    callout_box = (78, 190, 230, 215)
+    before_callout_dark = _count_dark_pixels(im.crop(callout_box))
     untouched = im.getpixel((65, 90))
     im.save(base)
     asset_dir = tmp_path / "assets"
@@ -459,6 +467,8 @@ def test_square_result_erase_does_not_create_large_uniform_rectangle(tmp_path: P
     assert result.getpixel((65, 90)) == untouched
     # But a dashed artifact pixel should be repaired.
     assert result.getpixel((50, 40)) != (80, 80, 80)
+    # Public text near the result slot must not be blurred or painted away.
+    assert _count_dark_pixels(result.crop(callout_box)) >= before_callout_dark * 0.75
 
 
 def test_normalize_can_plan_geometry_without_redrawing_visible_placeholders(tmp_path: Path):
@@ -533,6 +543,45 @@ def test_hidden_normalize_corrects_over_tall_color_consistent_placeholder(tmp_pa
     assert clear[3] <= 255
     assert box[3] <= clear[3]
     assert abs(((box[2] - box[0]) / (box[3] - box[1])) - 1.2) < 0.03
+
+
+def test_hidden_normalize_keeps_exact_wide_fit_plot_above_following_bullets(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (620, 500), "white")
+    draw = ImageDraw.Draw(im)
+    # Exact generated wide placeholder followed immediately by a bullet strip.
+    for x in range(50, 570, 28):
+        draw.line([(x, 120), (min(x + 14, 570), 120)], fill=(100, 100, 100), width=3)
+        draw.line([(x, 328), (min(x + 14, 570), 328)], fill=(100, 100, 100), width=3)
+    for y in range(120, 328, 28):
+        draw.line([(50, y), (50, min(y + 14, 328))], fill=(100, 100, 100), width=3)
+        draw.line([(570, y), (570, min(y + 14, 328))], fill=(100, 100, 100), width=3)
+    draw.rounded_rectangle([50, 332, 570, 390], radius=8, outline=(190, 170, 220), width=2)
+    draw.text((86, 348), "Fitted discriminant: HT/pTmu1", fill=(20, 20, 20))
+    im.save(base)
+    spec = {
+        "placeholders": [
+            {
+                "id": "FIG 02",
+                "label": "Post-fit HT/pTmu1 distributions in SRs and CRs",
+                "aspect": "2.5:1 wide",
+                "role": "supporting_validation",
+            }
+        ],
+        "placements": {"FIG 02": [50, 120, 570, 328]},
+    }
+    _, updated = normalize_placeholder_geometry(
+        base_image=base,
+        spec=spec,
+        out_path=tmp_path / "planned.png",
+        redraw=False,
+    )
+    assert updated["_replacement_clear_boxes"]["FIG 02"] == [50, 120, 570, 328]
+    frame = updated["_replacement_frame_boxes"]["FIG 02"]
+    box = updated["placements"]["FIG 02"]
+    assert frame[3] < 328
+    assert box[3] < frame[3]
+    assert abs(((box[2] - box[0]) / (box[3] - box[1])) - 2.5) < 0.03
 
 
 def test_hidden_normalize_keeps_edge_detection_inside_canvas_gutter(tmp_path: Path):

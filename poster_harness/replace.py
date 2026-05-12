@@ -195,7 +195,13 @@ def _default_erase_box(
         # placeholder text.
         x0, y0, x1, y1 = cleanup_box
         return _clamp_box((x0 - pad, y0 - pad, x1 + pad, y1), canvas_size)
-    return _pad_box(cleanup_box, pad, canvas_size)
+    # Generic plot placeholders are often followed immediately by bullet rows.
+    # A symmetric erase pad can blank the first bullet even when the real figure
+    # is perfectly contained.  The final publication frame already covers the
+    # detected placeholder border, so keep the lower edge fixed and only allow a
+    # small top/side cleanup margin.
+    x0, y0, x1, y1 = cleanup_box
+    return _clamp_box((x0 - pad, y0 - pad, x1 + pad, y1), canvas_size)
 
 
 def _erase_final_placeholder_region(canvas: Image.Image, box: tuple[int, int, int, int]) -> None:
@@ -210,14 +216,16 @@ def _erase_final_placeholder_region(canvas: Image.Image, box: tuple[int, int, in
 
 
 def _erase_placeholder_region_with_sampled_fill(canvas: Image.Image, box: tuple[int, int, int, int]) -> None:
-    """Erase a square-result placeholder without creating a huge white board.
+    """Erase square-result placeholder edge artifacts without blurring text.
 
     For dense headline result cards, the original image-generation placeholder
     is often a dashed rectangle on a cream/gradient card.  Clearing that whole
     region to pure white makes a giant "white board" that looks larger than the
-    intended placeholder.  Instead, only paint over the actual placeholder
-    artifacts (dark text/dashes) with a sampled local card fill; the smaller
-    publication frame is drawn separately around the real figure.
+    intended placeholder.  Earlier versions used a blurred local repair mask;
+    that looked especially bad when a public callout was close to the result
+    slot because the callout text became smeared.  Instead, only repaint
+    line-like placeholder border artifacts with a sampled card fill.  The
+    smaller publication frame is drawn separately around the real figure.
     """
     x0, y0, x1, y1 = box
     w, h = max(1, x1 - x0), max(1, y1 - y0)
@@ -225,28 +233,83 @@ def _erase_placeholder_region_with_sampled_fill(canvas: Image.Image, box: tuple[
     mask = _placeholder_artifact_mask(crop)
     if mask.getbbox() is None:
         return
-    # The mask is sparse, so a local blurred repair removes glyph/dash pixels
-    # without creating a visible large same-color rectangle.
-    repair = crop.filter(ImageFilter.GaussianBlur(radius=max(3, min(14, min(w, h) // 28))))
-    canvas.paste(repair, (x0, y0), mask)
+    fill = Image.new("RGB", (w, h), _sample_light_card_fill(canvas, box))
+    canvas.paste(fill, (x0, y0), mask)
 
 
 def _placeholder_artifact_mask(crop: Image.Image) -> Image.Image:
-    """Mask only placeholder labels/dashes, not the whole placeholder panel."""
+    """Mask only line-like placeholder dashes, not nearby public text."""
     rgb = crop.convert("RGB")
     mask = Image.new("L", rgb.size, 0)
     px = rgb.load()
     mp = mask.load()
+    if rgb.width <= 0 or rgb.height <= 0:
+        return mask
+
+    artifact: list[list[bool]] = []
+    row_counts: list[int] = []
+    col_counts = [0 for _ in range(rgb.width)]
     for y in range(rgb.height):
+        row: list[bool] = []
+        count = 0
         for x in range(rgb.width):
-            pixel = px[x, y]
-            if _is_square_placeholder_artifact_pixel(pixel):
+            is_artifact = _is_square_placeholder_artifact_pixel(px[x, y])
+            row.append(is_artifact)
+            if is_artifact:
+                count += 1
+                col_counts[x] += 1
+        artifact.append(row)
+        row_counts.append(count)
+
+    # Placeholder dashes are line-like structures near the replacement boundary.
+    # Public callout text may also be dark, but it should not form both border
+    # rows/columns at the outer edge of the placeholder cleanup box.
+    edge_band_y = max(8, int(round(rgb.height * 0.16)))
+    edge_band_x = max(8, int(round(rgb.width * 0.16)))
+    row_threshold = max(12, int(round(rgb.width * 0.10)))
+    col_threshold = max(12, int(round(rgb.height * 0.10)))
+    x_probe = max(4, int(round(rgb.width * 0.14)))
+    y_probe = max(4, int(round(rgb.height * 0.14)))
+
+    def row_has_edge_hits(y: int) -> bool:
+        row = artifact[y]
+        return any(row[x] for x in range(0, min(rgb.width, x_probe))) and any(
+            row[x] for x in range(max(0, rgb.width - x_probe), rgb.width)
+        )
+
+    def col_has_edge_hits(x: int) -> bool:
+        return any(artifact[y][x] for y in range(0, min(rgb.height, y_probe))) and any(
+            artifact[y][x] for y in range(max(0, rgb.height - y_probe), rgb.height)
+        )
+
+    candidate_rows = {
+        y
+        for y, count in enumerate(row_counts)
+        if count >= row_threshold
+        and (y <= edge_band_y or y >= rgb.height - edge_band_y - 1)
+        and row_has_edge_hits(y)
+    }
+    candidate_cols = {
+        x
+        for x, count in enumerate(col_counts)
+        if count >= col_threshold
+        and (x <= edge_band_x or x >= rgb.width - edge_band_x - 1)
+        and col_has_edge_hits(x)
+    }
+    if not candidate_rows and not candidate_cols:
+        return mask
+
+    radius = max(1, min(4, int(round(min(rgb.width, rgb.height) * 0.006))))
+    for y, row in enumerate(artifact):
+        near_row = any(abs(y - yy) <= radius for yy in candidate_rows)
+        for x, is_artifact in enumerate(row):
+            if not is_artifact:
+                continue
+            if near_row or any(abs(x - xx) <= radius for xx in candidate_cols):
                 mp[x, y] = 255
-    # Cover anti-aliased edges around glyphs/dashes without making a large
-    # rectangular patch.  Keep dilation modest; the visible plot frame covers
-    # most central label text anyway.
-    mask = mask.filter(ImageFilter.MaxFilter(7))
-    return mask.filter(ImageFilter.GaussianBlur(radius=0.7))
+    # Slightly dilate to catch antialiasing, but do not blur: blur was the cause
+    # of smeared public text in dense result cards.
+    return mask.filter(ImageFilter.MaxFilter(3))
 
 
 def _is_square_placeholder_artifact_pixel(pixel: tuple[int, int, int]) -> bool:
@@ -531,6 +594,18 @@ def normalize_placeholder_geometry(
                     min(canvas.size[0], clear_box[2] + pad_x),
                     clear_box[3],
                 )
+            if _needs_supporting_plot_text_clearance(ph, ratio) and _busy_content_below_placeholder(canvas, source_box):
+                # Wide fit/distribution plots often sit immediately above
+                # analysis-strategy bullets.  Preserve the detected placeholder
+                # as the hard containment envelope, but draw/paste a slightly
+                # shorter publication frame so it cannot blanket the first bullet
+                # row.  Still erase the *full* detected placeholder first;
+                # otherwise old dashed borders/labels/aspect text can remain
+                # visible below the shorter final frame.  This is a deterministic
+                # single-figure repair, not a fallback layout rewrite.
+                box = _inset_supporting_wide_target_box(source_box, ratio)
+                frame_box = _supporting_wide_frame_around_target(box, source_box)
+                erase_box = source_box
             # For square result plots, LLM detection often captures a good
             # ratio-correct seed that is visually just a little too low/right
             # inside a decorative result block.  Do not expand to the full
@@ -750,7 +825,7 @@ def _box_too_large_for_result_square(
     return side > canvas_size[0] * max_canvas_width_fraction
 
 
-_RESULT_SQUARE_MAX_BOTTOM_FRACTION = 0.835
+_RESULT_SQUARE_MAX_BOTTOM_FRACTION = 0.89
 
 
 def _box_too_low_for_result_square(
@@ -1307,15 +1382,12 @@ def _find_enclosing_placeholder_panel(
     it returns ``None`` and the caller keeps the LLM box.
     """
     raw_error = _ratio_relative_error(_box_ratio(box), ratio)
-    if (
-        0.90 <= ratio <= 1.10
-        and raw_error <= _effective_placeholder_ratio_tolerance(ratio, 0.20)
-        and _box_has_placeholder_edge_evidence(canvas, box)
-    ):
-        # For square result placeholders, the vision model often reports the
-        # actual dashed slot accurately enough.  Do not expand such a good seed
-        # to the wider surrounding light result card/mat; the latter is meant to
-        # be decorative surface, not the scientific replacement rectangle.
+    if raw_error <= _effective_placeholder_ratio_tolerance(ratio, 0.20) and _box_has_placeholder_edge_evidence(canvas, box):
+        # When the vision model already reports a ratio-correct box with visible
+        # placeholder border evidence, trust that seed.  Expanding a good seed to
+        # the surrounding light card/section is what made wide post-fit plots
+        # cover the bullet rows below and made square result erasers reach into
+        # public callouts.
         return None
 
     dashed_panel = _find_dashed_placeholder_panel(canvas, box, ratio)
@@ -1567,7 +1639,11 @@ def _box_has_placeholder_edge_evidence(
     bottom_ok = max(row_score(y) for y in range(max(0, y1 - tol), min(canvas.height, y1 + tol + 1))) >= min_h
     left_ok = max(col_score(x) for x in range(max(0, x0 - tol), min(canvas.width, x0 + tol + 1))) >= min_v
     right_ok = max(col_score(x) for x in range(max(0, x1 - tol), min(canvas.width, x1 + tol + 1))) >= min_v
-    return (top_ok and bottom_ok) or (left_ok and right_ok)
+    # This helper is used to decide whether an LLM/vision box is already the
+    # actual placeholder.  Require evidence on all sides; an over-tall detection
+    # may share the real left/right dashed edges while extending below the
+    # placeholder into the next text block.
+    return top_ok and bottom_ok and left_ok and right_ok
 
 
 def _find_dashed_placeholder_panel(
@@ -2299,6 +2375,74 @@ def _repair_square_result_replacement_plan(
     frame_box = _square_result_frame_around_target(box, clear_box)
     erase_box = _intersect_box(erase_box, clear_box) or clear_box
     return box, clear_box, erase_box, frame_box
+
+
+def _needs_supporting_plot_text_clearance(ph: dict[str, Any], ratio: float) -> bool:
+    if ratio < 1.9:
+        return False
+    role = str(ph.get("role") or "").lower()
+    label = str(ph.get("label") or "").lower()
+    target = " ".join([role, label])
+    return any(
+        word in target
+        for word in (
+            "fit",
+            "post-fit",
+            "distribution",
+            "template",
+            "validation",
+            "control region",
+            "signal region",
+        )
+    )
+
+
+def _busy_content_below_placeholder(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+) -> bool:
+    x0, _y0, x1, y1 = _pad_box(box, 0, canvas.size)
+    width = max(1, x1 - x0)
+    height = max(1, box[3] - box[1])
+    pad_x = int(round(width * 0.04))
+    sx0 = max(0, x0 + pad_x)
+    sx1 = min(canvas.width, x1 - pad_x)
+    sy0 = min(canvas.height, y1)
+    sy1 = min(canvas.height, y1 + max(24, min(180, int(round(height * 0.24)))))
+    if sx1 <= sx0 or sy1 <= sy0:
+        return False
+    pixels = canvas.load()
+    step = max(1, int(round(max(canvas.size) / 1800)))
+    busy = 0
+    total = 0
+    for y in range(sy0, sy1, step):
+        for x in range(sx0, sx1, step):
+            total += 1
+            if _is_busy_pixel(pixels[x, y]):
+                busy += 1
+    return bool(total and busy / total >= 0.025)
+
+
+def _inset_supporting_wide_target_box(
+    source_box: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = source_box
+    h = max(1, y1 - y0)
+    top_inset = max(6, min(28, int(round(h * 0.025))))
+    bottom_reserve = max(24, min(120, int(round(h * 0.120))))
+    inner = (x0, y0 + top_inset, x1, max(y0 + top_inset + 1, y1 - bottom_reserve))
+    return _fit_box_to_ratio_inside(inner, ratio)
+
+
+def _supporting_wide_frame_around_target(
+    box: tuple[int, int, int, int],
+    source_box: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = source_box
+    h = max(1, y1 - y0)
+    bottom_pad = max(4, min(18, int(round(h * 0.020))))
+    return x0, y0, x1, min(y1, box[3] + bottom_pad)
 
 
 def _square_result_frame_around_target(

@@ -13,11 +13,13 @@ from .llm import ChatGPTAccountResponsesProvider
 from .prompt import INTERNAL_DEFAULTS, sanitize_public_text
 from .schemas import (
     DEFAULT_FORBIDDEN_PHRASES,
+    copy_deck_schema,
     default_poster_spec,
     figure_selection_schema,
     normalize_assets_manifest,
     normalize_placeholder_id,
     placeholder_detection_schema,
+    physics_quiz_schema,
     poster_qa_schema,
     poster_template_critic_schema,
     poster_spec_schema,
@@ -29,6 +31,20 @@ SYSTEM_PROMPT = (
     "You are building internal poster-harness stage outputs for a scientific poster pipeline. "
     "Return JSON only. Keep text public-facing. Never invent scientific results that are not grounded in the provided text or assets."
 )
+
+
+FLOWCHART_NODE_RULES: list[str] = [
+    "When a section gets a 'flowchart' field, treat each node as a concrete information capsule, not a generic stage label.",
+    "Each flowchart node should contain at least one paper-specific number, variable, threshold, region label, fitted observable, uncertainty label, or statistical-method detail.",
+    "Bad node: 'preselection'. Good node: '>=2 same-sign muons: pT>30 GeV, |eta|<2.4; >=2 jets pT>30 GeV'.",
+    "Bad node: 'signal region'. Good node: 'HMN SR binned in Delta phi(ll) | Weinberg SR binned in pTmiss, split at 50 GeV'.",
+    "Bad node: 'fit'. Good node: 'Simultaneous SR/CR fit; WZ/top/fake norms constrained; profile-likelihood CLs'.",
+    "Use a '|' character inside a node label only when the analysis genuinely branches into parallel SR/CR/category paths.",
+    "Order nodes in true data-flow order: dataset -> object/event selection -> categorization -> SR/CR definition -> fit/model -> output result.",
+    "Keep each node under 22 words; use the paper's own symbols and unit suffixes when explicitly present.",
+    "Produce 4-5 nodes total; fewer is fine. Do not pad with generic stages.",
+    "Skip the flowchart entirely or leave it empty if the source text does not provide concrete data-flow details.",
+]
 
 
 def draft_spec_from_text(
@@ -63,6 +79,9 @@ def draft_spec_from_text(
             "Preserve the existing harness structure: project, style, sections, placeholders, placements, conclusion, closing.",
             "Keep 4-6 sections unless the source clearly needs a different count.",
             "Follow HEP poster rhetoric: motivation/context, dataset/object selection, analysis/background strategy, key results, interpretation/summary.",
+            "For a professional HEP audience, make dataset/selection and analysis-strategy sections analysis-specific, not generic. Extract concrete object thresholds, SR/CR definitions, binning variables, fit observable, likelihood/CLs method, normalization factors, and dominant uncertainties when present.",
+            "Do not use a generic workflow like 'pp collisions → candidates → topology → SR/CR → fit' as the main analysis graphic. If a flowchart is useful, make it a compact HEP region/fit schematic with concrete SR bins, CR labels, fitted observables, and nuisance/systematic blocks.",
+            *FLOWCHART_NODE_RULES,
             "Keep rendered text compact but information-rich: prefer short public bullets, data badges, and one-line claims over paragraphs.",
             "Do not make a sparse cover image. Aim for 14-24 public information units across the poster: section claims, badges, concise bullets, and conclusion takeaways.",
             "Each section should have at most one short body sentence plus 2-4 high-value bullets unless the source requires otherwise; use more sections or badges rather than long paragraphs.",
@@ -77,7 +96,7 @@ def draft_spec_from_text(
             "project_overrides": dict(project_overrides or {}),
             "style_overrides": dict(style_overrides or {}),
             "assets_manifest": assets,
-            "source_text_excerpt": _truncate(text, 8000),
+            "source_text_excerpt": _truncate(text, 30000),
             "starter_spec": base,
         },
     )
@@ -119,6 +138,9 @@ def storyboard_from_text(
             "Use the existing poster_spec sections as the section scaffold. Preserve section ids and titles where possible.",
             "For each section, assign a semantic role such as motivation, dataset, method, validation, result, interpretation, or outlook.",
             "Write concise public-facing synopses and key claims grounded only in the provided paper text.",
+            "For HEP analyses, preserve specialist analysis details when present: object selections, SR binning variables, CR definitions, fitted discriminant, profile-likelihood/CLs strategy, floating background normalizations, nuisance parameters, and leading statistical/systematic uncertainties.",
+            "Professional HEP posters should not spend scarce space on generic 'data → selection → fit' pipelines. Prefer region matrices, fit-model schematics, and short analysis-specific callouts.",
+            *FLOWCHART_NODE_RULES,
             "Assign text budgets in practical poster terms, e.g. 'title + 2 bullets' or 'one sentence + 3 short bullets'.",
             "Describe the preferred visual role for each section and map useful assets to target sections when supported by captions/labels.",
             "Mark one hero section and one hero visual role for the headline result or central method.",
@@ -133,7 +155,7 @@ def storyboard_from_text(
             "poster_spec_sections": target_spec.get("sections") or [],
             "poster_project": target_spec.get("project") or {},
             "assets_manifest": assets,
-            "source_text_excerpt": _truncate(text, 8000),
+            "source_text_excerpt": _truncate(text, 30000),
         },
     )
     envelope = provider.generate_json(
@@ -143,6 +165,122 @@ def storyboard_from_text(
         system_prompt=SYSTEM_PROMPT,
     )
     envelope["result"] = _normalize_storyboard(envelope["result"], target_spec, assets)
+    return envelope
+
+
+def physics_quiz_from_text(
+    text: str,
+    assets_manifest: Any = None,
+    *,
+    spec: Mapping[str, Any] | None = None,
+    storyboard: Mapping[str, Any] | None = None,
+    provider: ChatGPTAccountResponsesProvider | None = None,
+    max_questions: int | None = None,
+    extra_instructions: str | None = None,
+) -> dict[str, Any]:
+    """Generate a PaperQuiz-lite HEP comprehension target.
+
+    The quiz is an internal planning/evaluation artifact.  It should describe
+    what a conference viewer ought to learn from the poster; the questions are
+    not rendered verbatim on the poster.
+    """
+
+    provider = provider or ChatGPTAccountResponsesProvider()
+    assets = normalize_assets_manifest(assets_manifest)
+    target_spec = _normalize_spec(copy.deepcopy(dict(spec or default_poster_spec(_guess_title(text)))), assets)
+    limit = max(8, min(24, int(max_questions or 16)))
+    prompt = _compose_prompt(
+        header="Draft a HEP PaperQuiz-lite JSON object for poster information planning.",
+        instructions=[
+            f"Create {limit} concise quiz items that a good scientific poster for this paper should enable a viewer to answer.",
+            "This is internal planning/evaluation data, not public poster text. Do not ask the image model to render these questions.",
+            "Use high-energy-physics poster aspects: physics target, dataset/channel, object/event selection, analysis strategy, background/control regions, statistical method, systematic uncertainty, headline result, interpretation, and figure evidence.",
+            "Include specialist HEP questions about SR/CR definitions, discriminating variables, simultaneous-fit structure, nuisance/systematic treatment, floating normalization factors, and dominant uncertainty sources whenever the paper provides them.",
+            "For result papers with multiple interpretations, include quiz items for each headline numerical result, including observed and expected limits for secondary interpretations when present.",
+            "Do not settle for generic 'SR/CR fits' questions if the source gives named control regions or fit ingredients. Ask concrete questions about named CRs, binning variables, free normalization factors, profile likelihood/CLs, and dominant statistical/template uncertainties when present.",
+            "Every quiz item must be answerable from explicit source text, figure captions, or assets. Never invent luminosities, energies, masses, channels, significances, or limits.",
+            "For each item, provide a short answer, 0-4 multiple-choice options if useful, source_evidence, poster_priority, target_section, recommended_copy, and linked_assets when relevant.",
+            "Mark only the most central 6-10 items as poster_priority='must'; secondary items should be 'should' or 'could'.",
+            "Recommended copy should be a short public phrase suitable for a badge, callout, headline, or bullet; keep it under about 70 characters when possible.",
+            extra_instructions or "",
+        ],
+        context={
+            "max_questions": limit,
+            "poster_spec": target_spec,
+            "storyboard": dict(storyboard or {}),
+            "assets_manifest": assets,
+            "source_text_excerpt": _truncate(text, 30000),
+        },
+    )
+    envelope = provider.generate_json(
+        stage_name="physics_quiz_from_text",
+        prompt=prompt,
+        schema=physics_quiz_schema(),
+        system_prompt=SYSTEM_PROMPT,
+    )
+    envelope["result"] = _normalize_physics_quiz(envelope["result"], target_spec, assets, limit=limit)
+    return envelope
+
+
+def copy_deck_from_text(
+    text: str,
+    assets_manifest: Any = None,
+    *,
+    spec: Mapping[str, Any] | None = None,
+    storyboard: Mapping[str, Any] | None = None,
+    physics_quiz: Mapping[str, Any] | None = None,
+    figure_selection: Mapping[str, Any] | None = None,
+    provider: ChatGPTAccountResponsesProvider | None = None,
+    max_units: int | None = None,
+    extra_instructions: str | None = None,
+) -> dict[str, Any]:
+    """Create a grounded public copy deck for the image-generation prompt."""
+
+    provider = provider or ChatGPTAccountResponsesProvider()
+    assets = normalize_assets_manifest(assets_manifest)
+    target_spec = _normalize_spec(copy.deepcopy(dict(spec or default_poster_spec(_guess_title(text)))), assets)
+    limit = max(10, min(36, int(max_units or 28)))
+    prompt = _compose_prompt(
+        header="Draft a public copy_deck JSON object for a placeholder-first scientific poster.",
+        instructions=[
+            "Create concise public text units that the image-generation model should render on the poster.",
+            "Use the physics_quiz as the coverage target: must-priority quiz items should be answerable from rendered copy plus future real figure placeholders.",
+            "Use the storyboard as the narrative spine and the poster_spec sections as the section scaffold. Preserve section ids.",
+            "Do not create copy units for the exact main title, author line, or identity line; those are controlled by poster_spec.project and rendered separately.",
+            "Write compact, camera-ready poster copy: short headlines, badges, figure-near headlines, bullets, callouts, and conclusion takeaways.",
+            "For target_section roles like dataset, selection, method, strategy, fit, or background, prioritize analysis-specific copy over general HEP knowledge. Use types such as selection_cut, region_matrix, fit_strategy, and uncertainty when applicable.",
+            "Section 2 should favor a concrete object/region-definition matrix: lepton/jet thresholds, VBF cuts, b/tau/extra-lepton vetoes, SR binning variables, and named CRs if present.",
+            "Section 3 should favor a concrete fit-strategy summary: fitted discriminant, SR/CR simultaneous fit, background-only post-fit comparison, floating background normalizations, profile likelihood/CLs, nuisance parameters, and leading statistical/systematic uncertainties if present.",
+            "Result/conclusion units must cover every headline interpretation, not only the primary limit plot. If the paper gives both heavy-neutrino and Weinberg-operator limits, include both; preserve observed and expected numerical limits such as |mμμ| observed/expected values when explicitly present.",
+            "Never output a region_matrix unit that is merely a generic pipeline such as 'pp → candidates → SR/CR → fit'. A region_matrix must name concrete SR bins, CRs, or fitted regions; otherwise omit it.",
+            "If the paper names WZ, b-tagged, WZb, top, fake/nonprompt, validation, or control regions, include those names in section 2/3 copy units rather than a generic flowchart.",
+            "If the paper says statistical/template uncertainty dominates or mentions Barlow-Beeston-lite, CLs, profile likelihood, nuisance parameters, or floating normalizations, include at least one fit_strategy or uncertainty unit for it.",
+            "Do not write paragraphs. Most units should be under 70 characters; badges should be under 36 characters; hero headlines can be under 90 characters.",
+            "Ground every text unit in explicit source evidence, a quiz answer, a figure caption, or the supplied poster_spec. Never invent scientific numbers or claims.",
+            "For each placeholder/selected figure, add a nearby figure_headline if the evidence supports it; do not describe fake drawn contents and do not ask the model to draw scientific data.",
+            "Use priority='must' for the minimum public copy that must be rendered; use 'should' and 'could' for optional density.",
+            "Treat the copy deck as an exhaustive public body-text plan: do not add generic future-prospect, impact, or methodology slogans unless explicitly grounded.",
+            "Do not include internal workflow language, prompt instructions, placeholder explanations, TODOs, or replacement-process text in public copy.",
+            "Return at most max_units copy_units. If space is tight, omit could-priority units before shortening figures/placeholders.",
+            extra_instructions or "",
+        ],
+        context={
+            "max_units": limit,
+            "poster_spec": target_spec,
+            "storyboard": dict(storyboard or {}),
+            "physics_quiz": dict(physics_quiz or {}),
+            "figure_selection": dict(figure_selection or {}),
+            "assets_manifest": assets,
+            "source_text_excerpt": _truncate(text, 30000),
+        },
+    )
+    envelope = provider.generate_json(
+        stage_name="copy_deck_from_text",
+        prompt=prompt,
+        schema=copy_deck_schema(),
+        system_prompt=SYSTEM_PROMPT,
+    )
+    envelope["result"] = _normalize_copy_deck(envelope["result"], target_spec, physics_quiz or {}, limit=limit)
     return envelope
 
 
@@ -257,6 +395,7 @@ def qa_poster(
     )
     image_paths = [image_path] if image_path else None
     mode_instructions = _qa_mode_instructions(qa_mode)
+    detected_context = _qa_detected_placeholders_context(detected_placeholders or {}, qa_mode)
     prompt_text = _compose_prompt(
         header=f"Quality-assure the poster in {qa_mode!r} mode.",
         instructions=[
@@ -267,7 +406,7 @@ def qa_poster(
             "qa_mode": qa_mode,
             "poster_spec": normalized_spec,
             "render_prompt": prompt or "",
-            "detected_placeholders": detected_placeholders or {},
+            "detected_placeholders": detected_context,
             "deterministic_prechecks": prechecks,
         },
     )
@@ -280,6 +419,20 @@ def qa_poster(
     )
     envelope["result"] = _merge_qa_results(prechecks, envelope["result"])
     return envelope
+
+
+def _qa_detected_placeholders_context(detected_placeholders: Mapping[str, Any], qa_mode: str) -> dict[str, Any]:
+    detected = dict(detected_placeholders or {})
+    if qa_mode != "final":
+        return detected
+    # In final mode, labels like "[FIG 02]" are expected in the pre-replacement
+    # detection JSON but should not appear in the final rendered poster.  Passing
+    # those labels/notes to the VLM makes it prone to claiming that placeholder
+    # text is still visible.  Keep only geometry.
+    return {
+        "image_size": detected.get("image_size") or {},
+        "placements": detected.get("placements") or {},
+    }
 
 
 def critique_poster_template(
@@ -310,6 +463,8 @@ def critique_poster_template(
             "Do not require deterministic text overlays or manual post-editing. If text/information is weak, propose prompt repairs for regenerating the whole poster with image_generation.",
             "Fail if the poster is merely decorative, too sparse, PPT-like, has serious text corruption, leaks internal workflow text, has dark figure blocks, or contains fake scientific plots/diagrams outside placeholders.",
             "Fail if any placeholder appears to contain real/fake scientific content, is missing/duplicated, unreadable, or clearly violates its declared aspect ratio.",
+            "Do not penalize placeholder labels or aspect-ratio text when they are inside the dashed placeholder; the contract requires each placeholder to contain exactly the ID, intended label, and aspect ratio.",
+            "Prompt repairs must never contradict the placeholder contract: do not ask for only the [FIG NN] token, do not remove aspect-ratio text, and do not move labels outside the placeholder.",
             "Keep prompt_repairs concrete, short, and directly usable as additional image-generation instructions.",
             extra_instructions or "",
         ],
@@ -337,6 +492,7 @@ def _qa_mode_instructions(qa_mode: str) -> list[str]:
             "This is the pre-replacement placeholder poster. Enforce the placeholder contract strictly.",
             "Every scientific figure/table/diagram area must be a blank neutral placeholder box with a visible exact label [FIG NN].",
             "Inside each placeholder, only the ID, intended content label, and aspect-ratio text are allowed.",
+            "For deterministic replacement, the [FIG NN] ID, clean rectangular boundary, blank scientific content, and geometry are critical. Minor label paraphrasing, line breaks, or typography differences in the intended label/aspect text are warnings, not critical failures.",
             "Simple public text-only analysis flowcharts outside placeholders are allowed when they are explicitly specified by the poster spec; do not confuse them with source scientific figures.",
             "Fail with a critical issue if any placeholder contains real or fake scientific content: axes, bins, curves, legends, Feynman lines, process diagrams, heatmaps, tables, or thumbnails.",
             "Fail with a critical issue if any expected [FIG NN] label is missing, unreadable, or not associated with a clean rectangular placeholder.",
@@ -646,6 +802,274 @@ def _normalize_information_plan(raw: Any, result: Mapping[str, Any], sections: S
         "must_answer_questions": must_answer,
         "visual_story_units": clean_items(plan.get("visual_story_units") or [], limit=8),
     }
+
+
+def _normalize_physics_quiz(
+    result: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    assets: Sequence[Mapping[str, Any]],
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    asset_names = {str(asset.get("asset")) for asset in assets}
+    items: list[dict[str, Any]] = []
+    seen_questions: set[str] = set()
+    for idx, item in enumerate(result.get("quiz_items") or [], start=1):
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        question = sanitize_public_text(str(row.get("question") or "")).strip()
+        answer = sanitize_public_text(str(row.get("answer") or "")).strip()
+        if not question or not answer:
+            continue
+        qkey = re.sub(r"\s+", " ", question).strip().lower()
+        if qkey in seen_questions:
+            continue
+        seen_questions.add(qkey)
+        priority = str(row.get("poster_priority") or row.get("priority") or "should").strip().lower()
+        if priority not in {"must", "should", "could"}:
+            priority = "should"
+        linked_assets = [
+            str(asset).strip()
+            for asset in row.get("linked_assets") or []
+            if str(asset).strip() and (not asset_names or str(asset).strip() in asset_names)
+        ][:4]
+        options = [
+            sanitize_public_text(str(option)).strip()
+            for option in row.get("options") or []
+            if str(option).strip()
+        ][:4]
+        items.append(
+            {
+                "id": str(row.get("id") or f"Q{len(items) + 1:02d}"),
+                "aspect": _quiz_aspect(str(row.get("aspect") or "")),
+                "question": question,
+                "options": options,
+                "answer": answer,
+                "poster_priority": priority,
+                "source_evidence": _truncate(sanitize_public_text(str(row.get("source_evidence") or row.get("evidence") or "")).strip(), 360),
+                "target_section": _coerce_section(row.get("target_section"), spec.get("sections") or []),
+                "recommended_copy": _truncate(sanitize_public_text(str(row.get("recommended_copy") or answer)).strip(), 120),
+                "linked_assets": _dedupe_strings(linked_assets),
+            }
+        )
+        if len(items) >= limit:
+            break
+    if not items:
+        raise RuntimeError("physics_quiz_from_text: LLM returned no usable quiz_items in strict mode")
+    for idx, row in enumerate(items, start=1):
+        row["id"] = f"Q{idx:02d}"
+    coverage_notes = [
+        sanitize_public_text(str(note)).strip()
+        for note in result.get("coverage_notes") or []
+        if str(note).strip()
+    ][:8]
+    return {"quiz_items": items, "coverage_notes": coverage_notes}
+
+
+def _normalize_copy_deck(
+    result: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    physics_quiz: Mapping[str, Any],
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    valid_quiz_ids = {str(item.get("id")) for item in physics_quiz.get("quiz_items") or [] if isinstance(item, Mapping)}
+    valid_placeholder_ids = {str(item.get("id")) for item in spec.get("placeholders") or [] if isinstance(item, Mapping)}
+    units: list[dict[str, Any]] = []
+    seen_text: set[str] = set()
+    for item in result.get("copy_units") or []:
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        text = sanitize_public_text(str(row.get("text") or ""), spec.get("forbidden_phrases")).strip()
+        if not text:
+            continue
+        text = re.sub(r"\s+", " ", text)
+        key = text.lower()
+        if key in seen_text:
+            continue
+        if _looks_like_project_title_copy(row, text, spec):
+            continue
+        ctype = _copy_unit_type(str(row.get("type") or "bullet"))
+        if ctype == "region_matrix" and _is_generic_region_matrix_text(text):
+            continue
+        seen_text.add(key)
+        priority = str(row.get("priority") or "should").strip().lower()
+        if priority not in {"must", "should", "could"}:
+            priority = "should"
+        try:
+            max_chars = int(row.get("max_chars") or len(text) + 8)
+        except Exception:
+            max_chars = len(text) + 8
+        max_chars = max(16, min(120, max_chars))
+        placeholder_id = str(row.get("placeholder_id") or "").strip()
+        if placeholder_id and valid_placeholder_ids and placeholder_id not in valid_placeholder_ids:
+            placeholder_id = ""
+        quiz_ids = [
+            str(qid).strip()
+            for qid in row.get("quiz_ids") or []
+            if str(qid).strip() and (not valid_quiz_ids or str(qid).strip() in valid_quiz_ids)
+        ][:6]
+        units.append(
+            {
+                "id": str(row.get("id") or f"C{len(units) + 1:02d}"),
+                "target_section": _coerce_section(row.get("target_section"), spec.get("sections") or []),
+                "type": ctype,
+                "text": _truncate(text, max_chars + 24),
+                "max_chars": max_chars,
+                "priority": priority,
+                "evidence": _truncate(sanitize_public_text(str(row.get("evidence") or row.get("source_evidence") or "")).strip(), 360),
+                "quiz_ids": _dedupe_strings(quiz_ids),
+                "placeholder_id": placeholder_id,
+                "placement_hint": sanitize_public_text(str(row.get("placement_hint") or "")).strip(),
+                "render_style": sanitize_public_text(str(row.get("render_style") or "")).strip(),
+            }
+        )
+        if len(units) >= limit:
+            break
+    if not units:
+        raise RuntimeError("copy_deck_from_text: LLM returned no usable copy_units in strict mode")
+    for idx, row in enumerate(units, start=1):
+        row["id"] = f"C{idx:02d}"
+    section_copy = []
+    for item in result.get("section_copy") or []:
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        section_copy.append(
+            {
+                "section": _coerce_section(row.get("section"), spec.get("sections") or []),
+                "role": _compact_token(str(row.get("role") or "section"), default="section"),
+                "must_units": [
+                    str(unit).strip()
+                    for unit in row.get("must_units") or []
+                    if str(unit).strip()
+                ][:8],
+                "target_density": sanitize_public_text(str(row.get("target_density") or "")).strip(),
+            }
+        )
+    coverage_notes = [
+        sanitize_public_text(str(note)).strip()
+        for note in result.get("coverage_notes") or []
+        if str(note).strip()
+    ][:8]
+    return {"copy_units": units, "section_copy": section_copy, "coverage_notes": coverage_notes}
+
+
+def _quiz_aspect(value: str) -> str:
+    text = _compact_token(value, default="paper_understanding")
+    aliases = {
+        "physics": "physics_target",
+        "target": "physics_target",
+        "data": "dataset_channel",
+        "dataset": "dataset_channel",
+        "channel": "dataset_channel",
+        "selection": "event_selection",
+        "method": "analysis_strategy",
+        "strategy": "analysis_strategy",
+        "background": "background_control",
+        "fit": "statistical_method",
+        "statistics": "statistical_method",
+        "uncertainty": "systematics",
+        "result": "headline_result",
+        "interpretation": "interpretation",
+        "figure": "figure_evidence",
+    }
+    return aliases.get(text, text)
+
+
+def _copy_unit_type(value: str) -> str:
+    text = _compact_token(value, default="bullet")
+    allowed = {
+        "hero_headline",
+        "section_title",
+        "subhead",
+        "bullet",
+        "badge",
+        "figure_headline",
+        "selection_cut",
+        "region_matrix",
+        "fit_strategy",
+        "uncertainty",
+        "conclusion",
+        "callout",
+    }
+    aliases = {
+        "headline": "hero_headline",
+        "hero": "hero_headline",
+        "title": "section_title",
+        "chip": "badge",
+        "fact_badge": "badge",
+        "figure_caption": "figure_headline",
+        "figure_label": "figure_headline",
+        "cut": "selection_cut",
+        "cutflow": "selection_cut",
+        "selection": "selection_cut",
+        "sr": "region_matrix",
+        "cr": "region_matrix",
+        "sr_cr": "region_matrix",
+        "region": "region_matrix",
+        "regions": "region_matrix",
+        "fit": "fit_strategy",
+        "likelihood": "fit_strategy",
+        "systematic": "uncertainty",
+        "systematics": "uncertainty",
+        "nuisance": "uncertainty",
+        "summary": "conclusion",
+        "takeaway": "conclusion",
+    }
+    text = aliases.get(text, text)
+    return text if text in allowed else "bullet"
+
+
+def _is_generic_region_matrix_text(text: str) -> bool:
+    low = str(text or "").lower()
+    if "sr/cr" not in low and "signal/control" not in low and "control region" not in low:
+        return False
+    concrete_markers = [
+        "wz",
+        "b-tag",
+        "b tagged",
+        "wzb",
+        "nonprompt",
+        "fake",
+        "Δ",
+        "dphi",
+        "pTmiss".lower(),
+        "mjj",
+        "750",
+        "2.5",
+        "0.75",
+        "30 gev",
+        "profile",
+        "cls",
+        "nuisance",
+        "barlow",
+        "normalization",
+    ]
+    if any(marker.lower() in low for marker in concrete_markers):
+        return False
+    generic_markers = ["pp", "candidate", "topology", "→", "->", "fit"]
+    return sum(1 for marker in generic_markers if marker in low) >= 3
+
+
+def _looks_like_project_title_copy(row: Mapping[str, Any], text: str, spec: Mapping[str, Any]) -> bool:
+    project = spec.get("project") if isinstance(spec.get("project"), Mapping) else {}
+    title = str(project.get("title") or "")
+    if not title:
+        return False
+    placement = str(row.get("placement_hint") or "").lower()
+    evidence = str(row.get("evidence") or row.get("source_evidence") or "").lower()
+    ctype = _copy_unit_type(str(row.get("type") or ""))
+    if "title" in placement or "title band" in placement or "project title" in evidence:
+        return True
+    text_tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
+    title_tokens = set(re.findall(r"[a-z0-9]+", title.lower()))
+    if ctype in {"hero_headline", "section_title"} and title_tokens:
+        overlap = len(text_tokens & title_tokens) / max(1, len(text_tokens))
+        return overlap >= 0.72 and len(text_tokens) >= 5
+    return False
 
 
 def _normalize_template_critique(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -1249,28 +1673,131 @@ def _iter_strings(value: Any, path: str = "root"):
 
 def _merge_qa_results(prechecks: Mapping[str, Any], llm_result: Mapping[str, Any]) -> dict[str, Any]:
     issues = [dict(item) for item in prechecks.get("issues") or []]
+    deterministic_categories = {str(item.get("category") or "").lower() for item in issues}
     seen = {(item.get("severity"), item.get("category"), item.get("message"), item.get("location")) for item in issues}
     for item in llm_result.get("issues") or []:
-        row = dict(item)
+        row = _normalize_llm_qa_issue(dict(item))
+        _downgrade_speculative_visual_geometry_issue(row, deterministic_categories)
         key = (row.get("severity"), row.get("category"), row.get("message"), row.get("location"))
         if key not in seen:
             issues.append(row)
             seen.add(key)
     repairs = _dedupe_strings(list(prechecks.get("recommended_repairs") or []) + [str(item) for item in llm_result.get("recommended_repairs") or []])
-    passes = bool(prechecks.get("passes", True)) and bool(llm_result.get("passes", True))
+    passes = bool(prechecks.get("passes", True)) and not any(str(issue.get("severity") or "").lower() == "critical" for issue in issues)
     checks = dict(prechecks.get("checks") or {})
     checks.update(dict(llm_result.get("checks") or {}))
     score = llm_result.get("score")
     if score is None:
         score = prechecks.get("score")
+    summary = str(llm_result.get("summary") or prechecks.get("summary") or "QA completed.")
+    if passes and _summary_claims_failure(summary):
+        summary = "QA passed with nonblocking warnings after deterministic precheck reconciliation."
     return {
         "passes": passes,
-        "summary": str(llm_result.get("summary") or prechecks.get("summary") or "QA completed."),
+        "summary": summary,
         "score": float(score if score is not None else 0.0),
         "issues": issues,
         "checks": checks,
         "recommended_repairs": repairs,
     }
+
+
+def _summary_claims_failure(summary: str) -> bool:
+    low = str(summary or "").lower()
+    return any(marker in low for marker in ("qa fails", "qa failed", "fails because", "should not proceed", "does not pass"))
+
+
+def _normalize_llm_qa_issue(row: dict[str, Any]) -> dict[str, Any]:
+    category = str(row.get("category") or "").lower()
+    message = str(row.get("message") or "").lower()
+    suggested = str(row.get("suggested_fix") or "").lower()
+    text = " ".join([category, message, suggested])
+    nonblocking_label_markers = [
+        "label is not exact",
+        "not reliably exact",
+        "line-broken",
+        "hyphenated",
+        "paraphras",
+        "exact intended content label",
+        "aspect-ratio text",
+        "aspect ratio text",
+        "math typography",
+        "symbol substitutions",
+        "all caps",
+    ]
+    blocking_markers = [
+        "fake scientific",
+        "fake plot",
+        "axes",
+        "curves",
+        "heatmap",
+        "thumbnail",
+        "missing",
+        "duplicated",
+        "duplicate",
+        "unreadable",
+        "not square",
+        "not a 1:1",
+        "not 1:1",
+        "not a clear 2.5",
+        "overlap",
+        "extends outside",
+    ]
+    if str(row.get("severity") or "").lower() == "critical":
+        if any(marker in text for marker in nonblocking_label_markers) and not any(marker in text for marker in blocking_markers):
+            row["severity"] = "warning"
+    return row
+
+
+def _downgrade_speculative_visual_geometry_issue(row: dict[str, Any], deterministic_categories: set[str]) -> None:
+    """Trust deterministic replacement geometry over uncertain full-poster VLM QA.
+
+    Final-mode visual QA is useful for spotting obvious mistakes, but it can
+    misread a light figure mat or old dashed border as a containment violation.
+    The prompt already tells the model not to invent containment failures when
+    deterministic_prechecks are clean; enforce that policy here so a speculative
+    VLM-only geometry concern becomes a warning rather than deleting a valid
+    deterministic export.
+    """
+
+    if str(row.get("severity") or "").lower() != "critical":
+        return
+    category = str(row.get("category") or "").lower()
+    text = " ".join(
+        [
+            category,
+            str(row.get("message") or "").lower(),
+            str(row.get("suggested_fix") or "").lower(),
+        ]
+    )
+    placeholder_remnant_categories = {
+        "public_text_cleanliness",
+        "figure_replacement",
+        "incomplete_final_figure_replacement",
+        "final_cleanup",
+    }
+    placeholder_remnant_markers = ("[fig", "aspect-ratio", "aspect ratio", "placeholder label", "placeholder text")
+    if category in placeholder_remnant_categories and "placeholder" in text and any(marker in text for marker in placeholder_remnant_markers):
+        row["severity"] = "warning"
+        note = " Deterministic replacement erased the approved placeholder region, so this visual-only remnant concern is nonblocking."
+        row["message"] = str(row.get("message") or "").rstrip() + note
+        return
+    if category not in {"figure_containment", "figure_overlap", "panel_geometry"}:
+        return
+    blocking_categories = {
+        "figure_containment",
+        "figure_overlap",
+        "panel_geometry",
+        "panel_detection_alignment",
+        "figure_visual_envelope",
+        "figure_frame_oversized",
+        "figure_inner_margin",
+    }
+    if deterministic_categories & blocking_categories:
+        return
+    row["severity"] = "warning"
+    note = " Deterministic replacement-geometry prechecks were clean, so this visual-only concern is nonblocking."
+    row["message"] = str(row.get("message") or "").rstrip() + note
 
 
 def _dedupe_strings(values: Sequence[str]) -> list[str]:

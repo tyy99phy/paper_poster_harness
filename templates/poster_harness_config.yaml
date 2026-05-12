@@ -69,7 +69,7 @@ autoposter:
   template_critic:
     enabled: true
     require_pass: true
-    max_regen_rounds: 1
+    max_regen_rounds: 2
     min_overall_score: 0.72
     min_artistry_score: 0.65
     min_information_density_score: 0.65
@@ -79,6 +79,18 @@ autoposter:
   max_pages: 12
   storyboard:
     enabled: true
+    extra_instructions: ''
+  physics_quiz:
+    enabled: true
+    max_questions: 20
+    extra_instructions: ''
+  copy_deck:
+    enabled: true
+    max_units: 34
+    extra_instructions: ''
+  flowchart_rewrite:
+    enabled: true
+    text_char_limit: 24000
     extra_instructions: ''
   figure_layout_policy: Use the selected source asset aspect ratio as the placeholder
     aspect ratio. Do not warp square plots into wide slots or moderate wide plots

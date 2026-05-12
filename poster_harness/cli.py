@@ -24,16 +24,20 @@ from .config import (
     write_default_harness_config,
 )
 from .extract import extract_pdf_images, extract_text, extract_pptx_media, render_pdf_pages
+from .flowchart_rewrite import apply_flowchart_rewrites, rewrite_flowcharts_from_paper
 from .latex_utils import clean_latex_inline, extract_latex_braced
 from .layout_contract import build_layout_contract
+from .micro_repair import apply_micro_repairs
 from .prompt import build_prompt, sanitize_public_text
 from .replace import audit_generated_placeholder_geometry, audit_figure_containment, normalize_placeholder_geometry, replace_placeholders, upscale_image
 from .image_backend import generate_images_from_config
 from .llm import ChatGPTAccountResponsesProvider
 from .llm_stages import (
+    copy_deck_from_text,
     critique_poster_template,
     detect_placeholders_from_image,
     draft_spec_from_text,
+    physics_quiz_from_text,
     qa_poster,
     select_figures,
     storyboard_from_text,
@@ -187,6 +191,20 @@ def cmd_replace(args: argparse.Namespace) -> None:
     print(out)
 
 
+def cmd_micro_repair(args: argparse.Namespace) -> None:
+    plan = load_config(args.plan)
+    repairs = plan.get("repairs") if isinstance(plan, Mapping) else None
+    if not isinstance(repairs, list):
+        raise SystemExit("--plan must contain a top-level repairs: list")
+    out = apply_micro_repairs(
+        image_path=args.input,
+        out_path=args.out,
+        repairs=repairs,
+        scale=args.scale,
+    )
+    print(out)
+
+
 def cmd_upscale(args: argparse.Namespace) -> None:
     out = upscale_image(args.input, args.out, factor=args.factor, sharpen=not args.no_sharpen)
     print(out)
@@ -298,6 +316,23 @@ def cmd_llm_template_critic(args: argparse.Namespace) -> None:
         extra_instructions=args.extra or "",
     )
     _dump_llm_result(envelope, args.out)
+    print(args.out)
+
+
+def cmd_llm_rewrite_flowcharts(args: argparse.Namespace) -> None:
+    spec = _load_spec_arg(args.spec)
+    text = Path(args.text).read_text(encoding="utf-8")
+    envelope = rewrite_flowcharts_from_paper(
+        spec,
+        text,
+        provider=_llm_provider(args),
+        text_char_limit=args.text_char_limit,
+        extra_instructions=args.extra or "",
+    )
+    if args.raw_out:
+        dump_config(envelope, args.raw_out)
+    new_spec = apply_flowchart_rewrites(spec, envelope, require_evidence=not args.allow_unevidenced)
+    dump_config(new_spec, args.out)
     print(args.out)
 
 
@@ -440,6 +475,36 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         dump_config(storyboard, storyboard_path)
         draft_spec["storyboard"] = storyboard
 
+    physics_quiz: dict[str, Any] | None = None
+    physics_quiz_path: Path | None = None
+    quiz_cfg = cfg_get(config, "autoposter.physics_quiz", {})
+    quiz_enabled = True
+    quiz_extra = ""
+    quiz_max = int(cfg_get(config, "autoposter.physics_quiz.max_questions", 16) or 16)
+    if isinstance(quiz_cfg, Mapping):
+        quiz_enabled = bool(quiz_cfg.get("enabled", True))
+        quiz_extra = str(quiz_cfg.get("extra_instructions") or "")
+        quiz_max = int(quiz_cfg.get("max_questions") or quiz_max)
+    elif quiz_cfg is not None:
+        quiz_enabled = bool(quiz_cfg)
+    if quiz_enabled:
+        quiz_envelope = _call_llm_stage_with_retries(
+            "physics_quiz_from_text",
+            config,
+            physics_quiz_from_text,
+            text,
+            assets_manifest=assets_manifest,
+            spec=draft_spec,
+            storyboard=storyboard,
+            provider=provider,
+            max_questions=quiz_max,
+            extra_instructions=quiz_extra,
+        )
+        physics_quiz = dict(quiz_envelope["result"])
+        physics_quiz_path = dirs["specs"] / "physics_quiz.yaml"
+        dump_config(physics_quiz, physics_quiz_path)
+        draft_spec["physics_quiz"] = physics_quiz
+
     selection_envelope = _call_llm_stage_with_retries(
         "select_figures",
         config,
@@ -463,7 +528,65 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
     )
     if storyboard:
         final_spec["storyboard"] = storyboard
+    if physics_quiz:
+        final_spec["physics_quiz"] = physics_quiz
     final_spec = _apply_spec_extras(final_spec, spec_extras)
+    copy_deck: dict[str, Any] | None = None
+    copy_deck_path: Path | None = None
+    copy_cfg = cfg_get(config, "autoposter.copy_deck", {})
+    copy_enabled = True
+    copy_extra = ""
+    copy_max = int(cfg_get(config, "autoposter.copy_deck.max_units", 28) or 28)
+    if isinstance(copy_cfg, Mapping):
+        copy_enabled = bool(copy_cfg.get("enabled", True))
+        copy_extra = str(copy_cfg.get("extra_instructions") or "")
+        copy_max = int(copy_cfg.get("max_units") or copy_max)
+    elif copy_cfg is not None:
+        copy_enabled = bool(copy_cfg)
+    if copy_enabled:
+        copy_envelope = _call_llm_stage_with_retries(
+            "copy_deck_from_text",
+            config,
+            copy_deck_from_text,
+            text,
+            assets_manifest=assets_manifest,
+            spec=final_spec,
+            storyboard=storyboard,
+            physics_quiz=physics_quiz,
+            figure_selection=figure_selection,
+            provider=provider,
+            max_units=copy_max,
+            extra_instructions=copy_extra,
+        )
+        copy_deck = dict(copy_envelope["result"])
+        copy_deck_path = dirs["specs"] / "copy_deck.yaml"
+        dump_config(copy_deck, copy_deck_path)
+        final_spec["copy_deck"] = copy_deck
+    flowchart_rewrite_path: Path | None = None
+    flowchart_cfg = cfg_get(config, "autoposter.flowchart_rewrite", {})
+    flowchart_enabled = True
+    flowchart_extra = ""
+    flowchart_limit = int(cfg_get(config, "autoposter.flowchart_rewrite.text_char_limit", 24000) or 24000)
+    if isinstance(flowchart_cfg, Mapping):
+        flowchart_enabled = bool(flowchart_cfg.get("enabled", True))
+        flowchart_extra = str(flowchart_cfg.get("extra_instructions") or "")
+        flowchart_limit = int(flowchart_cfg.get("text_char_limit") or flowchart_limit)
+    elif flowchart_cfg is not None:
+        flowchart_enabled = bool(flowchart_cfg)
+    if flowchart_enabled:
+        flowchart_envelope = _call_llm_stage_with_retries(
+            "flowchart_rewrite",
+            config,
+            rewrite_flowcharts_from_paper,
+            final_spec,
+            text,
+            provider=provider,
+            text_char_limit=flowchart_limit,
+            extra_instructions=flowchart_extra,
+        )
+        flowchart_rewrite_path = dirs["specs"] / "flowchart_rewrite.yaml"
+        dump_config(flowchart_envelope, flowchart_rewrite_path)
+        final_spec = apply_flowchart_rewrites(final_spec, flowchart_envelope)
     layout_contract_path: Path | None = None
     if bool(cfg_get(config, "autoposter.layout_contract.enabled", True)):
         contract_w, contract_h = _image_size_from_config(args.size or cfg_get(config, "image_generation.size", "1024x1536"))
@@ -498,7 +621,10 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         "assets_manifest": str(assets_manifest_path),
         "draft_spec": str(draft_spec_path),
         "storyboard": str(storyboard_path) if storyboard_path else "",
+        "physics_quiz": str(physics_quiz_path) if physics_quiz_path else "",
         "figure_selection": str(figure_selection_path),
+        "copy_deck": str(copy_deck_path) if copy_deck_path else "",
+        "flowchart_rewrite": str(flowchart_rewrite_path) if flowchart_rewrite_path else "",
         "layout_contract": str(layout_contract_path) if layout_contract_path else "",
         "poster_spec": str(spec_path),
         "prompt": str(prompt_path),
@@ -780,7 +906,7 @@ def _process_generated_template_candidate(
 
 def _call_llm_stage_with_retries(
     stage_name: str,
-    config: Mapping[str, Any],
+    harness_config: Mapping[str, Any],
     func,
     *args,
     **kwargs,
@@ -790,7 +916,7 @@ def _call_llm_stage_with_retries(
     This is not a fallback or a weaker path: the exact same LLM stage is called
     again when the local ChatGPT/Codex transport drops a connection.
     """
-    retries = max(0, int(cfg_get(dict(config), "autoposter.llm_stage_retries", 2) or 0))
+    retries = max(0, int(cfg_get(dict(harness_config), "autoposter.llm_stage_retries", 2) or 0))
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
@@ -819,6 +945,8 @@ def _looks_transient_llm_error(exc: Exception) -> bool:
             "network error",
             "urlopen error",
             "remote end closed",
+            "incompleteread",
+            "incomplete read",
             "502",
             "503",
             "504",
@@ -875,7 +1003,10 @@ def _generate_templates_with_critic(
             prompt_path = dirs["prompts"] / f"poster_prompt.regen{round_index}.txt"
             prompt_path.write_text(current_prompt, encoding="utf-8")
             run_manifest.setdefault("regen_prompts", []).append(str(prompt_path))
-        generated = generate_images_from_config(
+        generated = _call_llm_stage_with_retries(
+            "image_generation",
+            config,
+            generate_images_from_config,
             prompt=current_prompt,
             out_dir=dirs["generated"],
             basename=round_basename,
@@ -957,12 +1088,16 @@ def _template_critic_accepts(critique: Mapping[str, Any], config: Mapping[str, A
 
 
 def _template_critic_repairs(critique: Mapping[str, Any]) -> list[str]:
-    repairs = [str(item).strip() for item in critique.get("prompt_repairs") or [] if str(item).strip()]
+    repairs = [
+        str(item).strip()
+        for item in critique.get("prompt_repairs") or []
+        if str(item).strip() and not _repair_contradicts_placeholder_contract(str(item))
+    ]
     for issue in critique.get("issues") or []:
         if not isinstance(issue, Mapping):
             continue
         repair = str(issue.get("suggested_prompt_repair") or "").strip()
-        if repair and repair not in repairs:
+        if repair and repair not in repairs and not _repair_contradicts_placeholder_contract(repair):
             repairs.append(repair)
     if not repairs:
         repairs = [
@@ -971,11 +1106,30 @@ def _template_critic_repairs(critique: Mapping[str, Any]) -> list[str]:
     return repairs[:10]
 
 
+def _repair_contradicts_placeholder_contract(text: str) -> bool:
+    low = str(text or "").lower()
+    contradiction_markers = [
+        "only the centered [fig",
+        "only the [fig",
+        "only [fig",
+        "show only the placeholder id",
+        "inside each figure area show only",
+        "do not render aspect",
+        "do not print aspect",
+        "remove aspect",
+        "without aspect",
+        "move all labels",
+        "move labels outside",
+        "public caption/headline outside them",
+    ]
+    return any(marker in low for marker in contradiction_markers)
+
+
 def _prompt_with_template_critic_repairs(base_prompt: str, *, repairs: list[str], round_index: int) -> str:
     unique_repairs: list[str] = []
     for repair in repairs:
         clean = sanitize_public_text(str(repair)).strip()
-        if clean and clean not in unique_repairs:
+        if clean and clean not in unique_repairs and not _repair_contradicts_placeholder_contract(clean):
             unique_repairs.append(clean)
         if len(unique_repairs) >= 10:
             break
@@ -1471,6 +1625,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_replace)
 
+    p = sub.add_parser("micro-repair", help="apply local deterministic typo/text repairs to a rendered poster")
+    p.add_argument("--input", required=True)
+    p.add_argument("--plan", required=True, help="YAML/JSON file with repairs: [...]")
+    p.add_argument("--out", required=True)
+    p.add_argument("--scale", type=float, default=1.0)
+    p.set_defaults(func=cmd_micro_repair)
+
     p = sub.add_parser("upscale", help="deterministic high-resolution review export")
     p.add_argument("--input", required=True)
     p.add_argument("--out", required=True)
@@ -1556,6 +1717,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--config")
     p.set_defaults(func=cmd_llm_template_critic)
+
+    p = sub.add_parser("llm-rewrite-flowcharts", help="rewrite spec flowchart nodes into concrete paper-grounded analysis schematics")
+    p.add_argument("--spec", required=True)
+    p.add_argument("--text", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--raw-out", help="optional path for the raw LLM rewrite envelope")
+    p.add_argument("--text-char-limit", type=int, default=24000)
+    p.add_argument("--extra", help="extra flowchart rewrite instructions")
+    p.add_argument("--allow-unevidenced", action="store_true")
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--config")
+    p.set_defaults(func=cmd_llm_rewrite_flowcharts)
 
     p = sub.add_parser("autoposter", help="one-command paper/assets → spec → prompt → optional generation/replacement pipeline")
     p.add_argument("--config", help="YAML/JSON harness config; defaults to POSTER_HARNESS_CONFIG or built-in strict config")

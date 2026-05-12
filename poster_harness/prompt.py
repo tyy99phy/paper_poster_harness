@@ -33,6 +33,8 @@ FIGURE_COMPOSITION_RULES = [
     "Every placeholder rectangle must match its selected source image aspect ratio; enlarge or reshape the surrounding block instead of stretching the placeholder.",
     "Method, detector, topology, or control-region placeholders should support the story, not dominate it unless the paper is instrumentation-focused.",
     "Dense multi-panel HEP plots need large absolute area; preserve their native wide/tall ratio rather than forcing a square slot.",
+    "For wide post-fit/distribution plots, reserve enough vertical height for axes and legends; reduce nearby flowchart/text space before making the plot hard to read.",
+    "For professional HEP readers, dataset and strategy cards should show analysis-specific SR/CR, fit, and uncertainty details rather than a generic data-processing pipeline.",
     "Placeholders should align to the card grid and be easy to replace: rectangular, unobstructed, with visible margins.",
     "All figure-containing cards must use a light paper/lab-white surface around the placeholder; dark or saturated fills may be outer accents only, never the block background directly behind a future white plot.",
     "If a section mixes portrait, near-square, and square plots, give each placeholder its own correctly shaped light mat; do not force them into equal tall columns or equal square tiles.",
@@ -153,6 +155,15 @@ def build_prompt(spec: dict[str, Any]) -> str:
     information_plan = storyboard.get("information_plan") if isinstance(storyboard.get("information_plan"), dict) else {}
     lines += _information_density_prompt_lines(style, information_plan)
 
+    physics_quiz = spec.get("physics_quiz") if isinstance(spec.get("physics_quiz"), dict) else {}
+    copy_deck = spec.get("copy_deck") if isinstance(spec.get("copy_deck"), dict) else {}
+    if physics_quiz:
+        lines += _physics_quiz_prompt_lines(physics_quiz)
+    if copy_deck:
+        lines += _copy_deck_prompt_lines(copy_deck, placeholders)
+    copy_units_by_section = _copy_units_by_section(copy_deck)
+    copy_deck_enabled = bool(copy_deck.get("copy_units")) if isinstance(copy_deck, dict) else False
+
     grammar_rules = _style_rule_list(style, "hep_poster_grammar", HEP_POSTER_GRAMMAR)
     density_rules = _style_rule_list(style, "text_density", TEXT_DENSITY_RULES)
     figure_rules = _style_rule_list(style, "figure_composition", FIGURE_COMPOSITION_RULES)
@@ -251,7 +262,7 @@ def build_prompt(spec: dict[str, Any]) -> str:
             "- A square placeholder should look square; a wide placeholder should have real vertical presence and should not become a thin banner.",
             "- A moderate landscape placeholder such as 1.49:1 should look only about one and a half times wider than tall; never stretch it into a panoramic 2.5:1 or 3:1 banner.",
             "- A portrait or near-portrait placeholder such as 1:1.16 should look only slightly taller than wide; do not draw it as a narrow vertical strip or tall column.",
-            "- A square headline-result placeholder should be prominent but not oversized: keep its side around 28-33% of the canvas width, never a giant sticker covering most of the result card.",
+            "- A square headline-result placeholder should be prominent but not oversized: keep its side around 30-34% of the canvas width, visibly larger than supporting scientific placeholders, never a giant sticker covering most of the result card.",
             "- For square placeholders, the visible light/white placeholder fill itself must also be square; do not put the [FIG NN] label inside a wide white rounded rectangle and only draw a square-ish dashed fragment inside it.",
             "- Keep the square headline-result placeholder clearly above the bottom summary/conclusion modules; its bottom edge should sit before the lower fifth of the poster begins, with an obvious gutter below it.",
             "- If a wide placeholder would become too thin at full poster width, make it narrower or make its section taller rather than stretching it into a ribbon.",
@@ -283,10 +294,23 @@ def build_prompt(spec: dict[str, Any]) -> str:
     for sec in sections:
         sid = sec.get("id")
         title = sec.get("title", f"Section {sid}")
-        layout = sec.get("layout", "card")
         sec_figs = [p for p in placeholders if p.get("section") == sid]
+        layout = _section_layout_text(sec.get("layout", "card"), sec_figs)
         bullet_budget = _section_bullet_budget(sec_figs)
-        lines.append(f"Section {sid}, layout: {layout}, title: \"{sid}  {_q(title)}\"")
+        try:
+            sid_int = int(sid)
+        except Exception:
+            sid_int = -1
+        section_copy_units = copy_units_by_section.get(sid_int, [])
+        flowchart_items = [str(item).strip() for item in sec.get("flowchart") or [] if str(item).strip()]
+        render_flowchart = _should_render_flowchart(flowchart_items, copy_deck_enabled, section_copy_units)
+        copy_title = _section_title_from_copy_units(section_copy_units) if copy_deck_enabled else ""
+        display_title = copy_title or str(title)
+        lines.append(f"Section {sid}, layout: {layout}, title: \"{_q(_format_section_heading(sid, display_title))}\"")
+        if copy_title:
+            lines.append(
+                "Visible section heading is taken from the copy deck section_title unit above; do not repeat that heading again as a body bullet, badge, or callout."
+            )
         storyboard_sec = storyboard_sections.get(int(sid)) if sid is not None else None
         if storyboard_sec:
             if storyboard_sec.get("role"):
@@ -295,7 +319,40 @@ def build_prompt(spec: dict[str, Any]) -> str:
                 lines.append(f"Story synopsis for layout emphasis (do not render verbatim): {_q(str(storyboard_sec.get('synopsis')))}")
             if storyboard_sec.get("text_budget"):
                 lines.append(f"Story text budget: {_q(str(storyboard_sec.get('text_budget')))}")
-        if sec.get("text"):
+        if copy_deck_enabled:
+            if section_copy_units:
+                lines.append("Authoritative copy deck text for this section (render public text from these units; do not render C/Q IDs or evidence):")
+                rendered_bullets = 0
+                for unit in section_copy_units:
+                    utype = str(unit.get("type") or "bullet")
+                    if utype in {"section_title", "conclusion"}:
+                        continue
+                    priority = str(unit.get("priority") or "should")
+                    if render_flowchart and _should_skip_copy_unit_for_flowchart(unit):
+                        continue
+                    if _should_skip_copy_unit_for_geometry(unit, sec_figs):
+                        continue
+                    if bullet_budget is not None and utype == "bullet" and priority != "must" and rendered_bullets >= bullet_budget:
+                        continue
+                    text = sanitize_public_text(str(unit.get("text") or ""), spec.get("forbidden_phrases")).strip()
+                    if not text:
+                        continue
+                    if utype == "bullet":
+                        rendered_bullets += 1
+                    max_chars = unit.get("max_chars") or len(text)
+                    placeholder_ref = f"; near [{unit.get('placeholder_id')}]" if unit.get("placeholder_id") else ""
+                    style_hint = f"; style={_q(str(unit.get('render_style')))}" if unit.get("render_style") else ""
+                    specialist_hint = _specialist_copy_hint(utype)
+                    lines.append(
+                        f"- {utype}, priority={priority}, max≈{max_chars} chars{placeholder_ref}{style_hint}{specialist_hint}: \"{_q(text)}\""
+                    )
+                if bullet_budget is not None:
+                    lines.append(
+                        f"Copy-deck density rule for this figure-containing section: render must-priority units first and at most {bullet_budget} ordinary bullets; omit could-priority units before shrinking placeholders."
+                    )
+            else:
+                lines.append("No copy-deck units assigned to this section; keep rendered prose minimal and do not invent extra science copy.")
+        elif sec.get("text"):
             if bullet_budget is not None:
                 lines.append(
                     f"Text budget for this figure-containing section: render at most {bullet_budget} short bullets; omit lower-priority bullets before shrinking placeholders."
@@ -359,7 +416,7 @@ def build_prompt(spec: dict[str, Any]) -> str:
                 )
             elif any(0.92 <= ratio <= 1.08 for ratio in ratios):
                 lines.append(
-                    "Square-placeholder section design: reserve a true square dashed rectangle with square light/white fill; the surrounding figure card/mat must also be light, although it may have dramatic outer outlines, halos, ribbons, or side accents. The placeholder itself cannot be a landscape box or wide white rounded rectangle. For a headline result, make the square substantial yet moderate, with visible surrounding light-card breathing room; do not let it descend into the bottom summary/conclusion zone."
+                    "Square-placeholder section design: reserve a true square dashed rectangle with square light/white fill; the surrounding figure card/mat must also be light, although it may have dramatic outer outlines, halos, ribbons, or side accents. The placeholder itself cannot be a landscape box or wide white rounded rectangle. For a headline result, make the square substantial yet moderate, visibly larger than supporting placeholders, with visible surrounding light-card breathing room; do not let it descend into the bottom summary/conclusion zone."
                 )
             elif all(1.08 < ratio < 1.35 for ratio in ratios):
                 near_square_shapes = ", ".join(
@@ -386,17 +443,23 @@ def build_prompt(spec: dict[str, Any]) -> str:
             lines.append("Do not render separate captions directly above or below these placeholder boxes; keep their replacement area visually clear.")
             lines.append("Keep bullets/text, flowcharts, badges, and decorative artwork outside every placeholder rectangle with a clear visual gutter.")
             lines.append("Use a light neutral figure-card surface for this whole figure area; dark or saturated colors are allowed only as thin framing accents outside the light card.")
-        if sec.get("flowchart"):
+        if flowchart_items and render_flowchart:
             wide_sec = any((_parse_aspect_ratio_text(str(fig.get("aspect") or "")) or 1.0) >= 2.0 for fig in sec_figs)
             if wide_sec:
                 lines.append(
-                    "Optional compact public text-only analysis flowchart: draw it only if the wide placeholder remains visually substantial; otherwise omit the flowchart before shrinking the placeholder."
+                    "Optional compact public text-only analysis flowchart: draw it only if the wide placeholder remains visually substantial; simplify the flowchart before shrinking or distorting any placeholder."
                 )
             else:
-                lines.append("Draw this as a simple public text-only analysis flowchart, not a source-figure placeholder:")
-            lines.append("- Render only concise node labels and arrows derived from the following items; do NOT render instruction sentences verbatim.")
-            lines.append("- Flowchart style is text-only: rounded text boxes plus connecting arrows only. No circular node icons, no pictograms, no mini charts, no particle/equation symbols, and no symbol badges.")
-            for item in sec["flowchart"]:
+                lines.append("Draw this as a polished public text-only HEP analysis schematic, not a source-figure placeholder:")
+            lines.append("- Render only the listed node labels and short directional arrows; do NOT render instruction sentences verbatim and do NOT add generic stage labels.")
+            lines.append("- Use equal-sized rounded rectangular nodes, light node interiors, accent-color borders/arrows, subtle shadows, and readable compact typography.")
+            lines.append("- If a node label contains '|', show it as a clean branch or split node with parallel sub-flow labels; otherwise keep a simple left-to-right or top-to-bottom chain.")
+            lines.append("- Preserve explicit analysis symbols, subscripts, units, and region names in node text when supplied; do not convert them into standalone icons.")
+            lines.append("- No circular node icons, pictograms, mini charts, fake axes, particle/equation-symbol badges, or decorative Feynman/process diagrams.")
+            lines.append("- This schematic should look like a professional SR/CR/fit summary for HEP readers, with concrete cuts, regions, observables, uncertainties, or statistical methods visible in the nodes.")
+            if len(flowchart_items) > 5:
+                lines.append("- Use only the five highest-value concrete nodes; omit lower-priority flowchart nodes before shrinking nearby text or placeholders.")
+            for item in flowchart_items[:5]:
                 lines.append(f"- Node label: \"{_q(_flowchart_label_text(str(item)))}\"")
         if sec.get("caption") and not sec_figs:
             clean_caption = sanitize_public_text(str(sec["caption"]), spec.get("forbidden_phrases")).strip()
@@ -404,10 +467,29 @@ def build_prompt(spec: dict[str, Any]) -> str:
                 lines.append(f"Caption: \"{_q(clean_caption)}\"")
         lines.append("")
 
-    if conclusion:
+    conclusion_units = _copy_units_of_type(copy_deck, "conclusion") if copy_deck_enabled else []
+    if conclusion or conclusion_units:
         lines.append("Conclusion box titled \"Conclusion and prospects\" with public bullets:")
-        for bullet in conclusion:
-            lines.append(f"- \"{_q(str(bullet))}\"")
+        rendered_conclusions: list[str] = []
+        if conclusion_units:
+            for unit in conclusion_units:
+                text = sanitize_public_text(str(unit.get("text") or ""), spec.get("forbidden_phrases")).strip()
+                if text:
+                    rendered_conclusions.append(text)
+            seen = {item.lower() for item in rendered_conclusions}
+            for bullet in conclusion:
+                clean = sanitize_public_text(str(bullet), spec.get("forbidden_phrases")).strip()
+                if clean and clean.lower() not in seen and len(rendered_conclusions) < 4:
+                    rendered_conclusions.append(clean)
+                    seen.add(clean.lower())
+            for text in rendered_conclusions:
+                lines.append(f"- \"{_q(text)}\"")
+            lines.append("Use these copy-deck conclusion units plus any listed public conclusion bullets as the authoritative public conclusion text; do not render copy IDs, quiz IDs, or evidence notes.")
+            lines.append("Conclusion layout rule: render the conclusion units as distinct large takeaway chips/tiles; three is ideal, four is allowed when needed to cover all headline interpretations. Do not merge them into a paragraph or add unlisted takeaway claims.")
+            lines.append("Conclusion typography rule: use large non-italic bullet/tile text with short line lengths; do not create dense paragraph text or tiny footnote-style prose in the bottom strip.")
+        else:
+            for bullet in conclusion:
+                lines.append(f"- \"{_q(str(bullet))}\"")
         if spec.get("closing"):
             lines.append(f"Closing line: \"{_q(spec['closing'])}\"")
         lines.append("Conclusion hard constraint: the conclusion box must contain ONLY the public bullets and closing line listed above. Do not add any workflow, placeholder, replacement, validation, TODO, or production-process bullet.")
@@ -453,6 +535,7 @@ def _layout_contract_prompt_lines(contract: dict[str, Any]) -> list[str]:
     rows = [
         "LAYOUT CONTRACT (soft visual prior; replacement QA will check it):",
         "- Coordinates below are normalized poster fractions [x0, y0, x1, y1], not pixel art instructions.",
+        "- The poster canvas is portrait, so normalized x/y spans are not visual aspect ratios. Use the stated aspect text for the visible dashed rectangle: a 1:1 placeholder must look square in pixels even if its normalized x-span is larger than its y-span.",
         "- Keep each visible dashed [FIG NN] rectangle roughly inside its planned zone/search zone and in the named section, while preserving artistic freedom for card shape, glow, ribbons, and surrounding decoration.",
         "- Do not use these coordinates as a reason to draw fake figure content; they only reserve blank placeholder rectangles for later real source figures.",
     ]
@@ -475,6 +558,70 @@ def _format_norm_box(value: Any) -> str:
     if not isinstance(value, (list, tuple)) or len(value) < 4:
         return "[unspecified]"
     return "[" + ", ".join(f"{float(v):.2f}" for v in value[:4]) + "]"
+
+
+def _should_render_flowchart(items: list[str], copy_deck_enabled: bool, section_copy_units: list[dict[str, Any]]) -> bool:
+    if not items:
+        return False
+    if not copy_deck_enabled or not _section_has_specialist_copy(section_copy_units):
+        return True
+    # If a copy deck already carries specialist HEP content, suppress only the
+    # old generic pipeline flowcharts.  Concrete rewritten flowcharts remain
+    # useful as a compact analysis schematic.
+    return any(_is_concrete_flowchart_item(item) for item in items)
+
+
+def _should_skip_copy_unit_for_flowchart(unit: dict[str, Any]) -> bool:
+    """Avoid rendering the same dense selection/region content twice.
+
+    Concrete rewritten flowcharts are meant to replace generic process graphics.
+    When a section has such a schematic, repeated selection/region copy makes the
+    model shrink text and placeholders, which in turn destabilizes geometry.
+    Keep badges/headlines, but let the flowchart carry most SR/CR/cut details.
+    """
+
+    utype = str(unit.get("type") or "bullet").lower()
+    priority = str(unit.get("priority") or "should").lower()
+    if utype in {"section_title", "conclusion", "figure_headline", "badge"}:
+        return False
+    if priority == "must" and utype in {"fit_strategy", "uncertainty"}:
+        return False
+    return utype in {"selection_cut", "region_matrix", "bullet", "callout"}
+
+
+def _is_concrete_flowchart_item(text: str) -> bool:
+    value = str(text or "").strip()
+    low = value.lower()
+    generic = {
+        "pp collisions",
+        "collision data",
+        "candidate events",
+        "candidates",
+        "selection",
+        "preselection",
+        "event selection",
+        "signal region",
+        "signal regions",
+        "sr/cr",
+        "fit",
+        "limit",
+        "result",
+        "results",
+    }
+    compact = re.sub(r"\s+", " ", low).strip(" .:-")
+    if compact in generic:
+        return False
+    concrete_patterns = [
+        r"\d",
+        r"\b(?:sr|cr|vr)\b",
+        r"\b(?:cls|cl_s|profile|likelihood|nuisance|barlow|post-fit|postfit|prefit|pre-fit)\b",
+        r"\b(?:pt|p_t|eta|mjj|m_jj|ht|h_t|met|pTmiss|delta|phi|mass|gev|tev|fb)\b",
+        r"\b(?:wz|top|fake|nonprompt|vbf|b-tag|btag|control|validation|bin|binned|observable|uncertainty)\b",
+        r"[Δδφηνμ]|\\",
+        r"[<>=]",
+        r"\|",
+    ]
+    return any(re.search(pattern, value, flags=re.IGNORECASE) for pattern in concrete_patterns)
 
 
 def _flowchart_label_text(text: str) -> str:
@@ -544,6 +691,45 @@ def _aspect_shape_hint(aspect: str) -> str:
     return f"portrait panel, about {(1.0 / ratio):.1f} times taller than wide"
 
 
+def _section_layout_text(layout: Any, sec_figs: list[dict[str, Any]]) -> str:
+    text = str(layout or "card").strip() or "card"
+    if not _has_square_hero_placeholder(sec_figs):
+        return text
+    # LLM-drafted specs sometimes describe a result section as "lower hero card
+    # plus summary strip".  Image generation then tends to stretch the square
+    # limit placeholder into a wide strip.  Keep the public layout intent but
+    # make the square-first geometry explicit at the earliest section line.
+    text = re.sub(r"\bplus\s+(?:bottom\s+)?summary\s+strip\b", "with separate bottom conclusion outside the figure slot", text, flags=re.IGNORECASE)
+    return (
+        f"{text}; square-first hero layout: reserve a true square dashed result placeholder above the bottom conclusion zone, "
+        "then place compact result text beside it"
+    )
+
+
+def _has_square_hero_placeholder(sec_figs: list[dict[str, Any]]) -> bool:
+    for fig in sec_figs:
+        ratio = _parse_aspect_ratio_text(str(fig.get("aspect") or "")) or 1.0
+        role = str(fig.get("role") or fig.get("group") or "").lower()
+        label = str(fig.get("label") or "").lower()
+        hero = "hero" in role or any(word in label for word in ("limit", "result", "constraint", "measurement", "exclusion"))
+        if hero and 0.90 <= ratio <= 1.10:
+            return True
+    return False
+
+
+def _should_skip_copy_unit_for_geometry(unit: dict[str, Any], sec_figs: list[dict[str, Any]]) -> bool:
+    if not _has_square_hero_placeholder(sec_figs):
+        return False
+    priority = str(unit.get("priority") or "should").lower()
+    utype = str(unit.get("type") or "bullet")
+    # Square hero result cards fail when the image model tries to fit too many
+    # fit/background chips around the limit plot.  Keep must-level public
+    # headlines and bullets, but drop optional method chips before geometry is
+    # compromised.  The statistical-method details remain available in the
+    # dedicated strategy sections and/or conclusion.
+    return priority != "must" and utype in {"fit_strategy", "uncertainty", "callout", "badge"}
+
+
 def _section_bullet_budget(sec_figs: list[dict[str, Any]]) -> int | None:
     if not sec_figs:
         return None
@@ -606,6 +792,193 @@ def _information_density_prompt_lines(style: dict[str, Any], information_plan: d
             lines.append(f"  • {_q(_design_brief_safe_text(item))}")
     lines.append("")
     return lines
+
+
+def _physics_quiz_prompt_lines(physics_quiz: dict[str, Any]) -> list[str]:
+    items = [item for item in physics_quiz.get("quiz_items") or [] if isinstance(item, dict)]
+    if not items:
+        return []
+    lines = [
+        "PHYSICS QUIZ COVERAGE TARGET (internal; do not render this heading, Q IDs, questions, or answers verbatim unless also present in COPY DECK):",
+        "- These questions define what a viewer should be able to understand after reading the poster.",
+        "- Use them to prioritize public copy and figure hierarchy. Do not draw quiz cards, exam questions, answer keys, or Q-number labels.",
+    ]
+    for item in items[:12]:
+        priority = str(item.get("poster_priority") or "should")
+        aspect = str(item.get("aspect") or "paper_understanding")
+        question = _design_brief_safe_text(str(item.get("question") or ""))
+        answer = _design_brief_safe_text(str(item.get("answer") or ""))
+        lines.append(
+            f"- priority={priority}, aspect={aspect}: viewer question \"{_q(question)}\"; expected answer target \"{_q(answer)}\"."
+        )
+    lines.append("")
+    return lines
+
+
+def _copy_deck_prompt_lines(copy_deck: dict[str, Any], placeholders: list[dict[str, Any]] | None = None) -> list[str]:
+    units = [item for item in copy_deck.get("copy_units") or [] if isinstance(item, dict)]
+    if not units:
+        return []
+    lines = [
+        "PUBLIC COPY DECK (authoritative text plan for image generation):",
+        "- Render public poster wording from these copy units, not from internal storyboard/quiz prose.",
+        "- The top title band is specified later and must use the exact Main title; never replace it with a shortened copy-deck headline.",
+        "- Do not render copy unit IDs (C01), quiz IDs (Q01), source evidence, or this heading.",
+        "- section_title units define visible section headings; do not render them a second time as body bullets or badges.",
+        "- The copy deck is exhaustive for body text, badges, takeaways, and figure-near headlines. Do not add extra public claims, generic future-prospect tiles, or methodology slogans that are not listed here.",
+        "- Must-priority units are required unless they would break placeholder geometry or legibility; should/could units are optional density.",
+        "- Copy text may be typeset as hero headlines, badges, section bullets, callouts, figure-near headlines, or conclusion bullets according to its type.",
+        "- Scientific symbols that appear in copy text are plain text only. Do not convert them into decorative particle icons, standalone symbol badges, equations, or fake diagrams.",
+        "- Keep wording short and legible. If there is not enough room, drop could-priority units first, then should-priority units, before shrinking any [FIG NN] placeholder.",
+    ]
+    figs_by_section: dict[int, list[dict[str, Any]]] = {}
+    for fig in placeholders or []:
+        if not isinstance(fig, dict):
+            continue
+        try:
+            section_id = int(fig.get("section"))
+        except Exception:
+            continue
+        figs_by_section.setdefault(section_id, []).append(fig)
+    for unit in units[:36]:
+        if str(unit.get("type") or "") == "section_title":
+            continue
+        try:
+            target_section = int(unit.get("target_section"))
+        except Exception:
+            target_section = -1
+        if _should_skip_copy_unit_for_geometry(unit, figs_by_section.get(target_section, [])):
+            continue
+        text = sanitize_public_text(str(unit.get("text") or "")).strip()
+        if not text:
+            continue
+        target = unit.get("target_section", "")
+        placeholder = f", near [{unit.get('placeholder_id')}]" if unit.get("placeholder_id") else ""
+        placement = f", placement={_q(str(unit.get('placement_hint')))}" if unit.get("placement_hint") else ""
+        lines.append(
+            f"- section {target}, type={unit.get('type', 'bullet')}, "
+            f"priority={unit.get('priority', 'should')}, max≈{unit.get('max_chars', len(text))} chars{placeholder}{placement}; "
+            f"text=\"{_q(_design_brief_safe_text(text))}\"."
+        )
+    notes = [str(note).strip() for note in copy_deck.get("coverage_notes") or [] if str(note).strip()]
+    if notes:
+        lines.append("- Copy coverage notes for hierarchy only (do not render verbatim):")
+        for note in notes[:4]:
+            lines.append(f"  • {_q(_design_brief_safe_text(note))}")
+    lines.append("")
+    return lines
+
+
+def _copy_units_by_section(copy_deck: dict[str, Any]) -> dict[int, list[dict[str, Any]]]:
+    out: dict[int, list[dict[str, Any]]] = {}
+    if not isinstance(copy_deck, dict):
+        return out
+    for unit in copy_deck.get("copy_units") or []:
+        if not isinstance(unit, dict):
+            continue
+        try:
+            section_id = int(unit.get("target_section"))
+        except Exception:
+            continue
+        out.setdefault(section_id, []).append(unit)
+    priority_rank = {"must": 0, "should": 1, "could": 2}
+    type_rank = {
+        "hero_headline": 0,
+        "section_title": 1,
+        "subhead": 2,
+        "badge": 3,
+        "selection_cut": 4,
+        "region_matrix": 5,
+        "fit_strategy": 6,
+        "uncertainty": 7,
+        "figure_headline": 8,
+        "bullet": 9,
+        "callout": 10,
+        "conclusion": 11,
+    }
+    for units in out.values():
+        units.sort(
+            key=lambda item: (
+                priority_rank.get(str(item.get("priority") or "should"), 1),
+                type_rank.get(str(item.get("type") or "bullet"), 5),
+                str(item.get("id") or ""),
+            )
+        )
+    return out
+
+
+def _copy_units_of_type(copy_deck: dict[str, Any], unit_type: str) -> list[dict[str, Any]]:
+    if not isinstance(copy_deck, dict):
+        return []
+    units = [
+        item
+        for item in copy_deck.get("copy_units") or []
+        if isinstance(item, dict) and str(item.get("type") or "") == unit_type
+    ]
+    priority_rank = {"must": 0, "should": 1, "could": 2}
+    return sorted(units, key=lambda item: (priority_rank.get(str(item.get("priority") or "should"), 1), str(item.get("id") or "")))
+
+
+def _section_title_from_copy_units(units: list[dict[str, Any]]) -> str:
+    for unit in units:
+        if str(unit.get("type") or "") != "section_title":
+            continue
+        text = sanitize_public_text(str(unit.get("text") or "")).strip()
+        if text:
+            return text
+    return ""
+
+
+def _format_section_heading(section_id: Any, title: str) -> str:
+    text = str(title or "").strip()
+    if not text:
+        return f"Section {section_id}"
+    try:
+        sid = int(section_id)
+    except Exception:
+        return text
+    # Copy decks often provide polished headings like "02 Dataset and event
+    # signature".  Preserve those exactly instead of prepending another number.
+    if re.match(rf"^\s*0?{sid}\b", text):
+        return text
+    return f"{sid:02d} {text}"
+
+
+def _section_has_specialist_copy(units: list[dict[str, Any]]) -> bool:
+    specialist_types = {"selection_cut", "region_matrix", "fit_strategy", "uncertainty"}
+    if any(str(unit.get("type") or "") in specialist_types for unit in units):
+        return True
+    specialist_terms = [
+        "sr",
+        "cr",
+        "control region",
+        "signal region",
+        "profile likelihood",
+        "cls",
+        "nuisance",
+        "barlow",
+        "normalization",
+        "post-fit",
+        "simultaneous",
+        "uncertainty",
+        "b-tag",
+        "wz",
+    ]
+    for unit in units:
+        text = str(unit.get("text") or "").lower()
+        if any(term in text for term in specialist_terms):
+            return True
+    return False
+
+
+def _specialist_copy_hint(unit_type: str) -> str:
+    hints = {
+        "selection_cut": "; render as a compact cut/threshold chip, not a generic process step",
+        "region_matrix": "; render as a tiny SR/CR matrix or split region tile with concrete labels",
+        "fit_strategy": "; render as a fit-model callout connected to the result/fit figure",
+        "uncertainty": "; render as a small nuisance/uncertainty chip for HEP experts",
+    }
+    return hints.get(str(unit_type or ""), "")
 
 
 def _style_rule_list(style: dict[str, Any], key: str, defaults: list[str]) -> list[str]:

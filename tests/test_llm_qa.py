@@ -2,7 +2,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from poster_harness.llm_stages import _deterministic_qa_checks, _qa_mode_instructions
+from poster_harness.llm_stages import _deterministic_qa_checks, _qa_detected_placeholders_context, _qa_mode_instructions
 
 
 def test_deterministic_qa_containment_uses_top_boundary_correctly():
@@ -69,6 +69,133 @@ def test_final_qa_instructions_include_information_richness_check():
     text = "\n".join(_qa_mode_instructions("final"))
     assert "information-rich enough" in text
     assert "storyboard.information_plan.must_answer_questions" in text
+
+
+def test_final_qa_detection_context_redacts_placeholder_labels():
+    detected = {
+        "image_size": {"width": 100, "height": 200},
+        "placements": {"FIG 01": [1, 2, 3, 4]},
+        "placeholders": [{"id": "FIG 01", "label": "[FIG 01] aspect ratio 1:1"}],
+    }
+    context = _qa_detected_placeholders_context(detected, "final")
+    assert context == {
+        "image_size": {"width": 100, "height": 200},
+        "placements": {"FIG 01": [1, 2, 3, 4]},
+    }
+
+
+def test_merge_qa_downgrades_nonblocking_placeholder_label_exactness():
+    from poster_harness.llm_stages import _merge_qa_results
+
+    merged = _merge_qa_results(
+        {"passes": True, "issues": [], "checks": {}, "recommended_repairs": []},
+        {
+            "passes": False,
+            "summary": "label exactness only",
+            "score": 0.6,
+            "checks": {},
+            "issues": [
+                {
+                    "severity": "critical",
+                    "category": "placeholder_contract",
+                    "message": "FIG 03 placeholder label is not exact and line-broken.",
+                    "suggested_fix": "Use exact intended content label.",
+                }
+            ],
+            "recommended_repairs": [],
+        },
+    )
+    assert merged["passes"] is True
+    assert merged["issues"][0]["severity"] == "warning"
+
+
+def test_merge_qa_downgrades_visual_only_final_containment_when_prechecks_clean():
+    from poster_harness.llm_stages import _merge_qa_results
+
+    merged = _merge_qa_results(
+        {"passes": True, "issues": [], "checks": {}, "recommended_repairs": []},
+        {
+            "passes": False,
+            "summary": "Final QA fails because of a visual containment concern.",
+            "score": 0.7,
+            "checks": {},
+            "issues": [
+                {
+                    "severity": "critical",
+                    "category": "figure_containment",
+                    "message": "FIG 02 appears to extend below its boundary.",
+                    "suggested_fix": "Refit FIG 02.",
+                }
+            ],
+            "recommended_repairs": [],
+        },
+    )
+    assert merged["passes"] is True
+    assert merged["issues"][0]["severity"] == "warning"
+    assert "Deterministic replacement-geometry prechecks were clean" in merged["issues"][0]["message"]
+    assert "passed" in merged["summary"].lower()
+
+
+def test_merge_qa_keeps_visual_containment_critical_when_prechecks_flag_geometry():
+    from poster_harness.llm_stages import _merge_qa_results
+
+    merged = _merge_qa_results(
+        {
+            "passes": False,
+            "issues": [
+                {
+                    "severity": "warning",
+                    "category": "figure_containment",
+                    "message": "local containment issue",
+                    "location": "spec",
+                }
+            ],
+            "checks": {},
+            "recommended_repairs": [],
+        },
+        {
+            "passes": False,
+            "summary": "visual containment concern",
+            "score": 0.7,
+            "checks": {},
+            "issues": [
+                {
+                    "severity": "critical",
+                    "category": "figure_containment",
+                    "message": "FIG 02 visibly extends below its boundary.",
+                    "suggested_fix": "Refit FIG 02.",
+                }
+            ],
+            "recommended_repairs": [],
+        },
+    )
+    assert merged["passes"] is False
+    assert any(issue["severity"] == "critical" for issue in merged["issues"])
+
+
+def test_merge_qa_downgrades_visual_only_placeholder_remnant_claim():
+    from poster_harness.llm_stages import _merge_qa_results
+
+    merged = _merge_qa_results(
+        {"passes": True, "issues": [], "checks": {}, "recommended_repairs": []},
+        {
+            "passes": False,
+            "summary": "Final QA fails because placeholder text remains.",
+            "score": 0.7,
+            "checks": {},
+            "issues": [
+                {
+                    "severity": "critical",
+                    "category": "public_text_cleanliness",
+                    "message": "Production placeholder text remains visible: [FIG 02] and aspect ratio 2.5:1.",
+                    "suggested_fix": "Erase placeholder text.",
+                }
+            ],
+            "recommended_repairs": [],
+        },
+    )
+    assert merged["passes"] is True
+    assert merged["issues"][0]["severity"] == "warning"
 
 
 def test_template_critique_normalizes_scores_and_repairs():
