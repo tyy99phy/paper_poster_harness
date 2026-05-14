@@ -21,9 +21,11 @@ HEP_POSTER_GRAMMAR = [
 
 TEXT_DENSITY_RULES = [
     "Compress prose into poster bullets: short noun phrases, ideally under 11 words each.",
-    "Maintain Paper2Poster-style information richness: enough compact facts to answer the central reader questions, not just decorative headings.",
+    "Maintain Paper2Poster-style information richness through smaller but still legible text tiers, not by removing whitespace or shrinking figure placeholders.",
+    "Use three text scales: large must-level claims, compact body bullets for specialist detail, and micro-badges for optional should/could facts.",
+    "Preserve the current generous editorial whitespace; add information by making copy shorter and typesetting secondary facts smaller, not by packing cards edge-to-edge.",
     "Avoid microscopic paragraphs, footnote blocks, dense equations, and reference lists in the rendered poster.",
-    "Prefer 2-4 bullets per card and at most one short sentence per text block; preserve meaning without adding new science.",
+    "Prefer 2-5 bullets/fact chips per non-hero card and at most one short sentence per text block; preserve meaning without adding new science.",
     "Use public fact chips and numeric badges for explicitly grounded dataset/result facts; do not invent numbers.",
     "If text competes with a result figure, shrink or omit lower-priority text first and enlarge/preserve the figure placeholder.",
 ]
@@ -119,6 +121,7 @@ def build_prompt(spec: dict[str, Any]) -> str:
 
     storyboard = spec.get("storyboard") if isinstance(spec.get("storyboard"), dict) else {}
     storyboard_sections = _storyboard_section_map(storyboard)
+    content_outline = spec.get("content_outline") if isinstance(spec.get("content_outline"), dict) else {}
     if storyboard:
         lines += [
             "NARRATIVE STORYBOARD (internal design brief; do not render this heading or the word storyboard):",
@@ -151,6 +154,9 @@ def build_prompt(spec: dict[str, Any]) -> str:
             "- Storyboard science terms are semantic guidance only: never render them as standalone icons, circular badges, particle-symbol marks, fake diagrams, or flowchart pictograms outside [FIG NN] placeholders.",
             "",
         ]
+
+    if content_outline:
+        lines += _content_outline_prompt_lines(content_outline)
 
     information_plan = storyboard.get("information_plan") if isinstance(storyboard.get("information_plan"), dict) else {}
     lines += _information_density_prompt_lines(style, information_plan)
@@ -754,11 +760,79 @@ def _storyboard_section_map(storyboard: dict[str, Any]) -> dict[int, dict[str, A
     return out
 
 
+def _content_outline_prompt_lines(content_outline: dict[str, Any]) -> list[str]:
+    lines = [
+        "P2P-STYLE CONTENT OUTLINE (internal coverage map; do not render this heading, evidence, or the words content outline):",
+        "- Use this outline to make the poster more information-rich while preserving the current generous whitespace and figure-led design.",
+        "- Increase density primarily through smaller but legible microcopy tiers: compact bullets, badges, cut chips, fit chips, uncertainty chips, and figure-side headlines.",
+        "- Do not add paragraphs. Do not shrink or distort [FIG NN] placeholders. Do not convert specialist notation into decorative physics icons.",
+    ]
+    paper_type = str(content_outline.get("paper_type") or "").strip()
+    if paper_type:
+        lines.append(f"- Paper type: {_q(_design_brief_safe_text(paper_type))}.")
+
+    sections = [item for item in content_outline.get("dynamic_sections") or [] if isinstance(item, dict)]
+    if sections:
+        lines.append("- Paper-specific section roles to prefer over generic headings:")
+        for item in sections[:8]:
+            title = _design_brief_safe_text(str(item.get("title") or ""))
+            purpose = _design_brief_safe_text(str(item.get("purpose") or ""))
+            details = [
+                _design_brief_safe_text(str(detail).strip())
+                for detail in (item.get("specialist_details") or item.get("must_include_facts") or [])
+                if str(detail).strip()
+            ][:3]
+            suffix = f"; specialist facts={_q('; '.join(details))}" if details else ""
+            lines.append(f"  • {_q(title)} — {_q(purpose)}{suffix}")
+
+    facts = [item for item in content_outline.get("high_density_facts") or [] if isinstance(item, dict)]
+    if facts:
+        lines.append("- High-density grounded facts for optional small text tiers (render must/should first; evidence is internal):")
+        for item in facts[:18]:
+            fact = _design_brief_safe_text(str(item.get("fact") or ""))
+            priority = str(item.get("priority") or "should")
+            render_as = str(item.get("render_as") or "bullet")
+            section_hint = str(item.get("section_hint") or "").strip()
+            section_part = f", section≈{_q(section_hint)}" if section_hint else ""
+            lines.append(f"  • priority={priority}, as={render_as}{section_part}: {_q(fact)}")
+
+    formulas = [item for item in content_outline.get("essential_formulas") or [] if isinstance(item, dict)]
+    if formulas:
+        lines.append("- Essential formulas may appear only as tiny plain-text formula chips when legible and explicitly listed here:")
+        for item in formulas[:6]:
+            formula = _design_brief_safe_text(str(item.get("formula") or ""))
+            meaning = _design_brief_safe_text(str(item.get("meaning") or ""))
+            priority = str(item.get("priority") or "should")
+            lines.append(f"  • priority={priority}: {_q(formula)} ({_q(meaning)})")
+
+    figure_guidance = [item for item in content_outline.get("figure_text_guidance") or [] if isinstance(item, dict)]
+    if figure_guidance:
+        lines.append("- Figure-aware nearby text guidance: use these as figure-side headlines/callouts, not as fake figure content:")
+        for item in figure_guidance[:10]:
+            asset = str(item.get("asset") or "").strip()
+            nearby = _design_brief_safe_text(str(item.get("nearby_text") or item.get("communicates") or ""))
+            priority = str(item.get("priority") or "should")
+            asset_part = f", asset={_q(asset)}" if asset else ""
+            lines.append(f"  • priority={priority}{asset_part}: {_q(nearby)}")
+
+    priorities = [
+        _design_brief_safe_text(str(item).strip())
+        for item in content_outline.get("coverage_priorities") or []
+        if str(item).strip()
+    ][:8]
+    if priorities:
+        lines.append("- Coverage priorities to preserve before optional style-only copy:")
+        for item in priorities:
+            lines.append(f"  • {_q(item)}")
+    lines.append("")
+    return lines
+
+
 def _information_density_prompt_lines(style: dict[str, Any], information_plan: dict[str, Any]) -> list[str]:
     density_target = str(
         style.get("information_density")
         or information_plan.get("density_target")
-        or "Paper2Poster-rich but readable: 14-24 concise public information units, no paragraphs"
+        or "Paper2Poster-rich but readable: 18-30 concise public information units, no paragraphs"
     ).strip()
     data_badges = [str(item).strip() for item in information_plan.get("data_badges") or [] if str(item).strip()][:8]
     display_facts = [str(item).strip() for item in information_plan.get("display_facts") or [] if str(item).strip()][:18]
@@ -769,7 +843,8 @@ def _information_density_prompt_lines(style: dict[str, Any], information_plan: d
         "INFORMATION DENSITY TARGET:",
         f"- Target: {_q(density_target)}.",
         "- Do not make the poster a sparse cover illustration. It should communicate enough public content for a conference viewer to understand the paper's motivation, method, key figures, and conclusion.",
-        "- Prefer compact information architecture: 4-6 section modules, 12-20 total short bullets/fact chips, 3-6 small badges, and a concise conclusion strip.",
+        "- Prefer compact information architecture: 4-6 section modules, 18-30 total short bullets/fact chips, 4-8 small badges, and a concise conclusion strip.",
+        "- Keep the current generous whitespace/gutters; increase information density with smaller text tiers and shorter copy, not by flattening the layout or shrinking placeholders.",
         "- Keep public facts legible and truthful. If the image model cannot fit a fact clearly, omit the lowest-priority fact rather than shrinking text to unreadable size or inventing abbreviations.",
         "- Numeric badges are allowed only for numbers explicitly present in the supplied public text/assets; never invent luminosities, energies, masses, limits, years, or confidence levels.",
         "- Use figure placeholders as information anchors: each figure card should have a short nearby public headline explaining why the future real figure matters, without describing fake drawn contents.",
@@ -829,7 +904,8 @@ def _copy_deck_prompt_lines(copy_deck: dict[str, Any], placeholders: list[dict[s
         "- Must-priority units are required unless they would break placeholder geometry or legibility; should/could units are optional density.",
         "- Copy text may be typeset as hero headlines, badges, section bullets, callouts, figure-near headlines, or conclusion bullets according to its type.",
         "- Scientific symbols that appear in copy text are plain text only. Do not convert them into decorative particle icons, standalone symbol badges, equations, or fake diagrams.",
-        "- Keep wording short and legible. If there is not enough room, drop could-priority units first, then should-priority units, before shrinking any [FIG NN] placeholder.",
+        "- Keep wording short and legible. Use a smaller but readable tier for should/could microcopy; do not reduce whitespace/gutters just to fit extra text.",
+        "- If there is not enough room, drop could-priority units first, then should-priority units, before shrinking any [FIG NN] placeholder.",
     ]
     figs_by_section: dict[int, list[dict[str, Any]]] = {}
     for fig in placeholders or []:
@@ -840,7 +916,7 @@ def _copy_deck_prompt_lines(copy_deck: dict[str, Any], placeholders: list[dict[s
         except Exception:
             continue
         figs_by_section.setdefault(section_id, []).append(fig)
-    for unit in units[:36]:
+    for unit in units[:48]:
         if str(unit.get("type") or "") == "section_title":
             continue
         try:

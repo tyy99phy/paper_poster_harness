@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from poster_harness.flowchart_rewrite import apply_flowchart_rewrites, rewrite_flowcharts_from_paper
-from poster_harness.llm_stages import FLOWCHART_NODE_RULES, draft_spec_from_text
+from poster_harness.llm_stages import FLOWCHART_NODE_RULES, draft_spec_from_text, paper_content_outline_from_text
 
 
 class FakeProvider:
@@ -59,6 +59,57 @@ def test_draft_spec_prompt_contains_flowchart_node_rules() -> None:
     assert "information capsule" in prompt
     assert "branch" in prompt
     assert "delta phi" in prompt
+
+
+def test_content_outline_stage_normalizes_dynamic_sections_and_facts() -> None:
+    provider = FakeProvider(
+        {
+            "paper_content_outline_from_text": {
+                "paper_type": "HEP result paper",
+                "dynamic_sections": [
+                    {
+                        "title": "Signal and control regions",
+                        "purpose": "Show SR/CR strategy",
+                        "must_include_facts": ["SR binned in pTmiss"],
+                        "specialist_details": ["WZ CR constrains normalization"],
+                        "figure_links": ["limit.png", "missing.png"],
+                    }
+                ],
+                "high_density_facts": [
+                    {
+                        "fact": "Profile-likelihood CLs limit",
+                        "section_hint": "fit",
+                        "priority": "must",
+                        "evidence": "paper says CLs",
+                        "render_as": "fit_chip",
+                    }
+                ],
+                "essential_formulas": [
+                    {"formula": "|V_muN|^2", "meaning": "mixing", "priority": "should", "evidence": "paper formula"}
+                ],
+                "figure_text_guidance": [
+                    {
+                        "asset": "limit.png",
+                        "communicates": "limit curve",
+                        "nearby_text": "Observed 95% CL limit",
+                        "priority": "must",
+                    }
+                ],
+                "coverage_priorities": ["fit/result coverage"],
+            }
+        }
+    )
+    env = paper_content_outline_from_text(
+        "paper text",
+        assets_manifest={"assets": [{"asset": "limit.png", "label": "Limit"}]},
+        provider=provider,
+    )
+    result = env["result"]
+    assert provider.calls[0]["stage"] == "paper_content_outline_from_text"
+    assert result["paper_type"] == "hep_result_paper"
+    assert result["dynamic_sections"][0]["figure_links"] == ["limit.png"]
+    assert result["high_density_facts"][0]["render_as"] == "fit_chip"
+    assert result["figure_text_guidance"][0]["nearby_text"] == "Observed 95% CL limit"
 
 
 def test_rewrite_flowcharts_skips_when_no_section_has_flowchart() -> None:

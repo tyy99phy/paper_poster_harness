@@ -319,6 +319,200 @@ class ChatGPTAccountResponsesProvider:
         raise RuntimeError("Responses request failed without a captured exception")
 
 
+@dataclass(slots=True)
+class OpenAICompatibleResponsesProvider:
+    """Strict JSON provider for OpenAI-compatible Responses endpoints.
+
+    This backend is useful for local Codex-compatible routers that expose
+    ``/v1/responses``.  It deliberately reads the API key only from an
+    environment variable; configs should store endpoint/model, not secrets.
+    """
+
+    endpoint: str
+    model: str = DEFAULT_MODEL
+    api_key_env: str = "OPENAI_API_KEY"
+    response_format: str = "json_schema"
+    reasoning_effort: str | None = None
+    timeout: int = 120
+    default_image_detail: str = "high"
+    proxy: str | None = None
+
+    @property
+    def configured(self) -> bool:
+        return bool(os.getenv(self.api_key_env))
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "name": "openai_compatible_responses",
+            "model": self.model,
+            "configured": self.configured,
+            "endpoint": self.endpoint,
+            "response_format": self.response_format,
+            "reasoning_effort": self.reasoning_effort or "",
+        }
+
+    def generate_json(
+        self,
+        *,
+        stage_name: str,
+        prompt: str,
+        schema: Mapping[str, Any],
+        system_prompt: str | None = None,
+        image_paths: Sequence[str | Path] | None = None,
+        image_detail: str | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        tool_choice: str | Mapping[str, Any] | None = None,
+        include: Sequence[str] | None = None,
+        reasoning: Mapping[str, Any] | None = None,
+        strict: bool = False,
+    ) -> dict[str, Any]:
+        schema_copy = copy.deepcopy(dict(schema))
+        try:
+            body = self._build_request_body(
+                stage_name=stage_name,
+                prompt=prompt,
+                schema=schema_copy,
+                system_prompt=system_prompt,
+                image_paths=image_paths,
+                image_detail=image_detail,
+                tools=tools,
+                tool_choice=tool_choice,
+                include=include,
+                reasoning=reasoning,
+                strict=strict,
+            )
+            payload = self._post_json(body)
+            parsed = extract_json_from_response(payload)
+            raw_text = extract_response_text(payload)
+        except Exception as exc:
+            raise RuntimeError(f"{stage_name}: strict OpenAI-compatible Responses request failed: {exc}") from exc
+
+        if not isinstance(parsed, Mapping):
+            raise RuntimeError(f"{stage_name}: strict LLM stage returned non-object JSON: {type(parsed).__name__}")
+        return {
+            "stage": stage_name,
+            "ok": True,
+            "mode": "openai_compatible_responses",
+            "provider": self.describe(),
+            "prompt": prompt,
+            "schema": schema_copy,
+            "result": parsed,
+            "raw_text": raw_text,
+            "response_id": payload.get("id"),
+            "warnings": [],
+        }
+
+    def _build_request_body(
+        self,
+        *,
+        stage_name: str,
+        prompt: str,
+        schema: Mapping[str, Any],
+        system_prompt: str | None,
+        image_paths: Sequence[str | Path] | None,
+        image_detail: str | None,
+        tools: Sequence[Mapping[str, Any]] | None,
+        tool_choice: str | Mapping[str, Any] | None,
+        include: Sequence[str] | None,
+        reasoning: Mapping[str, Any] | None,
+        strict: bool,
+    ) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+        for image_path in image_paths or []:
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": encode_image_as_data_url(image_path),
+                    "detail": image_detail or self.default_image_detail,
+                }
+            )
+        response_format = str(self.response_format or "json_schema").strip().lower()
+        body: dict[str, Any] = {
+            "model": self.model,
+            "stream": False,
+            "store": False,
+            "input": [{"type": "message", "role": "user", "content": content}],
+        }
+        if response_format == "json_schema":
+            body["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": normalize_schema_name(stage_name),
+                    "schema": _schema_without_type_lists(copy.deepcopy(dict(schema))),
+                    "strict": strict,
+                }
+            }
+        elif response_format == "json_object":
+            body["text"] = {"format": {"type": "json_object"}}
+        elif response_format in {"none", "text"}:
+            pass
+        else:
+            raise RuntimeError(f"unsupported response_format={self.response_format!r}")
+        if system_prompt:
+            body["instructions"] = system_prompt
+        if tools:
+            body["tools"] = [copy.deepcopy(dict(tool)) for tool in tools]
+        if tool_choice:
+            body["tool_choice"] = copy.deepcopy(tool_choice)
+        if include:
+            body["include"] = list(include)
+        if reasoning:
+            body["reasoning"] = copy.deepcopy(dict(reasoning))
+        elif self.reasoning_effort:
+            body["reasoning"] = {"effort": self.reasoning_effort}
+        return body
+
+    def _post_json(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        api_key = os.getenv(self.api_key_env, "")
+        if not api_key:
+            raise RuntimeError(f"{self.api_key_env} is not set")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "poster-harness/0.1",
+        }
+        req = request.Request(self.endpoint, method="POST", data=json.dumps(dict(body)).encode("utf-8"), headers=headers)
+        handlers = []
+        proxy = self.proxy or os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or ""
+        if proxy:
+            handlers.append(request.ProxyHandler({"http": proxy, "https": proxy}))
+        opener = request.build_opener(*handlers)
+        try:
+            with opener.open(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="replace"))
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+
+
+def _schema_without_type_lists(value: Any) -> Any:
+    """Convert JSON Schema ``type: [a, b]`` unions to ``anyOf``.
+
+    Some OpenAI-compatible routers accept normal Responses payloads but choke on
+    list-valued ``type`` fields while native OpenAI JSON Schema allows them.  The
+    conversion keeps the schema semantics close enough for our non-strict
+    structured stages and avoids weakening the downstream normalizers/QA.
+    """
+
+    if isinstance(value, list):
+        return [_schema_without_type_lists(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    out = {key: _schema_without_type_lists(item) for key, item in value.items() if key != "type"}
+    schema_type = value.get("type")
+    if isinstance(schema_type, list):
+        variants = []
+        for item_type in schema_type:
+            variant = copy.deepcopy(out)
+            variant["type"] = item_type
+            variants.append(_schema_without_type_lists(variant))
+        return {"anyOf": variants}
+    if schema_type is not None:
+        out["type"] = schema_type
+    return out
+
+
 def response_payload_from_sse_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     completed: dict[str, Any] | None = None
     delta_parts: list[str] = []

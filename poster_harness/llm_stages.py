@@ -13,6 +13,7 @@ from .llm import ChatGPTAccountResponsesProvider
 from .prompt import INTERNAL_DEFAULTS, sanitize_public_text
 from .schemas import (
     DEFAULT_FORBIDDEN_PHRASES,
+    content_outline_schema,
     copy_deck_schema,
     default_poster_spec,
     figure_selection_schema,
@@ -47,6 +48,71 @@ FLOWCHART_NODE_RULES: list[str] = [
 ]
 
 
+def paper_content_outline_from_text(
+    text: str,
+    assets_manifest: Any = None,
+    *,
+    provider: ChatGPTAccountResponsesProvider | None = None,
+    project_overrides: Mapping[str, Any] | None = None,
+    max_sections: int | None = None,
+    max_facts: int | None = None,
+    max_formulas: int | None = None,
+    extra_instructions: str | None = None,
+) -> dict[str, Any]:
+    """Create a P2P-inspired high-density content outline.
+
+    This stage is deliberately upstream of poster_spec/storyboard/copy_deck.  It
+    borrows P2P's useful idea—derive paper-specific section roles and
+    figure-aware content targets—without borrowing its deterministic HTML/PPTX
+    visual route.  The result is an internal planning artifact, not public text
+    to render verbatim.
+    """
+
+    provider = provider or ChatGPTAccountResponsesProvider()
+    assets = normalize_assets_manifest(assets_manifest)
+    section_limit = max(4, min(8, int(max_sections or 6)))
+    fact_limit = max(12, min(36, int(max_facts or 28)))
+    formula_limit = max(0, min(10, int(max_formulas or 6)))
+    prompt = _compose_prompt(
+        header="Draft a P2P-style high-density paper content outline JSON for a poster pipeline.",
+        instructions=[
+            "This is an internal planning artifact. Do not write prompt/process/workflow text that could appear on the final poster.",
+            "Infer paper-specific dynamic sections from the source paper rather than forcing generic Introduction/Methods/Results labels.",
+            f"Return {section_limit} or fewer dynamic_sections. Prefer specific HEP section titles such as dataset+signature, SR/CR strategy, fit model, uncertainty budget, headline limits, or interpretation when supported by the source.",
+            f"Return up to {fact_limit} high_density_facts: compact grounded facts that could become small body text, badges, callouts, or figure-near headlines.",
+            f"Return up to {formula_limit} essential_formulas. Include formulas only if they are explicitly present and useful for a professional conference poster.",
+            "For every dynamic section, list must_include_facts and specialist_details grounded in the source text/assets. For HEP, prioritize concrete luminosity/energy/channel, object selections, SR/CR labels, binning variables, fitted observables, likelihood/CLs strategy, floating normalizations, and dominant uncertainties when present.",
+            "For figure_text_guidance, describe what each important source asset communicates and what nearby text should say, so the final poster can reduce redundant prose without losing information.",
+            "Assign priority='must' only to facts/formulas/figure guidance that should survive even when space is tight. Use should/could for extra density.",
+            "Use short public wording, but include evidence snippets. Never invent scientific numbers, region names, channels, or results.",
+            "Do not mention placeholders, image generation, replacement, or harness internals.",
+            extra_instructions or "",
+        ],
+        context={
+            "max_sections": section_limit,
+            "max_facts": fact_limit,
+            "max_formulas": formula_limit,
+            "project_overrides": dict(project_overrides or {}),
+            "assets_manifest": assets,
+            "source_text_excerpt": _truncate(text, 32000),
+        },
+    )
+    envelope = provider.generate_json(
+        stage_name="paper_content_outline_from_text",
+        prompt=prompt,
+        schema=content_outline_schema(),
+        system_prompt=SYSTEM_PROMPT,
+    )
+    envelope["result"] = _normalize_content_outline(
+        envelope["result"],
+        assets,
+        section_limit=section_limit,
+        fact_limit=fact_limit,
+        formula_limit=formula_limit,
+    )
+    return envelope
+
+
 def draft_spec_from_text(
     text: str,
     assets_manifest: Any = None,
@@ -54,6 +120,7 @@ def draft_spec_from_text(
     provider: ChatGPTAccountResponsesProvider | None = None,
     project_overrides: Mapping[str, Any] | None = None,
     style_overrides: Mapping[str, Any] | None = None,
+    content_outline: Mapping[str, Any] | None = None,
     extra_instructions: str | None = None,
 ) -> dict[str, Any]:
     provider = provider or ChatGPTAccountResponsesProvider()
@@ -78,7 +145,8 @@ def draft_spec_from_text(
             "Use the supplied paper/talk text to create a public-facing poster specification.",
             "Preserve the existing harness structure: project, style, sections, placeholders, placements, conclusion, closing.",
             "Keep 4-6 sections unless the source clearly needs a different count.",
-            "Follow HEP poster rhetoric: motivation/context, dataset/object selection, analysis/background strategy, key results, interpretation/summary.",
+            "When a content_outline is supplied, use its dynamic_sections as the preferred semantic section roles/titles; merge or rename only when needed for poster legibility.",
+            "Follow HEP poster rhetoric but avoid bland generic section names: motivation/context, dataset/object selection, SR/CR or background strategy, fit model, key results, interpretation/summary.",
             "For a professional HEP audience, make dataset/selection and analysis-strategy sections analysis-specific, not generic. Extract concrete object thresholds, SR/CR definitions, binning variables, fit observable, likelihood/CLs method, normalization factors, and dominant uncertainties when present.",
             "Do not use a generic workflow like 'pp collisions → candidates → topology → SR/CR → fit' as the main analysis graphic. If a flowchart is useful, make it a compact HEP region/fit schematic with concrete SR bins, CR labels, fitted observables, and nuisance/systematic blocks.",
             *FLOWCHART_NODE_RULES,
@@ -95,6 +163,7 @@ def draft_spec_from_text(
         context={
             "project_overrides": dict(project_overrides or {}),
             "style_overrides": dict(style_overrides or {}),
+            "content_outline": dict(content_outline or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 30000),
             "starter_spec": base,
@@ -117,6 +186,7 @@ def storyboard_from_text(
     assets_manifest: Any = None,
     *,
     spec: Mapping[str, Any] | None = None,
+    content_outline: Mapping[str, Any] | None = None,
     provider: ChatGPTAccountResponsesProvider | None = None,
     extra_instructions: str | None = None,
 ) -> dict[str, Any]:
@@ -136,6 +206,7 @@ def storyboard_from_text(
             "Create an internal storyboard that compresses the paper into a poster narrative.",
             "Do not write design-process or workflow text that should appear on the poster; this is an internal planning artifact.",
             "Use the existing poster_spec sections as the section scaffold. Preserve section ids and titles where possible.",
+            "If content_outline is supplied, treat its dynamic_sections, high_density_facts, essential_formulas, and figure_text_guidance as the preferred coverage map.",
             "For each section, assign a semantic role such as motivation, dataset, method, validation, result, interpretation, or outlook.",
             "Write concise public-facing synopses and key claims grounded only in the provided paper text.",
             "For HEP analyses, preserve specialist analysis details when present: object selections, SR binning variables, CR definitions, fitted discriminant, profile-likelihood/CLs strategy, floating background normalizations, nuisance parameters, and leading statistical/systematic uncertainties.",
@@ -154,6 +225,7 @@ def storyboard_from_text(
         context={
             "poster_spec_sections": target_spec.get("sections") or [],
             "poster_project": target_spec.get("project") or {},
+            "content_outline": dict(content_outline or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 30000),
         },
@@ -174,6 +246,7 @@ def physics_quiz_from_text(
     *,
     spec: Mapping[str, Any] | None = None,
     storyboard: Mapping[str, Any] | None = None,
+    content_outline: Mapping[str, Any] | None = None,
     provider: ChatGPTAccountResponsesProvider | None = None,
     max_questions: int | None = None,
     extra_instructions: str | None = None,
@@ -194,6 +267,7 @@ def physics_quiz_from_text(
         instructions=[
             f"Create {limit} concise quiz items that a good scientific poster for this paper should enable a viewer to answer.",
             "This is internal planning/evaluation data, not public poster text. Do not ask the image model to render these questions.",
+            "Use content_outline.coverage_priorities and high_density_facts as a coverage checklist when supplied.",
             "Use high-energy-physics poster aspects: physics target, dataset/channel, object/event selection, analysis strategy, background/control regions, statistical method, systematic uncertainty, headline result, interpretation, and figure evidence.",
             "Include specialist HEP questions about SR/CR definitions, discriminating variables, simultaneous-fit structure, nuisance/systematic treatment, floating normalization factors, and dominant uncertainty sources whenever the paper provides them.",
             "For result papers with multiple interpretations, include quiz items for each headline numerical result, including observed and expected limits for secondary interpretations when present.",
@@ -208,6 +282,7 @@ def physics_quiz_from_text(
             "max_questions": limit,
             "poster_spec": target_spec,
             "storyboard": dict(storyboard or {}),
+            "content_outline": dict(content_outline or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 30000),
         },
@@ -230,6 +305,7 @@ def copy_deck_from_text(
     storyboard: Mapping[str, Any] | None = None,
     physics_quiz: Mapping[str, Any] | None = None,
     figure_selection: Mapping[str, Any] | None = None,
+    content_outline: Mapping[str, Any] | None = None,
     provider: ChatGPTAccountResponsesProvider | None = None,
     max_units: int | None = None,
     extra_instructions: str | None = None,
@@ -239,12 +315,14 @@ def copy_deck_from_text(
     provider = provider or ChatGPTAccountResponsesProvider()
     assets = normalize_assets_manifest(assets_manifest)
     target_spec = _normalize_spec(copy.deepcopy(dict(spec or default_poster_spec(_guess_title(text)))), assets)
-    limit = max(10, min(36, int(max_units or 28)))
+    limit = max(10, min(48, int(max_units or 28)))
     prompt = _compose_prompt(
         header="Draft a public copy_deck JSON object for a placeholder-first scientific poster.",
         instructions=[
             "Create concise public text units that the image-generation model should render on the poster.",
+            "Increase information density through a controlled type-size hierarchy, not by reducing whitespace or shrinking figure placeholders: must units are normal-small poster text; should/could units are mini bullets or micro-badges, still legible.",
             "Use the physics_quiz as the coverage target: must-priority quiz items should be answerable from rendered copy plus future real figure placeholders.",
+            "Use content_outline.high_density_facts, essential_formulas, and figure_text_guidance as the main source of optional density when supplied.",
             "Use the storyboard as the narrative spine and the poster_spec sections as the section scaffold. Preserve section ids.",
             "Do not create copy units for the exact main title, author line, or identity line; those are controlled by poster_spec.project and rendered separately.",
             "Write compact, camera-ready poster copy: short headlines, badges, figure-near headlines, bullets, callouts, and conclusion takeaways.",
@@ -256,6 +334,8 @@ def copy_deck_from_text(
             "If the paper names WZ, b-tagged, WZb, top, fake/nonprompt, validation, or control regions, include those names in section 2/3 copy units rather than a generic flowchart.",
             "If the paper says statistical/template uncertainty dominates or mentions Barlow-Beeston-lite, CLs, profile likelihood, nuisance parameters, or floating normalizations, include at least one fit_strategy or uncertainty unit for it.",
             "Do not write paragraphs. Most units should be under 70 characters; badges should be under 36 characters; hero headlines can be under 90 characters.",
+            "For denser posters, split long facts into multiple short copy_units rather than one paragraph. Prefer more small chips/bullets over fewer long sentences.",
+            "Set render_style to indicate the intended text tier when useful: 'primary badge', 'mini bullet', 'micro callout', 'figure-side headline', 'tiny formula chip'.",
             "Ground every text unit in explicit source evidence, a quiz answer, a figure caption, or the supplied poster_spec. Never invent scientific numbers or claims.",
             "For each placeholder/selected figure, add a nearby figure_headline if the evidence supports it; do not describe fake drawn contents and do not ask the model to draw scientific data.",
             "Use priority='must' for the minimum public copy that must be rendered; use 'should' and 'could' for optional density.",
@@ -270,6 +350,7 @@ def copy_deck_from_text(
             "storyboard": dict(storyboard or {}),
             "physics_quiz": dict(physics_quiz or {}),
             "figure_selection": dict(figure_selection or {}),
+            "content_outline": dict(content_outline or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 30000),
         },
@@ -290,6 +371,7 @@ def select_figures(
     *,
     spec: Mapping[str, Any] | None = None,
     storyboard: Mapping[str, Any] | None = None,
+    content_outline: Mapping[str, Any] | None = None,
     provider: ChatGPTAccountResponsesProvider | None = None,
     max_figures: int | None = None,
     extra_instructions: str | None = None,
@@ -303,6 +385,7 @@ def select_figures(
         instructions=[
             "Pick at most the available placeholder count or max_figures, whichever is smaller.",
             "Prefer figures that communicate the main physics motivation, method, key backgrounds, and headline results.",
+            "Use content_outline.figure_text_guidance and dynamic_sections when supplied to place figures where they reduce redundant prose and increase useful information density.",
             "Assign priority so the headline result/limit/cross-section/significance plot becomes the hero placeholder.",
             "Deprioritize dense diagnostic variants unless they are essential to the scientific claim.",
             "Map each selected asset onto a sequential placeholder_id exactly like FIG 01, FIG 02, ...; do not invent semantic IDs.",
@@ -318,6 +401,7 @@ def select_figures(
             "max_figures": limit,
             "poster_spec": target_spec,
             "storyboard": dict(storyboard or {}),
+            "content_outline": dict(content_outline or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 5000),
         },
@@ -655,6 +739,157 @@ def _clean_flowchart_item(text: str) -> str:
     return text
 
 
+def _normalize_content_outline(
+    result: Mapping[str, Any],
+    assets: Sequence[Mapping[str, Any]],
+    *,
+    section_limit: int,
+    fact_limit: int,
+    formula_limit: int,
+) -> dict[str, Any]:
+    asset_names = {str(asset.get("asset")) for asset in assets if str(asset.get("asset") or "").strip()}
+
+    def priority(value: Any) -> str:
+        text = str(value or "should").strip().lower()
+        return text if text in {"must", "should", "could"} else "should"
+
+    def clean_list(values: Any, *, limit: int, max_chars: int = 160) -> list[str]:
+        out: list[str] = []
+        for value in values or []:
+            text = sanitize_public_text(str(value)).strip()
+            text = re.sub(r"\s+", " ", text)
+            if text and text not in out:
+                out.append(_truncate(text, max_chars))
+            if len(out) >= limit:
+                break
+        return out
+
+    dynamic_sections: list[dict[str, Any]] = []
+    for item in result.get("dynamic_sections") or []:
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        title = sanitize_public_text(str(row.get("title") or "")).strip()
+        purpose = sanitize_public_text(str(row.get("purpose") or "")).strip()
+        if not title and not purpose:
+            continue
+        dynamic_sections.append(
+            {
+                "title": _truncate(title or "Poster section", 80),
+                "purpose": _truncate(purpose, 220),
+                "role": _compact_token(str(row.get("role") or title or "section"), default="section"),
+                "must_include_facts": clean_list(row.get("must_include_facts") or row.get("facts") or [], limit=6),
+                "specialist_details": clean_list(row.get("specialist_details") or row.get("details") or [], limit=8),
+                "formulas": clean_list(row.get("formulas") or [], limit=4, max_chars=120),
+                "figure_links": [
+                    str(asset).strip()
+                    for asset in row.get("figure_links") or row.get("assets") or []
+                    if str(asset).strip() and (not asset_names or str(asset).strip() in asset_names)
+                ][:6],
+            }
+        )
+        if len(dynamic_sections) >= section_limit:
+            break
+
+    high_density_facts: list[dict[str, str]] = []
+    seen_facts: set[str] = set()
+    allowed_render_as = {"badge", "bullet", "callout", "figure_headline", "formula_chip", "region_matrix", "fit_chip"}
+    for item in result.get("high_density_facts") or []:
+        if isinstance(item, Mapping):
+            row = dict(item)
+            fact = sanitize_public_text(str(row.get("fact") or row.get("text") or "")).strip()
+            section_hint = sanitize_public_text(str(row.get("section_hint") or row.get("section") or "")).strip()
+            evidence = sanitize_public_text(str(row.get("evidence") or row.get("source_evidence") or "")).strip()
+            render_as = _compact_token(str(row.get("render_as") or "bullet"), default="bullet")
+        else:
+            fact = sanitize_public_text(str(item)).strip()
+            section_hint = ""
+            evidence = ""
+            render_as = "bullet"
+            row = {}
+        fact = re.sub(r"\s+", " ", fact)
+        key = fact.lower()
+        if not fact or key in seen_facts:
+            continue
+        seen_facts.add(key)
+        if render_as not in allowed_render_as:
+            render_as = "bullet"
+        high_density_facts.append(
+            {
+                "fact": _truncate(fact, 150),
+                "section_hint": _truncate(section_hint, 60),
+                "priority": priority(row.get("priority") if isinstance(row, Mapping) else None),
+                "evidence": _truncate(evidence, 300),
+                "render_as": render_as,
+            }
+        )
+        if len(high_density_facts) >= fact_limit:
+            break
+
+    essential_formulas: list[dict[str, str]] = []
+    seen_formulas: set[str] = set()
+    for item in result.get("essential_formulas") or []:
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        formula = sanitize_public_text(str(row.get("formula") or "")).strip()
+        meaning = sanitize_public_text(str(row.get("meaning") or "")).strip()
+        key = formula.lower()
+        if not formula or key in seen_formulas:
+            continue
+        seen_formulas.add(key)
+        essential_formulas.append(
+            {
+                "formula": _truncate(formula, 120),
+                "meaning": _truncate(meaning, 160),
+                "priority": priority(row.get("priority")),
+                "evidence": _truncate(sanitize_public_text(str(row.get("evidence") or "")).strip(), 300),
+            }
+        )
+        if len(essential_formulas) >= formula_limit:
+            break
+
+    figure_text_guidance: list[dict[str, Any]] = []
+    for item in result.get("figure_text_guidance") or []:
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        asset = str(row.get("asset") or "").strip()
+        if asset and asset_names and asset not in asset_names:
+            continue
+        communicates = sanitize_public_text(str(row.get("communicates") or "")).strip()
+        nearby = sanitize_public_text(str(row.get("nearby_text") or row.get("headline") or "")).strip()
+        if not asset and not communicates and not nearby:
+            continue
+        figure_text_guidance.append(
+            {
+                "asset": asset,
+                "communicates": _truncate(communicates, 220),
+                "nearby_text": _truncate(nearby, 120),
+                "priority": priority(row.get("priority")),
+                "simplify_text_about": clean_list(row.get("simplify_text_about") or [], limit=5, max_chars=120),
+            }
+        )
+        if len(figure_text_guidance) >= max(8, section_limit * 2):
+            break
+
+    coverage_priorities = clean_list(result.get("coverage_priorities") or [], limit=12, max_chars=140)
+    if not coverage_priorities:
+        coverage_priorities = [row["fact"] for row in high_density_facts if row["priority"] == "must"][:8]
+
+    if not dynamic_sections and not high_density_facts:
+        raise RuntimeError("paper_content_outline_from_text: LLM returned no usable dynamic_sections or high_density_facts in strict mode")
+
+    return {
+        "paper_type": _compact_token(str(result.get("paper_type") or "research_paper"), default="research_paper"),
+        "dynamic_sections": dynamic_sections,
+        "high_density_facts": high_density_facts,
+        "essential_formulas": essential_formulas,
+        "figure_text_guidance": figure_text_guidance,
+        "coverage_priorities": coverage_priorities,
+    }
+
+
 def _normalize_storyboard(
     result: Mapping[str, Any],
     spec: Mapping[str, Any],
@@ -811,6 +1046,7 @@ def _normalize_physics_quiz(
     *,
     limit: int,
 ) -> dict[str, Any]:
+    result = _unwrap_nested_stage_result(result, "quiz_items")
     asset_names = {str(asset.get("asset")) for asset in assets}
     items: list[dict[str, Any]] = []
     seen_questions: set[str] = set()
@@ -819,7 +1055,7 @@ def _normalize_physics_quiz(
             continue
         row = dict(item)
         question = sanitize_public_text(str(row.get("question") or "")).strip()
-        answer = sanitize_public_text(str(row.get("answer") or "")).strip()
+        answer = sanitize_public_text(str(row.get("answer") or row.get("short_answer") or row.get("expected_answer") or "")).strip()
         if not question or not answer:
             continue
         qkey = re.sub(r"\s+", " ", question).strip().lower()
@@ -859,9 +1095,12 @@ def _normalize_physics_quiz(
         raise RuntimeError("physics_quiz_from_text: LLM returned no usable quiz_items in strict mode")
     for idx, row in enumerate(items, start=1):
         row["id"] = f"Q{idx:02d}"
+    raw_coverage = result.get("coverage_notes") or result.get("coverage_summary") or []
+    if isinstance(raw_coverage, str):
+        raw_coverage = [raw_coverage]
     coverage_notes = [
         sanitize_public_text(str(note)).strip()
-        for note in result.get("coverage_notes") or []
+        for note in raw_coverage
         if str(note).strip()
     ][:8]
     return {"quiz_items": items, "coverage_notes": coverage_notes}
@@ -874,6 +1113,7 @@ def _normalize_copy_deck(
     *,
     limit: int,
 ) -> dict[str, Any]:
+    result = _unwrap_nested_stage_result(result, "copy_units")
     valid_quiz_ids = {str(item.get("id")) for item in physics_quiz.get("quiz_items") or [] if isinstance(item, Mapping)}
     valid_placeholder_ids = {str(item.get("id")) for item in spec.get("placeholders") or [] if isinstance(item, Mapping)}
     units: list[dict[str, Any]] = []
@@ -955,6 +1195,15 @@ def _normalize_copy_deck(
         if str(note).strip()
     ][:8]
     return {"copy_units": units, "section_copy": section_copy, "coverage_notes": coverage_notes}
+
+
+def _unwrap_nested_stage_result(result: Mapping[str, Any], required_key: str) -> Mapping[str, Any]:
+    if required_key in result:
+        return result
+    for value in result.values():
+        if isinstance(value, Mapping) and required_key in value:
+            return value
+    return result
 
 
 def _quiz_aspect(value: str) -> str:
@@ -1073,7 +1322,28 @@ def _looks_like_project_title_copy(row: Mapping[str, Any], text: str, spec: Mapp
 
 
 def _normalize_template_critique(result: Mapping[str, Any]) -> dict[str, Any]:
+    result = _unwrap_nested_stage_result(result, "scores")
     raw_scores = dict(result.get("scores") or {})
+    if not raw_scores and isinstance(result.get("dimension_scores"), Mapping):
+        dims = dict(result.get("dimension_scores") or {})
+
+        def dim_score(*names: str) -> Any:
+            for name in names:
+                value = dims.get(name)
+                if isinstance(value, Mapping):
+                    return value.get("score")
+                if value is not None:
+                    return value
+            return None
+
+        raw_scores = {
+            "overall": result.get("overall_score") or dim_score("overall"),
+            "artistry": dim_score("artistry", "artistic_editorial_quality", "artistic_quality"),
+            "information_density": dim_score("information_density"),
+            "placeholder_contract": dim_score("placeholder_contract", "placeholder_contract_cleanliness"),
+            "text_quality": dim_score("text_quality", "text_legibility_typos"),
+            "figure_integration": dim_score("figure_integration", "figure_card_integration"),
+        }
     score_keys = [
         "overall",
         "artistry",
@@ -1090,7 +1360,12 @@ def _normalize_template_critique(result: Mapping[str, Any]) -> dict[str, Any]:
         scores["overall"] = sum(nonzero) / len(nonzero) if nonzero else 0.0
 
     issues: list[dict[str, str]] = []
-    for item in result.get("issues") or []:
+    raw_issues = list(result.get("issues") or [])
+    for item in result.get("blocking_issues") or []:
+        raw_issues.append({"severity": "critical", "category": "template_quality", "message": item})
+    for item in result.get("non_blocking_issues") or []:
+        raw_issues.append({"severity": "warning", "category": "template_quality", "message": item})
+    for item in raw_issues:
         row = dict(item or {})
         severity = str(row.get("severity") or "warning").lower()
         if severity not in {"critical", "warning", "info"}:
@@ -1118,11 +1393,16 @@ def _normalize_template_critique(result: Mapping[str, Any]) -> dict[str, Any]:
             prompt_repairs.append(repair)
         if len(prompt_repairs) >= 8:
             break
-    checks = dict(result.get("checks") or {})
-    passes = bool(result.get("passes")) and not any(issue["severity"] == "critical" for issue in issues)
+    checks = dict(result.get("checks") or result.get("qa_coverage") or {})
+    raw_passes = result.get("passes")
+    if raw_passes is None:
+        raw_passes = result.get("pass")
+    if raw_passes is None:
+        raw_passes = result.get("proceed_to_replacement")
+    passes = bool(raw_passes) and not any(issue["severity"] == "critical" for issue in issues)
     return {
         "passes": passes,
-        "summary": sanitize_public_text(str(result.get("summary") or "")).strip(),
+        "summary": sanitize_public_text(str(result.get("summary") or result.get("overall_assessment") or "")).strip(),
         "scores": scores,
         "issues": issues,
         "checks": {str(key): bool(value) for key, value in checks.items()},
@@ -1197,6 +1477,7 @@ def _normalize_figure_selection(
         row = dict(item)
         placeholder = placeholders[idx - 1] if idx - 1 < len(placeholders) else {}
         asset_name = str(row.get("asset") or placeholder.get("asset") or "")
+        asset_name = _resolve_selected_asset_name(row, asset_name, asset_index)
         if asset_name not in asset_index:
             raise RuntimeError(f"select_figures: LLM selected unknown asset {asset_name!r}")
         asset = asset_index.get(asset_name, {})
@@ -1238,6 +1519,38 @@ def _normalize_figure_selection(
         "deferred_assets": deferred,
         "selection_notes": [str(note) for note in result.get("selection_notes") or []],
     }
+
+
+def _resolve_selected_asset_name(row: Mapping[str, Any], asset_name: str, asset_index: Mapping[str, Mapping[str, Any]]) -> str:
+    source_path = str(row.get("source_path") or "").strip()
+    source_name = Path(source_path).name if source_path else ""
+    if not source_name or source_name not in asset_index or source_name == asset_name:
+        return asset_name
+    if asset_name not in asset_index:
+        return source_name
+    evidence = " ".join(
+        str(row.get(key) or "")
+        for key in ("label", "reason", "rationale", "role")
+    )
+    current_score = _asset_text_match_score(evidence, asset_index.get(asset_name, {}))
+    source_score = _asset_text_match_score(evidence, asset_index.get(source_name, {}))
+    return source_name if source_score > current_score else asset_name
+
+
+def _asset_text_match_score(text: str, asset: Mapping[str, Any]) -> int:
+    haystack = " ".join(str(asset.get(key) or "") for key in ("asset", "label", "caption", "name")).lower()
+    needles = set(re.findall(r"[a-z0-9_]+", str(text or "").lower()))
+    aliases = {
+        "limit": {"limit", "limits", "upper", "mixing", "vmn", "vmun", "mn", "mass"},
+        "distribution": {"distribution", "post", "fit", "sr", "cr", "background", "ht", "pt"},
+        "majorana": {"majorana", "heavy", "neutrino"},
+        "weinberg": {"weinberg", "operator"},
+        "diagram": {"diagram", "process", "vbf", "feynman"},
+    }
+    expanded = set(needles)
+    for token in list(needles):
+        expanded |= aliases.get(token, set())
+    return sum(1 for token in expanded if token and token in haystack)
 
 
 def _figure_selection_priority(item: Any) -> int:
@@ -1332,12 +1645,14 @@ def _normalize_placeholder_detection(
         placeholder_id = str(row.get("id") or normalize_placeholder_id(idx))
         bbox = _clamp_bbox(row.get("bbox"), width=width, height=height)
         seed = expected_index.get(placeholder_id, {})
+        confidence_raw = row.get("confidence")
+        confidence = float(confidence_raw) if confidence_raw is not None else (1.0 if any(bbox) else 0.0)
         normalized_placeholders.append(
             {
                 "id": placeholder_id,
                 "label": str(row.get("label") or seed.get("label") or placeholder_id),
                 "bbox": bbox,
-                "confidence": float(row.get("confidence") or 0.0),
+                "confidence": confidence,
                 "notes": [str(note) for note in row.get("notes") or []],
             }
         )

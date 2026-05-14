@@ -275,7 +275,92 @@ def poster_spec_schema() -> dict[str, Any]:
             "conclusion": {"type": "array", "items": {"type": "string"}},
             "closing": {"type": "string"},
             "storyboard": {"type": "object", "additionalProperties": True},
+            "content_outline": {"type": "object", "additionalProperties": True},
             "text_overlays": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        },
+    }
+
+
+def content_outline_schema() -> dict[str, Any]:
+    return {
+        "$schema": JSON_SCHEMA_DRAFT,
+        "type": "object",
+        "additionalProperties": True,
+        "required": [
+            "paper_type",
+            "dynamic_sections",
+            "high_density_facts",
+            "essential_formulas",
+            "figure_text_guidance",
+            "coverage_priorities",
+        ],
+        "properties": {
+            "paper_type": {"type": "string"},
+            "dynamic_sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["title", "purpose", "must_include_facts", "figure_links"],
+                    "properties": {
+                        "title": {"type": "string"},
+                        "purpose": {"type": "string"},
+                        "role": {"type": "string"},
+                        "must_include_facts": {"type": "array", "items": {"type": "string"}},
+                        "specialist_details": {"type": "array", "items": {"type": "string"}},
+                        "formulas": {"type": "array", "items": {"type": "string"}},
+                        "figure_links": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "high_density_facts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["fact", "section_hint", "priority", "evidence"],
+                    "properties": {
+                        "fact": {"type": "string"},
+                        "section_hint": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["must", "should", "could"]},
+                        "evidence": {"type": "string"},
+                        "render_as": {
+                            "type": "string",
+                            "enum": ["badge", "bullet", "callout", "figure_headline", "formula_chip", "region_matrix", "fit_chip"],
+                        },
+                    },
+                },
+            },
+            "essential_formulas": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["formula", "meaning", "priority", "evidence"],
+                    "properties": {
+                        "formula": {"type": "string"},
+                        "meaning": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["must", "should", "could"]},
+                        "evidence": {"type": "string"},
+                    },
+                },
+            },
+            "figure_text_guidance": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["asset", "communicates", "nearby_text", "priority"],
+                    "properties": {
+                        "asset": {"type": "string"},
+                        "communicates": {"type": "string"},
+                        "nearby_text": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["must", "should", "could"]},
+                        "simplify_text_about": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "coverage_priorities": {"type": "array", "items": {"type": "string"}},
         },
     }
 

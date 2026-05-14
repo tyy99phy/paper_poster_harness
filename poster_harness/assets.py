@@ -254,7 +254,11 @@ def apply_detections_to_spec(
     """Write detected placeholder boxes into ``spec['placements']``."""
     updated = copy.deepcopy(dict(spec))
     expected_ids = {_canonical_placeholder_id(p.get("id")) for p in updated.get("placeholders") or []}
-    placements: dict[str, list[int]] = dict(updated.get("placements") or {})
+    placements: dict[str, list[int]] = {
+        _canonical_placeholder_id(key): [int(round(v)) for v in value]
+        for key, value in dict(updated.get("placements") or {}).items()
+        if _valid_bbox(value)
+    }
     for item in detections.get("placeholders") or []:
         placeholder_id = _canonical_placeholder_id(item.get("id"))
         if expected_ids and placeholder_id not in expected_ids:

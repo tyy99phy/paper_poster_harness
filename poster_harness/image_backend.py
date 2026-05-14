@@ -83,9 +83,34 @@ def generate_images_from_config(
             proxy=account_cfg.get("proxy"),
         )
         return [item.path for item in results]
+    if backend in {"openai_responses", "openai_compatible", "openai_compatible_responses"}:
+        responses_cfg = dict(cfg_get(dict(config), "image_generation.openai_responses", {}) or {})
+        endpoint = (
+            responses_cfg.get("endpoint")
+            or cfg_get(dict(config), "image_generation.endpoint", None)
+            or responses_cfg.get("base_url")
+            or cfg_get(dict(config), "image_generation.base_url", None)
+        )
+        if endpoint and str(endpoint).rstrip("/").endswith("/v1"):
+            endpoint = str(endpoint).rstrip("/") + "/responses"
+        if not endpoint:
+            raise ImageBackendError("image_generation.openai_responses.endpoint is required for openai_responses backend")
+        results = generate_with_openai_responses(
+            prompt=prompt,
+            out_dir=out_dir,
+            basename=basename,
+            model=str(image_model),
+            size=str(image_size),
+            quality=str(image_quality),
+            n=variants,
+            endpoint=str(endpoint),
+            api_key_env=str(responses_cfg.get("api_key_env") or cfg_get(dict(config), "image_generation.api_key_env", "OPENAI_API_KEY")),
+            proxy=responses_cfg.get("proxy") or cfg_get(dict(config), "image_generation.proxy", None),
+        )
+        return [item.path for item in results]
 
     raise ImageBackendError(
-        f"unsupported image_generation.backend={backend!r}. Supported: chatgpt_account."
+        f"unsupported image_generation.backend={backend!r}. Supported: chatgpt_account, openai_responses."
     )
 
 
@@ -116,6 +141,36 @@ def generate_with_chatgpt_account(
     return transport.generate(
         prompt=prompt,
         auth=auth,
+        out_dir=Path(out_dir),
+        basename=basename,
+        model=model,
+        size=size,
+        quality=quality,
+        n=n,
+        max_retries=max_retries,
+    )
+
+
+def generate_with_openai_responses(
+    *,
+    prompt: str,
+    out_dir: str | Path,
+    basename: str,
+    model: str = "gpt-5.5",
+    size: str = "1024x1536",
+    quality: str = "high",
+    n: int = 1,
+    endpoint: str,
+    api_key_env: str = "OPENAI_API_KEY",
+    proxy: str | None = None,
+    max_retries: int = 1,
+) -> list[ImageResult]:
+    api_key = os.getenv(api_key_env, "")
+    if not api_key:
+        raise ImageBackendError(f"{api_key_env} is not set")
+    transport = OpenAIResponsesImageTransport(endpoint=endpoint, api_key=api_key, proxy=proxy)
+    return transport.generate(
+        prompt=prompt,
         out_dir=Path(out_dir),
         basename=basename,
         model=model,
@@ -215,6 +270,104 @@ class ChatGPTImageTransport:
             return list(iter_sse_events(response))
 
 
+class OpenAIResponsesImageTransport:
+    def __init__(self, *, endpoint: str, api_key: str, proxy: str | None = None):
+        self.endpoint = endpoint
+        self.api_key = api_key
+        self.proxy = proxy
+
+    def generate(
+        self,
+        *,
+        prompt: str,
+        out_dir: Path,
+        basename: str,
+        model: str,
+        size: str,
+        quality: str,
+        n: int,
+        max_retries: int = 1,
+    ) -> list[ImageResult]:
+        if size not in CODEX_VALID_SIZES:
+            raise ImageBackendError(
+                f"openai_responses backend size must be one of {sorted(CODEX_VALID_SIZES)}; got {size!r}."
+            )
+        if quality not in CODEX_VALID_QUALITIES:
+            raise ImageBackendError(f"quality must be one of {sorted(CODEX_VALID_QUALITIES)}; got {quality!r}")
+        if not 1 <= int(n) <= 4:
+            raise ImageBackendError("variants/n must be between 1 and 4 for openai_responses")
+        opener = self._opener()
+        all_results: list[ImageResult] = []
+        for index in range(int(n)):
+            per_call_base = basename if int(n) == 1 else f"{basename}-{index + 1}"
+            last_error: Exception | None = None
+            for attempt in range(max_retries + 1):
+                try:
+                    body = build_image_request_body(prompt=prompt, model=model, size=size, quality=quality)
+                    events = self._post_stream(opener=opener, body=body)
+                    started = time.time()
+                    results = parse_image_events(
+                        events,
+                        out_dir=out_dir,
+                        basename=per_call_base,
+                        model=model,
+                        size=size,
+                        quality=quality,
+                        started_at=started,
+                        completed_at=time.time(),
+                    )
+                    if not results:
+                        raise ImageBackendError("openai_responses streamed response did not contain an image_generation_call result")
+                    for item in results:
+                        item.index = index
+                    all_results.extend(results)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= max_retries:
+                        raise
+                    time.sleep(3 + attempt * 3)
+            else:  # pragma: no cover
+                assert last_error is not None
+                raise last_error
+        if not all_results:
+            raise ImageBackendError("openai_responses backend returned no image_generation_call result")
+        return all_results
+
+    def _opener(self):
+        proxy = self.proxy
+        if proxy is None:
+            proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+        handlers = []
+        if proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        return urllib.request.build_opener(*handlers)
+
+    def _post_stream(self, *, opener, body: Mapping[str, Any]) -> list[dict[str, Any]]:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "User-Agent": "poster-harness/0.1",
+        }
+        req = urllib.request.Request(self.endpoint, method="POST", data=json.dumps(dict(body)).encode("utf-8"), headers=headers)
+        try:
+            response = opener.open(req, timeout=SSE_READ_TIMEOUT_S)
+        except urllib.error.HTTPError as exc:
+            detail = (exc.read() or b"")[:2000].decode("utf-8", "replace")
+            raise ImageBackendError(f"openai_responses HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise ImageBackendError(f"openai_responses network error: {exc}") from exc
+        except socket.timeout as exc:
+            raise ImageBackendError("openai_responses connection timed out") from exc
+        with response:
+            content_type = response.headers.get("Content-Type", "")
+            if "text/event-stream" in content_type.lower():
+                return list(iter_sse_events(response))
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            return _response_payload_to_done_events(payload)
+
+
 def build_image_request_body(*, prompt: str, model: str, size: str, quality: str) -> dict[str, Any]:
     tool: dict[str, Any] = {"type": "image_generation", "quality": quality}
     if size != "auto":
@@ -267,6 +420,16 @@ def iter_sse_events(reader) -> Iterator[dict[str, Any]]:
                     continue
                 if isinstance(event, dict):
                     yield event
+
+
+def _response_payload_to_done_events(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    if payload.get("id"):
+        events.append({"type": "response.completed", "response": dict(payload)})
+    for item in payload.get("output", []) if isinstance(payload.get("output"), list) else []:
+        if isinstance(item, Mapping):
+            events.append({"type": "response.output_item.done", "item": dict(item)})
+    return events
 
 
 def parse_image_events(

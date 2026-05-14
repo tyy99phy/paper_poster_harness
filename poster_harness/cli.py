@@ -20,6 +20,7 @@ from .config import (
     cfg_get,
     load_config,
     dump_config,
+    load_autoposter_config,
     load_harness_config,
     write_default_harness_config,
 )
@@ -31,12 +32,13 @@ from .micro_repair import apply_micro_repairs
 from .prompt import build_prompt, sanitize_public_text
 from .replace import audit_generated_placeholder_geometry, audit_figure_containment, normalize_placeholder_geometry, replace_placeholders, upscale_image
 from .image_backend import generate_images_from_config
-from .llm import ChatGPTAccountResponsesProvider
+from .llm import ChatGPTAccountResponsesProvider, OpenAICompatibleResponsesProvider
 from .llm_stages import (
     copy_deck_from_text,
     critique_poster_template,
     detect_placeholders_from_image,
     draft_spec_from_text,
+    paper_content_outline_from_text,
     physics_quiz_from_text,
     qa_poster,
     select_figures,
@@ -262,6 +264,22 @@ def cmd_llm_storyboard(args: argparse.Namespace) -> None:
     print(args.out)
 
 
+def cmd_llm_content_outline(args: argparse.Namespace) -> None:
+    text = _read_text_file(args.text)
+    envelope = paper_content_outline_from_text(
+        text,
+        assets_manifest=_load_optional_config(args.assets_manifest),
+        provider=_llm_provider(args),
+        project_overrides=_load_mapping_arg(args.project_json, root_key="project"),
+        max_sections=args.max_sections,
+        max_facts=args.max_facts,
+        max_formulas=args.max_formulas,
+        extra_instructions=args.extra_instructions or "",
+    )
+    _dump_llm_result(envelope, args.out)
+    print(args.out)
+
+
 def cmd_llm_select_figures(args: argparse.Namespace) -> None:
     text = _read_text_file(args.text)
     spec = _load_spec_arg(args.spec) if args.spec else None
@@ -337,7 +355,7 @@ def cmd_llm_rewrite_flowcharts(args: argparse.Namespace) -> None:
 
 
 def cmd_autoposter(args: argparse.Namespace) -> None:
-    config = load_harness_config(args.config)
+    config = load_autoposter_config(args.config, content_mode=getattr(args, "content_mode", None))
     provider = _provider_from_config(config, model=args.model or cfg_get(config, "llm.model", DEFAULT_MODEL))
     resolution: dict[str, Any] | None = None
     arxiv_bundle = None
@@ -435,6 +453,41 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
 
     style_name = args.style or cfg_get(config, "autoposter.style", "generic")
     project_overrides, style_overrides, spec_extras = _style_preset(style_name, config)
+
+    content_outline: dict[str, Any] | None = None
+    content_outline_path: Path | None = None
+    outline_cfg = cfg_get(config, "autoposter.content_outline", {})
+    outline_enabled = True
+    outline_extra = ""
+    outline_max_sections = int(cfg_get(config, "autoposter.content_outline.max_sections", 6) or 6)
+    outline_max_facts = int(cfg_get(config, "autoposter.content_outline.max_facts", 28) or 28)
+    outline_max_formulas = int(cfg_get(config, "autoposter.content_outline.max_formulas", 6) or 6)
+    if isinstance(outline_cfg, Mapping):
+        outline_enabled = bool(outline_cfg.get("enabled", True))
+        outline_extra = str(outline_cfg.get("extra_instructions") or "")
+        outline_max_sections = int(outline_cfg.get("max_sections") or outline_max_sections)
+        outline_max_facts = int(outline_cfg.get("max_facts") or outline_max_facts)
+        outline_max_formulas = int(outline_cfg.get("max_formulas") or outline_max_formulas)
+    elif outline_cfg is not None:
+        outline_enabled = bool(outline_cfg)
+    if outline_enabled:
+        outline_envelope = _call_llm_stage_with_retries(
+            "paper_content_outline_from_text",
+            config,
+            paper_content_outline_from_text,
+            text,
+            assets_manifest=assets_manifest,
+            provider=provider,
+            project_overrides=project_overrides,
+            max_sections=outline_max_sections,
+            max_facts=outline_max_facts,
+            max_formulas=outline_max_formulas,
+            extra_instructions=outline_extra,
+        )
+        content_outline = dict(outline_envelope["result"])
+        content_outline_path = dirs["specs"] / "content_outline.yaml"
+        dump_config(content_outline, content_outline_path)
+
     draft_envelope = _call_llm_stage_with_retries(
         "draft_spec_from_text",
         config,
@@ -444,6 +497,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         provider=provider,
         project_overrides=project_overrides,
         style_overrides=style_overrides,
+        content_outline=content_outline,
     )
     draft_spec = _apply_spec_extras(dict(draft_envelope["result"]), spec_extras)
     draft_spec_path = dirs["specs"] / "poster_spec.draft.yaml"
@@ -467,6 +521,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             text,
             assets_manifest=assets_manifest,
             spec=draft_spec,
+            content_outline=content_outline,
             provider=provider,
             extra_instructions=storyboard_extra,
         )
@@ -474,6 +529,8 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         storyboard_path = dirs["specs"] / "storyboard.yaml"
         dump_config(storyboard, storyboard_path)
         draft_spec["storyboard"] = storyboard
+    if content_outline:
+        draft_spec["content_outline"] = content_outline
 
     physics_quiz: dict[str, Any] | None = None
     physics_quiz_path: Path | None = None
@@ -496,6 +553,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             assets_manifest=assets_manifest,
             spec=draft_spec,
             storyboard=storyboard,
+            content_outline=content_outline,
             provider=provider,
             max_questions=quiz_max,
             extra_instructions=quiz_extra,
@@ -513,6 +571,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         assets_manifest,
         spec=draft_spec,
         storyboard=storyboard,
+        content_outline=content_outline,
         provider=provider,
         max_figures=_opt(args.max_figures, config, "autoposter.max_figures", None),
         extra_instructions=str(cfg_get(config, "autoposter.figure_layout_policy", "") or ""),
@@ -530,6 +589,8 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         final_spec["storyboard"] = storyboard
     if physics_quiz:
         final_spec["physics_quiz"] = physics_quiz
+    if content_outline:
+        final_spec["content_outline"] = content_outline
     final_spec = _apply_spec_extras(final_spec, spec_extras)
     copy_deck: dict[str, Any] | None = None
     copy_deck_path: Path | None = None
@@ -554,6 +615,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             storyboard=storyboard,
             physics_quiz=physics_quiz,
             figure_selection=figure_selection,
+            content_outline=content_outline,
             provider=provider,
             max_units=copy_max,
             extra_instructions=copy_extra,
@@ -609,6 +671,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         "paper": str(paper),
         "out": str(root),
         "style": style_name,
+        "content_mode": str(cfg_get(config, "autoposter.content_mode", "standard")),
         "config": str(args.config) if args.config else "",
         "arxiv": resolution or {},
         "arxiv_bundle": {
@@ -619,6 +682,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         "text_source": str(text_source),
         "source_roots": [str(p) for p in source_roots],
         "assets_manifest": str(assets_manifest_path),
+        "content_outline": str(content_outline_path) if content_outline_path else "",
         "draft_spec": str(draft_spec_path),
         "storyboard": str(storyboard_path) if storyboard_path else "",
         "physics_quiz": str(physics_quiz_path) if physics_quiz_path else "",
@@ -1216,6 +1280,27 @@ def _provider_from_config(config: Mapping[str, Any], *, model: str | None = None
             min_token_seconds=int(account_cfg.get("min_token_seconds") or 60),
             proxy=str(account_cfg.get("proxy") or "") or None,
         )
+    if backend in {"openai_responses", "openai_compatible", "openai_compatible_responses"}:
+        responses_cfg = dict(cfg_get(cfg, "llm.openai_responses", {}) or {})
+        endpoint = (
+            responses_cfg.get("endpoint")
+            or cfg_get(cfg, "llm.endpoint", None)
+            or responses_cfg.get("base_url")
+            or cfg_get(cfg, "llm.base_url", None)
+        )
+        if endpoint and str(endpoint).rstrip("/").endswith("/v1"):
+            endpoint = str(endpoint).rstrip("/") + "/responses"
+        if not endpoint:
+            raise RuntimeError("llm.openai_responses.endpoint or llm.endpoint is required for openai_responses backend")
+        return OpenAICompatibleResponsesProvider(
+            endpoint=str(endpoint),
+            model=str(llm_model),
+            api_key_env=str(responses_cfg.get("api_key_env") or cfg_get(cfg, "llm.api_key_env", "OPENAI_API_KEY")),
+            response_format=str(responses_cfg.get("response_format") or cfg_get(cfg, "llm.response_format", "json_schema")),
+            reasoning_effort=str(responses_cfg.get("reasoning_effort") or cfg_get(cfg, "llm.reasoning_effort", "") or "") or None,
+            timeout=timeout,
+            proxy=str(responses_cfg.get("proxy") or cfg_get(cfg, "llm.proxy", "") or "") or None,
+        )
 
     raise RuntimeError(f"unsupported llm.backend={backend!r}. Supported: chatgpt_account")
 
@@ -1666,6 +1751,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--config")
     p.set_defaults(func=cmd_llm_draft_spec)
 
+    p = sub.add_parser("llm-content-outline", help="draft a P2P-style high-density content outline from source text")
+    p.add_argument("--text", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--assets-manifest")
+    p.add_argument("--project-json")
+    p.add_argument("--max-sections", type=int)
+    p.add_argument("--max-facts", type=int)
+    p.add_argument("--max-formulas", type=int)
+    p.add_argument("--extra-instructions")
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--config")
+    p.set_defaults(func=cmd_llm_content_outline)
+
     p = sub.add_parser("llm-storyboard", help="draft a structured storyboard from source text and assets")
     p.add_argument("--text", required=True)
     p.add_argument("--out", required=True)
@@ -1739,6 +1837,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", help="run directory; defaults to config paths.runs_dir plus paper/arXiv id")
     p.add_argument("--assets-dir", action="append", default=[], help="extra directory of real figure assets; can be repeated")
     p.add_argument("--style", help="style preset from config, e.g. cms-hep or generic")
+    p.add_argument(
+        "--content-mode",
+        help=(
+            "content planning mode: standard (default/main-compatible) or hep_dense "
+            "(optional regen2/P2P-style higher information density; aliases: dense, regen2)"
+        ),
+    )
     p.add_argument("--variants", type=int, help="number of image-generation variants")
     p.add_argument("--poster-sets", type=int, help="number of strict-QA poster sets to collect; default 2")
     p.add_argument("--max-figures", type=int)

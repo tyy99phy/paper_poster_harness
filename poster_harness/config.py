@@ -101,6 +101,14 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
         },
         "pdf_render_dpi": 220,
         "max_pages": 12,
+        "content_mode": "standard",
+        "content_outline": {
+            "enabled": False,
+            "max_sections": 6,
+            "max_facts": 28,
+            "max_formulas": 6,
+            "extra_instructions": "",
+        },
         "storyboard": {
             "enabled": True,
             "extra_instructions": "",
@@ -126,6 +134,86 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
             "Readability should come from allocating more absolute area, using wider/taller surrounding cards, "
             "or changing the card layout while preserving the source figure ratio."
         ),
+    },
+    "content_modes": {
+        "standard": {
+            # Default/main-compatible route: keep the established prompt and stage graph.
+            "autoposter": {
+                "content_mode": "standard",
+                "content_outline": {"enabled": False},
+                "copy_deck": {"max_units": 34, "extra_instructions": ""},
+            },
+        },
+        "hep_dense": {
+            # Optional high-information-density expert HEP route inspired by the
+            # successful regen2/P2P-density experiments.  This deliberately does
+            # not replace the default route.
+            "autoposter": {
+                "content_mode": "hep_dense",
+                "content_outline": {
+                    "enabled": True,
+                    "max_sections": 6,
+                    "max_facts": 30,
+                    "max_formulas": 6,
+                    "extra_instructions": (
+                        "Increase useful information density through paper-specific facts and smaller text tiers, "
+                        "not by reducing whitespace, shrinking placeholders, or adding generic HEP boilerplate."
+                    ),
+                },
+                "copy_deck": {
+                    "enabled": True,
+                    "max_units": 42,
+                    "extra_instructions": (
+                        "Prefer denser but still legible microcopy: preserve current generous whitespace and figure sizes, "
+                        "but use smaller body/badge tiers for should/could units so more paper-specific facts survive."
+                    ),
+                },
+                "physics_quiz": {
+                    "enabled": True,
+                    "max_questions": 20,
+                },
+            },
+            "styles": {
+                "generic": {
+                    "style": {
+                        "information_density": (
+                            "Paper2Poster-rich editorial density without reducing whitespace: 18-30 concise public information units across the poster, "
+                            "4-8 grounded fact badges, 4-6 section modules, and one compact conclusion strip. "
+                            "Use a controlled smaller text tier for optional bullets/badges/micro-callouts, while keeping must-level facts clearly legible. "
+                            "Prefer short claims and fact chips over paragraphs; omit lower-priority facts before sacrificing legibility or placeholder geometry."
+                        ),
+                        "text_density": [
+                            "Compress prose into poster bullets: short noun phrases, ideally under 11 words each.",
+                            "Maintain Paper2Poster-style information richness through smaller but legible body/badge tiers, not through crowded layouts or reduced whitespace.",
+                            "Use three text scales: primary claims readable at a glance, compact bullets for specialist detail, and micro-badges for optional should/could facts.",
+                            "Avoid microscopic paragraphs, footnote blocks, dense equations, and reference lists in the rendered poster.",
+                            "Prefer 2-5 bullets/fact chips per non-hero card and at most one short sentence per text block; preserve meaning without adding new science.",
+                            "Use public fact chips and numeric badges for explicitly grounded dataset/result facts; do not invent numbers.",
+                            "If text competes with a result figure, shrink or omit lower-priority text first and enlarge/preserve the figure placeholder.",
+                        ],
+                    },
+                },
+                "cms-hep": {
+                    "style": {
+                        "information_density": (
+                            "Paper2Poster-rich HEP density without reducing whitespace: preserve enough public facts for a viewer to answer what was measured/searched, "
+                            "which dataset/channel/strategy was used, what the headline result says, and which figures support it. "
+                            "Use 18-28 short bullets/fact chips total plus 4-8 grounded badges; increase density through a smaller but still legible specialist-detail tier, "
+                            "never by shrinking figure placeholders, flattening the layout, or inventing CMS numbers."
+                        ),
+                        "text_density": [
+                            "Compress prose into HEP poster microcopy: short noun phrases, ideally under 11 words each.",
+                            "Maintain Paper2Poster-style information richness through smaller but legible specialist-detail text, not through crowded layouts or reduced whitespace.",
+                            "Use three text scales: large must-level result/method claims, compact bullets for SR/CR/fit details, and micro-badges for optional uncertainties or category labels.",
+                            "For HEP experts, prefer concrete SR/CR, fit, selection, and uncertainty chips over generic analysis prose.",
+                            "Avoid paragraphs, footnote blocks, dense equations, reference lists, and tiny illegible tables.",
+                            "Use public fact chips and numeric badges only for explicitly grounded luminosity, energy, channel, mass/limit, or CL facts.",
+                            "If text competes with a result figure, omit could-priority units before shrinking placeholders or reducing gutters.",
+                        ],
+                    },
+                },
+            },
+        },
     },
     "arxiv": {
         "enabled": True,
@@ -300,6 +388,67 @@ def load_harness_config(path: str | Path | None = None) -> dict[str, Any]:
     if config_path:
         config = deep_merge(config, load_config(config_path))
     return config
+
+
+def load_autoposter_config(path: str | Path | None = None, *, content_mode: str | None = None) -> dict[str, Any]:
+    """Load config for the one-command autoposter pipeline and apply a content mode.
+
+    Mode overlays are applied between built-in defaults and user overrides:
+
+    1. start from the built-in standard/main-compatible defaults;
+    2. apply the selected mode's overlay (for example ``hep_dense``);
+    3. merge the user's config file on top so explicit local overrides still win;
+    4. apply a CLI ``--content-mode`` override last when provided.
+
+    This keeps the default route identical to ``standard`` while making the
+    regen2/P2P-density behavior opt-in instead of silently changing main.
+    """
+    base = copy.deepcopy(DEFAULT_HARNESS_CONFIG)
+    config_path = path or os.getenv("POSTER_HARNESS_CONFIG")
+    user_config = load_config(config_path) if config_path else {}
+    requested_mode = (
+        content_mode
+        or cfg_get(user_config, "autoposter.content_mode")
+        or cfg_get(base, "autoposter.content_mode", "standard")
+    )
+    config = apply_content_mode(base, requested_mode)
+    if user_config:
+        config = deep_merge(config, user_config)
+    if content_mode:
+        config = apply_content_mode(config, content_mode)
+    else:
+        # Normalize aliases even when the mode came from the config file.
+        normalized = normalize_content_mode(str(cfg_get(config, "autoposter.content_mode", requested_mode)))
+        config.setdefault("autoposter", {})["content_mode"] = normalized
+    return config
+
+
+def normalize_content_mode(mode: str | None) -> str:
+    normalized = (mode or "standard").strip().lower().replace("-", "_")
+    aliases = {
+        "": "standard",
+        "default": "standard",
+        "main": "standard",
+        "stable": "standard",
+        "standard": "standard",
+        "dense": "hep_dense",
+        "hep_dense": "hep_dense",
+        "p2p_dense": "hep_dense",
+        "p2p_content_density": "hep_dense",
+        "regen2": "hep_dense",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def apply_content_mode(config: dict[str, Any], mode: str | None) -> dict[str, Any]:
+    normalized = normalize_content_mode(mode)
+    modes = config.get("content_modes") or {}
+    if normalized not in modes:
+        available = ", ".join(sorted(str(key) for key in modes)) or "(none)"
+        raise ValueError(f"unknown content_mode '{mode}'; available modes: {available}")
+    merged = deep_merge(config, modes[normalized])
+    merged.setdefault("autoposter", {})["content_mode"] = normalized
+    return merged
 
 
 def write_default_harness_config(path: str | Path) -> None:

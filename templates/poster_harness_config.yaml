@@ -77,6 +77,13 @@ autoposter:
     extra_instructions: ''
   pdf_render_dpi: 220
   max_pages: 12
+  content_mode: standard
+  content_outline:
+    enabled: false
+    max_sections: 6
+    max_facts: 28
+    max_formulas: 6
+    extra_instructions: ''
   storyboard:
     enabled: true
     extra_instructions: ''
@@ -97,6 +104,85 @@ autoposter:
     into arbitrary poster ratios. Readability should come from allocating more absolute
     area, using wider/taller surrounding cards, or changing the card layout while
     preserving the source figure ratio.
+content_modes:
+  standard:
+    autoposter:
+      content_mode: standard
+      content_outline:
+        enabled: false
+      copy_deck:
+        max_units: 34
+        extra_instructions: ''
+  hep_dense:
+    autoposter:
+      content_mode: hep_dense
+      content_outline:
+        enabled: true
+        max_sections: 6
+        max_facts: 30
+        max_formulas: 6
+        extra_instructions: Increase useful information density through paper-specific
+          facts and smaller text tiers, not by reducing whitespace, shrinking placeholders,
+          or adding generic HEP boilerplate.
+      copy_deck:
+        enabled: true
+        max_units: 42
+        extra_instructions: 'Prefer denser but still legible microcopy: preserve current
+          generous whitespace and figure sizes, but use smaller body/badge tiers for
+          should/could units so more paper-specific facts survive.'
+      physics_quiz:
+        enabled: true
+        max_questions: 20
+    styles:
+      generic:
+        style:
+          information_density: 'Paper2Poster-rich editorial density without reducing
+            whitespace: 18-30 concise public information units across the poster,
+            4-8 grounded fact badges, 4-6 section modules, and one compact conclusion
+            strip. Use a controlled smaller text tier for optional bullets/badges/micro-callouts,
+            while keeping must-level facts clearly legible. Prefer short claims and
+            fact chips over paragraphs; omit lower-priority facts before sacrificing
+            legibility or placeholder geometry.'
+          text_density:
+          - 'Compress prose into poster bullets: short noun phrases, ideally under
+            11 words each.'
+          - Maintain Paper2Poster-style information richness through smaller but legible
+            body/badge tiers, not through crowded layouts or reduced whitespace.
+          - 'Use three text scales: primary claims readable at a glance, compact bullets
+            for specialist detail, and micro-badges for optional should/could facts.'
+          - Avoid microscopic paragraphs, footnote blocks, dense equations, and reference
+            lists in the rendered poster.
+          - Prefer 2-5 bullets/fact chips per non-hero card and at most one short
+            sentence per text block; preserve meaning without adding new science.
+          - Use public fact chips and numeric badges for explicitly grounded dataset/result
+            facts; do not invent numbers.
+          - If text competes with a result figure, shrink or omit lower-priority text
+            first and enlarge/preserve the figure placeholder.
+      cms-hep:
+        style:
+          information_density: 'Paper2Poster-rich HEP density without reducing whitespace:
+            preserve enough public facts for a viewer to answer what was measured/searched,
+            which dataset/channel/strategy was used, what the headline result says,
+            and which figures support it. Use 18-28 short bullets/fact chips total
+            plus 4-8 grounded badges; increase density through a smaller but still
+            legible specialist-detail tier, never by shrinking figure placeholders,
+            flattening the layout, or inventing CMS numbers.'
+          text_density:
+          - 'Compress prose into HEP poster microcopy: short noun phrases, ideally
+            under 11 words each.'
+          - Maintain Paper2Poster-style information richness through smaller but legible
+            specialist-detail text, not through crowded layouts or reduced whitespace.
+          - 'Use three text scales: large must-level result/method claims, compact
+            bullets for SR/CR/fit details, and micro-badges for optional uncertainties
+            or category labels.'
+          - For HEP experts, prefer concrete SR/CR, fit, selection, and uncertainty
+            chips over generic analysis prose.
+          - Avoid paragraphs, footnote blocks, dense equations, reference lists, and
+            tiny illegible tables.
+          - Use public fact chips and numeric badges only for explicitly grounded
+            luminosity, energy, channel, mass/limit, or CL facts.
+          - If text competes with a result figure, omit could-priority units before
+            shrinking placeholders or reducing gutters.
 arxiv:
   enabled: true
   download_source: true

@@ -69,6 +69,40 @@ def test_prompt_includes_hep_poster_grammar_and_density_rules():
     assert "one dominant hero region" in prompt
     assert "Do not put physics symbols" in prompt
     assert "particle-labeled icons" in prompt
+    assert "smaller but still legible text tiers" in prompt
+    assert "Preserve the current generous editorial whitespace" in prompt
+
+
+def test_prompt_includes_content_outline_density_guidance():
+    spec = {
+        "project": {"title": "T", "topic": "T"},
+        "style": {},
+        "sections": [],
+        "placeholders": [],
+        "conclusion": [],
+        "content_outline": {
+            "paper_type": "hep_result_paper",
+            "dynamic_sections": [
+                {
+                    "title": "SR/CR fit model",
+                    "purpose": "Explain the simultaneous fit",
+                    "specialist_details": ["WZ CR constrains normalization", "CLs profile likelihood"],
+                }
+            ],
+            "high_density_facts": [
+                {"fact": "SR binned in pTmiss", "priority": "must", "render_as": "fit_chip", "section_hint": "strategy"}
+            ],
+            "essential_formulas": [{"formula": "|V_muN|^2", "meaning": "mixing parameter", "priority": "should"}],
+            "figure_text_guidance": [{"asset": "limit.png", "nearby_text": "Observed and expected 95% CL limit", "priority": "must"}],
+            "coverage_priorities": ["dataset/channel/fit/result coverage"],
+        },
+    }
+    prompt = build_prompt(spec)
+    assert "P2P-STYLE CONTENT OUTLINE" in prompt
+    assert "SR/CR fit model" in prompt
+    assert "SR binned in pTmiss" in prompt
+    assert "Observed and expected 95% CL limit" in prompt
+    assert "evidence is internal" in prompt
 
 
 def test_placeholder_reference_list_keeps_source_aspect_without_pixel_blueprint():

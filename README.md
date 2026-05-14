@@ -21,14 +21,21 @@ pip install -e .
 # 2. 登录 ChatGPT 账号（打开浏览器完成 OAuth）
 poster-harness init-config --out poster_harness.yaml --login
 
-# 3. 从 arXiv 论文一键生成海报
+# 3. 从 arXiv 论文一键生成海报（默认 standard 稳定流程）
 poster-harness autoposter \
   --config poster_harness.yaml \
   --arxiv-id 2206.08956 \
   --out runs/my-poster
+
+# 可选：启用 hep_dense 高信息密度模式
+poster-harness autoposter \
+  --config poster_harness.yaml \
+  --arxiv-id 2206.08956 \
+  --content-mode hep_dense \
+  --out runs/my-poster-dense
 ```
 
-跑完后在 `runs/my-poster/exports/` 下找最终海报。
+跑完后在对应 `--out` 目录的 `exports/` 下找最终海报。
 
 ## 为什么是"占位符优先"
 
@@ -49,8 +56,10 @@ AI 图片模型有一个致命问题：它会"发明"看起来很专业的科学
 ```text
 arXiv / 本地论文
   → 提取文本 + 图片素材
+  → 可选 hep_dense：LLM 生成 paper content outline（专业事实、SR/CR、fit、systematics、figure-nearby text）
   → LLM 起草 poster_spec（包含版式描述、章节、占位符规格）
   → LLM 生成 storyboard（叙事主线、阅读顺序、图文角色、读者问题、信息密度计划）
+  → LLM 生成 physics quiz / copy deck（控制海报应回答的问题和可见文案）
   → LLM 从素材中挑选最有价值的图片，分配给 [FIG 01]、[FIG 02] ...
   → 组装完整 prompt，发给生图模型
   → 生图模型画海报（只含空白占位符，不画科学内容）
@@ -72,7 +81,7 @@ arXiv / 本地论文
 
 ```yaml
 llm:
-  backend: chatgpt_account    # 目前唯一支持的后端
+  backend: chatgpt_account    # 默认后端：本地 ChatGPT 账号认证 JSON
   model: gpt-5.5
   timeout: 180
   account:
@@ -107,7 +116,7 @@ autoposter:
   template_critic:
     enabled: true
     require_pass: true
-    max_regen_rounds: 1
+    max_regen_rounds: 2
     min_overall_score: 0.72
     min_artistry_score: 0.65
     min_information_density_score: 0.65
@@ -127,6 +136,39 @@ autoposter:
 - **`generic`**：通用学术海报风格
 
 可以在 `styles` 段下自定义或添加新的样式预设。
+
+### 内容密度模式
+
+框架现在把稳定路线和高信息密度路线明确分开：
+
+| 模式 | 默认 | 特点 | 适用场景 |
+|------|------|------|----------|
+| `standard` | 是 | 保持 main 原有稳定流程；不启用额外 content outline；信息量适中、速度较快 | 日常批量生成、追求稳定 |
+| `hep_dense` | 否 | 启用 paper content outline；提高 copy deck 容量；更强调 SR/CR、selection、fit strategy、systematics、limits 等 HEP 专家信息 | 需要更像 `regen2` 的高信息密度专业海报 |
+
+配置文件默认值：
+
+```yaml
+autoposter:
+  content_mode: standard
+```
+
+命令行临时启用高密度模式：
+
+```bash
+poster-harness autoposter --config poster_harness.yaml \
+  --arxiv-id 2206.08956 \
+  --content-mode hep_dense
+```
+
+也可以写进配置：
+
+```yaml
+autoposter:
+  content_mode: hep_dense
+```
+
+注意：`hep_dense` 是 opt-in，不会改变默认 `standard` / main 流程。
 
 ## 使用方式
 
