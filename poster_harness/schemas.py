@@ -39,50 +39,50 @@ def default_poster_spec(title: str = "Untitled Scientific Poster") -> dict[str, 
             "audience": "academic conference audience",
         },
         "style": {
-            "summary": "premium CERN/LHCC-inspired scientific poster, modern editorial HEP design, artistic but readable, not a collage",
+            "summary": "premium scientific conference poster, modern editorial design, artistic but readable, not a collage",
             "aspect": "A0 vertical / 2:3 ratio",
-            "top_band": "strong dark title banner with concise identity text and abstract detector/beam artwork",
+            "top_band": "strong title banner with concise identity text and abstract field-appropriate scientific artwork",
             "body_layout": "4-6 large numbered modules with one dominant result region, generous gutters, varied card shapes, and light paper-like figure cards",
-            "color_grammar": "primary result = blue; secondary result = warm red; use consistently; all figure surfaces remain warm-white or very pale neutral",
+            "color_grammar": "one primary accent color for headline results and one secondary accent color for contrasts; all figure surfaces remain warm-white or very pale neutral",
             "typography": "modern editorial sans-serif with bold title, crisp section headers, compact readable bullets, and disciplined type scale",
-            "color_palette": "deep indigo atmosphere, blue/violet/gold accents, and warm-white content/figure cards",
+            "color_palette": "deep indigo or graphite atmosphere, restrained accent colors, and warm-white content/figure cards",
             "figure_surface": "every scientific figure placeholder sits on a warm-white, pearl, or very pale neutral card/mat, never on a dark content block",
         },
         "forbidden_phrases": list(DEFAULT_FORBIDDEN_PHRASES),
         "sections": [
             {
                 "id": 1,
-                "title": "Motivation and physics target",
+                "title": "Motivation and research question",
                 "layout": "upper full-width, 3 columns",
                 "text": [
                     {
                         "title": "Motivation",
-                        "body": ["Summarize the central physics motivation in 1–2 public sentences."],
+                        "body": ["Summarize the central research motivation in 1–2 public sentences."],
                         "bullets": [],
                     }
                 ],
             },
             {
                 "id": 2,
-                "title": "Analysis strategy",
+                "title": "Method and study design",
                 "layout": "large middle card",
                 "text": [
                     {
                         "title": "Method",
-                        "body": ["Summarize the method, object selection, reconstruction, or experimental strategy."],
+                        "body": ["Summarize the method, dataset/sample, model, assay, or experimental strategy."],
                         "bullets": [],
                     }
                 ],
-                "flowchart": ["Use a clean vector flowchart for the main analysis logic if applicable."],
+                "flowchart": ["Use a compact paper-specific method schematic if applicable."],
             },
             {
                 "id": 3,
-                "title": "Samples and background estimation",
+                "title": "Evidence and validation",
                 "layout": "lower-left card",
                 "text": [
                     {
                         "title": "Inputs",
-                        "body": ["Describe datasets, simulation, controls, or background estimates."],
+                        "body": ["Describe datasets, samples, controls, baselines, simulations, or validation evidence."],
                         "bullets": [],
                     }
                 ],
@@ -101,7 +101,7 @@ def default_poster_spec(title: str = "Untitled Scientific Poster") -> dict[str, 
             },
             {
                 "id": 5,
-                "title": "Summary and prospects",
+                "title": "Summary and implications",
                 "layout": "bottom full-width card",
                 "text": [
                     {
@@ -114,9 +114,9 @@ def default_poster_spec(title: str = "Untitled Scientific Poster") -> dict[str, 
         ],
         "placeholders": [
             {"id": "FIG 01", "section": 1, "label": "Motivation/context figure", "aspect": "2:1 wide", "asset": "fig01.png"},
-            {"id": "FIG 02", "section": 1, "label": "Signal or process diagram", "aspect": "4:3", "asset": "fig02.png"},
-            {"id": "FIG 03", "section": 3, "label": "Samples/table or method sketch", "aspect": "4:3", "asset": "fig03.png"},
-            {"id": "FIG 04", "section": 3, "label": "Background/method figure", "aspect": "2.4:1 wide", "asset": "fig04.png"},
+            {"id": "FIG 02", "section": 2, "label": "Method or process diagram", "aspect": "4:3", "asset": "fig02.png"},
+            {"id": "FIG 03", "section": 3, "label": "Dataset/sample/table or validation figure", "aspect": "4:3", "asset": "fig03.png"},
+            {"id": "FIG 04", "section": 3, "label": "Supporting evidence or method figure", "aspect": "2.4:1 wide", "asset": "fig04.png"},
             {"id": "FIG 05", "section": 4, "label": "Key result A", "aspect": "1:1 square", "asset": "fig05.png"},
             {"id": "FIG 06", "section": 4, "label": "Key result B", "aspect": "1:1 square", "asset": "fig06.png"},
             {"id": "FIG 07", "section": 5, "label": "Diagnostic/result C", "aspect": "1:1 square", "asset": "fig07.png"},
@@ -126,7 +126,7 @@ def default_poster_spec(title: str = "Untitled Scientific Poster") -> dict[str, 
         "conclusion": [
             "State the main public result in one sentence.",
             "State the robustness or validation message in one sentence.",
-            "State future physics prospects in one sentence.",
+            "State future research prospects in one sentence.",
         ],
         "closing": "Thank you for your attention!",
     }
@@ -276,7 +276,40 @@ def poster_spec_schema() -> dict[str, Any]:
             "closing": {"type": "string"},
             "storyboard": {"type": "object", "additionalProperties": True},
             "content_outline": {"type": "object", "additionalProperties": True},
+            "domain_profile": {"type": "object", "additionalProperties": True},
             "text_overlays": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        },
+    }
+
+
+def domain_profile_schema() -> dict[str, Any]:
+    return {
+        "$schema": JSON_SCHEMA_DRAFT,
+        "type": "object",
+        "additionalProperties": True,
+        "required": [
+            "domain_label",
+            "domain_profile",
+            "confidence",
+            "rationale",
+            "visual_grammar",
+            "figure_types",
+            "layout_priorities",
+            "text_priorities",
+            "cautionary_rules",
+        ],
+        "properties": {
+            "domain_label": {"type": "string"},
+            "domain_profile": {"type": "string"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "arxiv_categories": {"type": "array", "items": {"type": "string"}},
+            "rationale": {"type": "string"},
+            "visual_grammar": {"type": "array", "items": {"type": "string"}},
+            "figure_types": {"type": "array", "items": {"type": "string"}},
+            "layout_priorities": {"type": "array", "items": {"type": "string"}},
+            "text_priorities": {"type": "array", "items": {"type": "string"}},
+            "cautionary_rules": {"type": "array", "items": {"type": "string"}},
+            "suggested_style": {"type": "string"},
         },
     }
 
@@ -663,6 +696,55 @@ def poster_qa_schema() -> dict[str, Any]:
                 },
             },
             "recommended_repairs": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
+def micro_repair_plan_schema() -> dict[str, Any]:
+    return {
+        "$schema": JSON_SCHEMA_DRAFT,
+        "type": "object",
+        "additionalProperties": True,
+        "required": ["repairs", "summary", "unsafe_to_repair"],
+        "properties": {
+            "summary": {"type": "string"},
+            "unsafe_to_repair": {"type": "boolean"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "repairs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "required": ["id", "type", "box", "text"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "type": {"type": "string", "enum": ["text_patch", "text_box", "glyph_patch"]},
+                        "box": {
+                            "type": "array",
+                            "minItems": 4,
+                            "maxItems": 4,
+                            "items": {"type": "integer"},
+                        },
+                        "text": {"type": "string"},
+                        "lines": {"type": "array", "items": {"type": "string"}},
+                        "font_size": {"type": "number"},
+                        "font_style": {"type": "string"},
+                        "color": {"type": "array", "items": {"type": "integer"}},
+                        "fill": {"type": "array", "items": {"type": "integer"}},
+                        "fill_prefer": {"type": "string"},
+                        "erase": {"type": "string"},
+                        "padding": {
+                            "anyOf": [
+                                {"type": "number"},
+                                {"type": "array", "items": {"type": "number"}},
+                            ]
+                        },
+                        "align": {"type": "string"},
+                        "wrap": {"type": "boolean"},
+                        "rationale": {"type": "string"},
+                    },
+                },
+            },
         },
     }
 

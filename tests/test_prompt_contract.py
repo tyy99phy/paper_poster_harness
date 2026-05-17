@@ -53,7 +53,18 @@ def test_prompt_marks_flowchart_items_as_node_labels_not_instruction_text():
 def test_prompt_includes_hep_poster_grammar_and_density_rules():
     spec = {
         "project": {"title": "T", "topic": "T"},
-        "style": {},
+        "style": {
+            "domain_profile": "hep",
+            "domain_label": "high_energy_physics",
+            "domain_grammar_heading": "HEP POSTER DESIGN GRAMMAR",
+            "domain_poster_grammar": [
+                "Use a CERN/LHCC-style scientific story spine: Motivation → dataset/selection → strategy/background → key result → interpretation/summary.",
+                "Create one dominant hero region for the headline result; do not divide the body into many equal tiny boxes.",
+            ],
+            "figure_composition": [
+                "For professional HEP readers, dataset and strategy cards should show analysis-specific SR/CR, fit, and uncertainty details rather than a generic data-processing pipeline.",
+            ],
+        },
         "sections": [],
         "placeholders": [],
         "conclusion": [],
@@ -71,6 +82,21 @@ def test_prompt_includes_hep_poster_grammar_and_density_rules():
     assert "particle-labeled icons" in prompt
     assert "smaller but still legible text tiers" in prompt
     assert "Preserve the current generous editorial whitespace" in prompt
+    assert "Greek gamma must look like γ, never Latin y" in prompt
+
+
+def test_prompt_default_grammar_is_domain_neutral():
+    spec = {
+        "project": {"title": "T", "topic": "T"},
+        "style": {},
+        "sections": [],
+        "placeholders": [],
+        "conclusion": [],
+    }
+    prompt = build_prompt(spec)
+    assert "SCIENTIFIC POSTER DESIGN GRAMMAR" in prompt
+    assert "question → approach → evidence" in prompt
+    assert "CERN/LHCC-style scientific story spine" not in prompt
 
 
 def test_prompt_includes_content_outline_density_guidance():
@@ -262,7 +288,7 @@ def test_prompt_gives_mixed_portrait_square_placeholder_guard_and_allowed_ids():
     prompt = build_prompt(spec)
     assert "Exact allowed placeholder IDs: [FIG 03], [FIG 04]" in prompt
     assert "Do not render any other [FIG NN] box" in prompt
-    assert "Mixed portrait/square placeholder section design" in prompt
+    assert "Mixed near-portrait/square placeholder section design" in prompt
     assert "only slightly taller than wide" in prompt
     assert "not make it a narrow tall column" in prompt
 
@@ -530,7 +556,7 @@ def test_copy_deck_specialist_units_suppress_generic_flowchart():
 def test_copy_deck_specialist_units_allow_concrete_rewritten_flowchart():
     spec = {
         "project": {"title": "T", "topic": "T"},
-        "style": {},
+        "style": {"domain_profile": "hep", "domain_label": "high_energy_physics"},
         "sections": [
             {
                 "id": 2,

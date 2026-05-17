@@ -16,7 +16,9 @@ from .schemas import (
     content_outline_schema,
     copy_deck_schema,
     default_poster_spec,
+    domain_profile_schema,
     figure_selection_schema,
+    micro_repair_plan_schema,
     normalize_assets_manifest,
     normalize_placeholder_id,
     placeholder_detection_schema,
@@ -46,6 +48,106 @@ FLOWCHART_NODE_RULES: list[str] = [
     "Produce 4-5 nodes total; fewer is fine. Do not pad with generic stages.",
     "Skip the flowchart entirely or leave it empty if the source text does not provide concrete data-flow details.",
 ]
+
+
+def paper_domain_profile_from_text(
+    text: str,
+    assets_manifest: Any = None,
+    *,
+    provider: ChatGPTAccountResponsesProvider | None = None,
+    arxiv_metadata: Mapping[str, Any] | None = None,
+    available_profiles: Sequence[str] | None = None,
+    max_text_chars: int | None = None,
+    extra_instructions: str | None = None,
+) -> dict[str, Any]:
+    """Classify the paper domain and produce domain-adaptation guidance.
+
+    The output is an internal routing artifact.  It decides which discipline
+    profile should shape prompt language and stage priorities; it is not text to
+    render on the final poster.
+    """
+
+    provider = provider or ChatGPTAccountResponsesProvider()
+    assets = normalize_assets_manifest(assets_manifest)
+    profiles = list(available_profiles or ["generic", "hep", "cs_ml", "bio", "astro", "math", "chemistry"])
+    prompt = _compose_prompt(
+        header="Classify the research paper domain for a domain-adaptive poster pipeline.",
+        instructions=[
+            "Return a JSON object selecting the best domain_profile from the available profiles.",
+            "Use arXiv categories, title/abstract clues, section terminology, equations, and figure captions/assets.",
+            "If the paper is high-energy/particle physics, collider physics, flavor physics, neutrino physics, heavy-ion physics, or precision particle physics, select domain_profile='hep'.",
+            "If the paper is machine learning, artificial intelligence, computer vision, NLP, systems, theory of computation, or software engineering, select domain_profile='cs_ml'.",
+            "If the paper is biology, biomedical, genomics, neuroscience, medicine, or clinical science, select domain_profile='bio'.",
+            "If it is astronomy/cosmology/astrophysics, select 'astro'. If it is pure/theoretical mathematics, select 'math'. If it is chemistry/materials, select 'chemistry'.",
+            "Use 'generic' only when no available profile fits well or confidence is low.",
+            "For visual_grammar, figure_types, layout_priorities, text_priorities, and cautionary_rules, write field-specific guidance for poster design and text planning.",
+            "Never write internal workflow, replacement, image-generation, or placeholder-process language.",
+            extra_instructions or "",
+        ],
+        context={
+            "available_profiles": profiles,
+            "arxiv_metadata": dict(arxiv_metadata or {}),
+            "assets_manifest": assets[:40],
+            "source_text_excerpt": _truncate(text, int(max_text_chars or 12000)),
+        },
+    )
+    envelope = provider.generate_json(
+        stage_name="paper_domain_profile_from_text",
+        prompt=prompt,
+        schema=domain_profile_schema(),
+        system_prompt=SYSTEM_PROMPT,
+    )
+    envelope["result"] = _normalize_domain_profile(envelope["result"], available_profiles=profiles)
+    return envelope
+
+
+def _domain_stage_instructions(domain_profile: Mapping[str, Any] | None, *, stage: str) -> list[str]:
+    if not domain_profile:
+        return [
+            "No domain_profile was supplied: use general scientific poster structure and avoid field-specific jargon unless it is explicit in the source."
+        ]
+    profile = str(domain_profile.get("domain_profile") or domain_profile.get("profile") or "generic").strip().lower()
+    label = str(domain_profile.get("domain_label") or profile).strip()
+    confidence = domain_profile.get("confidence")
+    prefix = f"Detected domain profile: {profile}"
+    if label:
+        prefix += f" ({label})"
+    if confidence is not None:
+        prefix += f", confidence≈{confidence}"
+    out = [
+        prefix + ". Use this only as internal adaptation guidance.",
+    ]
+    for key, title in (
+        ("visual_grammar", "Visual grammar"),
+        ("figure_types", "Likely figure types"),
+        ("layout_priorities", "Layout priorities"),
+        ("text_priorities", "Text priorities"),
+        ("cautionary_rules", "Cautionary rules"),
+    ):
+        values = [str(item).strip() for item in domain_profile.get(key) or [] if str(item).strip()]
+        if values:
+            out.append(f"{title}: " + "; ".join(values[:6]) + ".")
+
+    if profile == "hep":
+        out.extend(
+            [
+                "For a professional HEP audience, make dataset/selection and analysis-strategy sections analysis-specific, not generic.",
+                "Extract concrete luminosity/energy/channel, object thresholds, SR/CR definitions, binning variables, fit observable, likelihood/CLs method, normalization factors, nuisance/systematic treatment, and dominant uncertainties when present.",
+                "Preserve HEP notation with unambiguous glyphs: γ must remain Greek gamma, never Latin y; in compact public labels, prefer the word gamma when a rendered glyph would be ambiguous.",
+                "Do not use a generic workflow like 'pp collisions → candidates → topology → SR/CR → fit' as the main analysis graphic.",
+                "If a flowchart is useful, make it a compact HEP region/fit schematic with concrete SR bins, CR labels, fitted observables, and nuisance/systematic blocks.",
+                *FLOWCHART_NODE_RULES,
+            ]
+        )
+    else:
+        out.extend(
+            [
+                "Do not introduce HEP-only terms such as luminosity, collision energy, SR/CR, CLs, nuisance parameters, or Feynman diagrams unless they explicitly appear in the source paper.",
+                "If a flowchart is useful, each node should be a concrete information capsule with a paper-specific dataset, assay, algorithm step, theorem condition, observational setup, metric, or result.",
+                "Skip flowcharts when the source does not provide concrete method-flow details; prefer short domain-appropriate fact cards instead.",
+            ]
+        )
+    return out
 
 
 def paper_content_outline_from_text(
@@ -121,6 +223,7 @@ def draft_spec_from_text(
     project_overrides: Mapping[str, Any] | None = None,
     style_overrides: Mapping[str, Any] | None = None,
     content_outline: Mapping[str, Any] | None = None,
+    domain_profile: Mapping[str, Any] | None = None,
     extra_instructions: str | None = None,
 ) -> dict[str, Any]:
     provider = provider or ChatGPTAccountResponsesProvider()
@@ -146,10 +249,10 @@ def draft_spec_from_text(
             "Preserve the existing harness structure: project, style, sections, placeholders, placements, conclusion, closing.",
             "Keep 4-6 sections unless the source clearly needs a different count.",
             "When a content_outline is supplied, use its dynamic_sections as the preferred semantic section roles/titles; merge or rename only when needed for poster legibility.",
-            "Follow HEP poster rhetoric but avoid bland generic section names: motivation/context, dataset/object selection, SR/CR or background strategy, fit model, key results, interpretation/summary.",
-            "For a professional HEP audience, make dataset/selection and analysis-strategy sections analysis-specific, not generic. Extract concrete object thresholds, SR/CR definitions, binning variables, fit observable, likelihood/CLs method, normalization factors, and dominant uncertainties when present.",
-            "Do not use a generic workflow like 'pp collisions → candidates → topology → SR/CR → fit' as the main analysis graphic. If a flowchart is useful, make it a compact HEP region/fit schematic with concrete SR bins, CR labels, fitted observables, and nuisance/systematic blocks.",
-            *FLOWCHART_NODE_RULES,
+            "Follow the detected domain's poster rhetoric and figure grammar; do not force HEP/CS/bio terminology when the paper belongs to another field.",
+            "Make method/strategy sections paper-specific, not generic. Extract concrete experimental setup, model/assay/selection, variables, metrics, controls, uncertainty, or theorem assumptions when present.",
+            "If a flowchart is useful, make it a compact domain-specific schematic with concrete paper-specific nodes; otherwise skip it.",
+            *_domain_stage_instructions(domain_profile, stage="draft_spec"),
             "Keep rendered text compact but information-rich: prefer short public bullets, data badges, and one-line claims over paragraphs.",
             "Do not make a sparse cover image. Aim for 14-24 public information units across the poster: section claims, badges, concise bullets, and conclusion takeaways.",
             "Each section should have at most one short body sentence plus 2-4 high-value bullets unless the source requires otherwise; use more sections or badges rather than long paragraphs.",
@@ -164,6 +267,7 @@ def draft_spec_from_text(
             "project_overrides": dict(project_overrides or {}),
             "style_overrides": dict(style_overrides or {}),
             "content_outline": dict(content_outline or {}),
+            "domain_profile": dict(domain_profile or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 30000),
             "starter_spec": base,
@@ -187,6 +291,7 @@ def storyboard_from_text(
     *,
     spec: Mapping[str, Any] | None = None,
     content_outline: Mapping[str, Any] | None = None,
+    domain_profile: Mapping[str, Any] | None = None,
     provider: ChatGPTAccountResponsesProvider | None = None,
     extra_instructions: str | None = None,
 ) -> dict[str, Any]:
@@ -209,9 +314,8 @@ def storyboard_from_text(
             "If content_outline is supplied, treat its dynamic_sections, high_density_facts, essential_formulas, and figure_text_guidance as the preferred coverage map.",
             "For each section, assign a semantic role such as motivation, dataset, method, validation, result, interpretation, or outlook.",
             "Write concise public-facing synopses and key claims grounded only in the provided paper text.",
-            "For HEP analyses, preserve specialist analysis details when present: object selections, SR binning variables, CR definitions, fitted discriminant, profile-likelihood/CLs strategy, floating background normalizations, nuisance parameters, and leading statistical/systematic uncertainties.",
-            "Professional HEP posters should not spend scarce space on generic 'data → selection → fit' pipelines. Prefer region matrices, fit-model schematics, and short analysis-specific callouts.",
-            *FLOWCHART_NODE_RULES,
+            "Use the detected domain profile to preserve field-specific specialist details when present.",
+            *_domain_stage_instructions(domain_profile, stage="storyboard"),
             "Assign text budgets in practical poster terms, e.g. 'title + 2 bullets' or 'one sentence + 3 short bullets'.",
             "Describe the preferred visual role for each section and map useful assets to target sections when supported by captions/labels.",
             "Mark one hero section and one hero visual role for the headline result or central method.",
@@ -219,13 +323,14 @@ def storyboard_from_text(
             "The information_plan should preserve Paper2Poster-style information richness: enough concise facts for a reader to understand motivation, method, dataset, headline result, and interpretation without reading the paper.",
             "Prefer public numeric badges only when the numbers are explicitly present in source text/assets; otherwise use qualitative fact badges.",
             "Write 4-8 reader-understanding questions that a good poster should enable a viewer to answer.",
-            "Never invent numeric results, luminosities, limits, channels, or claims not present in the source text/assets.",
+            "Never invent numeric results, sample sizes, limits, metrics, channels, instrument settings, or claims not present in the source text/assets.",
             extra_instructions or "",
         ],
         context={
             "poster_spec_sections": target_spec.get("sections") or [],
             "poster_project": target_spec.get("project") or {},
             "content_outline": dict(content_outline or {}),
+            "domain_profile": dict(domain_profile or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 30000),
         },
@@ -247,11 +352,12 @@ def physics_quiz_from_text(
     spec: Mapping[str, Any] | None = None,
     storyboard: Mapping[str, Any] | None = None,
     content_outline: Mapping[str, Any] | None = None,
+    domain_profile: Mapping[str, Any] | None = None,
     provider: ChatGPTAccountResponsesProvider | None = None,
     max_questions: int | None = None,
     extra_instructions: str | None = None,
 ) -> dict[str, Any]:
-    """Generate a PaperQuiz-lite HEP comprehension target.
+    """Generate a PaperQuiz-lite domain-aware comprehension target.
 
     The quiz is an internal planning/evaluation artifact.  It should describe
     what a conference viewer ought to learn from the poster; the questions are
@@ -263,16 +369,15 @@ def physics_quiz_from_text(
     target_spec = _normalize_spec(copy.deepcopy(dict(spec or default_poster_spec(_guess_title(text)))), assets)
     limit = max(8, min(24, int(max_questions or 16)))
     prompt = _compose_prompt(
-        header="Draft a HEP PaperQuiz-lite JSON object for poster information planning.",
+        header="Draft a domain-aware PaperQuiz-lite JSON object for poster information planning.",
         instructions=[
             f"Create {limit} concise quiz items that a good scientific poster for this paper should enable a viewer to answer.",
             "This is internal planning/evaluation data, not public poster text. Do not ask the image model to render these questions.",
             "Use content_outline.coverage_priorities and high_density_facts as a coverage checklist when supplied.",
-            "Use high-energy-physics poster aspects: physics target, dataset/channel, object/event selection, analysis strategy, background/control regions, statistical method, systematic uncertainty, headline result, interpretation, and figure evidence.",
-            "Include specialist HEP questions about SR/CR definitions, discriminating variables, simultaneous-fit structure, nuisance/systematic treatment, floating normalization factors, and dominant uncertainty sources whenever the paper provides them.",
-            "For result papers with multiple interpretations, include quiz items for each headline numerical result, including observed and expected limits for secondary interpretations when present.",
-            "Do not settle for generic 'SR/CR fits' questions if the source gives named control regions or fit ingredients. Ask concrete questions about named CRs, binning variables, free normalization factors, profile likelihood/CLs, and dominant statistical/template uncertainties when present.",
-            "Every quiz item must be answerable from explicit source text, figure captions, or assets. Never invent luminosities, energies, masses, channels, significances, or limits.",
+            "Use the detected domain profile to ask field-appropriate questions about problem, method, evidence, result, uncertainty/limitations, and figure support.",
+            *_domain_stage_instructions(domain_profile, stage="physics_quiz"),
+            "For result papers with multiple interpretations, include quiz items for each headline numerical result when explicitly present.",
+            "Every quiz item must be answerable from explicit source text, figure captions, or assets. Never invent scientific numbers, sample sizes, metrics, channels, significances, limits, or claims.",
             "For each item, provide a short answer, 0-4 multiple-choice options if useful, source_evidence, poster_priority, target_section, recommended_copy, and linked_assets when relevant.",
             "Mark only the most central 6-10 items as poster_priority='must'; secondary items should be 'should' or 'could'.",
             "Recommended copy should be a short public phrase suitable for a badge, callout, headline, or bullet; keep it under about 70 characters when possible.",
@@ -283,6 +388,7 @@ def physics_quiz_from_text(
             "poster_spec": target_spec,
             "storyboard": dict(storyboard or {}),
             "content_outline": dict(content_outline or {}),
+            "domain_profile": dict(domain_profile or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 30000),
         },
@@ -306,6 +412,7 @@ def copy_deck_from_text(
     physics_quiz: Mapping[str, Any] | None = None,
     figure_selection: Mapping[str, Any] | None = None,
     content_outline: Mapping[str, Any] | None = None,
+    domain_profile: Mapping[str, Any] | None = None,
     provider: ChatGPTAccountResponsesProvider | None = None,
     max_units: int | None = None,
     extra_instructions: str | None = None,
@@ -326,13 +433,9 @@ def copy_deck_from_text(
             "Use the storyboard as the narrative spine and the poster_spec sections as the section scaffold. Preserve section ids.",
             "Do not create copy units for the exact main title, author line, or identity line; those are controlled by poster_spec.project and rendered separately.",
             "Write compact, camera-ready poster copy: short headlines, badges, figure-near headlines, bullets, callouts, and conclusion takeaways.",
-            "For target_section roles like dataset, selection, method, strategy, fit, or background, prioritize analysis-specific copy over general HEP knowledge. Use types such as selection_cut, region_matrix, fit_strategy, and uncertainty when applicable.",
-            "Section 2 should favor a concrete object/region-definition matrix: lepton/jet thresholds, VBF cuts, b/tau/extra-lepton vetoes, SR binning variables, and named CRs if present.",
-            "Section 3 should favor a concrete fit-strategy summary: fitted discriminant, SR/CR simultaneous fit, background-only post-fit comparison, floating background normalizations, profile likelihood/CLs, nuisance parameters, and leading statistical/systematic uncertainties if present.",
-            "Result/conclusion units must cover every headline interpretation, not only the primary limit plot. If the paper gives both heavy-neutrino and Weinberg-operator limits, include both; preserve observed and expected numerical limits such as |mμμ| observed/expected values when explicitly present.",
-            "Never output a region_matrix unit that is merely a generic pipeline such as 'pp → candidates → SR/CR → fit'. A region_matrix must name concrete SR bins, CRs, or fitted regions; otherwise omit it.",
-            "If the paper names WZ, b-tagged, WZb, top, fake/nonprompt, validation, or control regions, include those names in section 2/3 copy units rather than a generic flowchart.",
-            "If the paper says statistical/template uncertainty dominates or mentions Barlow-Beeston-lite, CLs, profile likelihood, nuisance parameters, or floating normalizations, include at least one fit_strategy or uncertainty unit for it.",
+            "For method/strategy/background/result sections, prioritize domain-specific paper facts over generic field slogans.",
+            *_domain_stage_instructions(domain_profile, stage="copy_deck"),
+            "Result/conclusion units must cover every headline interpretation or contribution explicitly present, not only the primary figure.",
             "Do not write paragraphs. Most units should be under 70 characters; badges should be under 36 characters; hero headlines can be under 90 characters.",
             "For denser posters, split long facts into multiple short copy_units rather than one paragraph. Prefer more small chips/bullets over fewer long sentences.",
             "Set render_style to indicate the intended text tier when useful: 'primary badge', 'mini bullet', 'micro callout', 'figure-side headline', 'tiny formula chip'.",
@@ -351,6 +454,7 @@ def copy_deck_from_text(
             "physics_quiz": dict(physics_quiz or {}),
             "figure_selection": dict(figure_selection or {}),
             "content_outline": dict(content_outline or {}),
+            "domain_profile": dict(domain_profile or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 30000),
         },
@@ -372,6 +476,7 @@ def select_figures(
     spec: Mapping[str, Any] | None = None,
     storyboard: Mapping[str, Any] | None = None,
     content_outline: Mapping[str, Any] | None = None,
+    domain_profile: Mapping[str, Any] | None = None,
     provider: ChatGPTAccountResponsesProvider | None = None,
     max_figures: int | None = None,
     extra_instructions: str | None = None,
@@ -384,9 +489,11 @@ def select_figures(
         header="Select the most valuable real figures/assets for the poster.",
         instructions=[
             "Pick at most the available placeholder count or max_figures, whichever is smaller.",
-            "Prefer figures that communicate the main physics motivation, method, key backgrounds, and headline results.",
+            "Prefer figures that communicate the paper's main motivation, method, evidence, validation, and headline results.",
             "Use content_outline.figure_text_guidance and dynamic_sections when supplied to place figures where they reduce redundant prose and increase useful information density.",
-            "Assign priority so the headline result/limit/cross-section/significance plot becomes the hero placeholder.",
+            "Use the detected domain profile to decide which figure types are most central for this field.",
+            *_domain_stage_instructions(domain_profile, stage="select_figures"),
+            "Assign priority so the headline result, central method/evidence figure, or key quantitative comparison becomes the hero placeholder.",
             "Deprioritize dense diagnostic variants unless they are essential to the scientific claim.",
             "Map each selected asset onto a sequential placeholder_id exactly like FIG 01, FIG 02, ...; do not invent semantic IDs.",
             "Use storyboard target sections/roles when supplied, but keep the final section id compatible with the poster_spec.",
@@ -402,6 +509,7 @@ def select_figures(
             "poster_spec": target_spec,
             "storyboard": dict(storyboard or {}),
             "content_outline": dict(content_outline or {}),
+            "domain_profile": dict(domain_profile or {}),
             "assets_manifest": assets,
             "source_text_excerpt": _truncate(text, 5000),
         },
@@ -432,7 +540,11 @@ def detect_placeholders_from_image(
         header="Locate poster placeholder boxes from an image.",
         instructions=[
             "Return bounding boxes in image pixel coordinates [x0, y0, x1, y1].",
-            "Prefer the visible clean placeholder panel edges, not the outer card boundary.",
+            "The bbox must tightly trace the visible dashed/outlined blank placeholder rectangle itself.",
+            "Prefer the clean placeholder panel edges, not the outer card boundary, section/card boundary, light mat, or whole content block.",
+            "Exclude all public poster text outside the placeholder: section numbers, headings, subtitles, captions, bullets, flowchart nodes, result badges, and conclusion boxes must not be inside the bbox.",
+            "If a placeholder sits below a local heading/caption, set y0 at the top edge of the dashed placeholder rectangle, not at the heading.",
+            "If a placeholder is inside a larger light card, report only the inner dashed placeholder box unless the dashed edge is genuinely absent.",
             "If a placeholder id is missing or ambiguous, still report the best-matching visible placeholder and note the ambiguity.",
             extra_instructions or "",
         ],
@@ -505,6 +617,60 @@ def qa_poster(
     return envelope
 
 
+def plan_micro_repairs_from_qa(
+    *,
+    image_path: str | Path,
+    final_qa: Mapping[str, Any],
+    spec: Mapping[str, Any] | None = None,
+    provider: ChatGPTAccountResponsesProvider | None = None,
+    max_repairs: int = 12,
+    extra_instructions: str | None = None,
+) -> dict[str, Any]:
+    """Plan deterministic local text/glyph patches for a failed final poster QA.
+
+    This stage is intentionally narrow: it may only return local boxes for text or
+    glyph repairs.  It must not request layout changes, figure movement, or full
+    image regeneration.
+    """
+
+    provider = provider or ChatGPTAccountResponsesProvider()
+    path = Path(image_path)
+    try:
+        width, height = Image.open(path).size
+    except Exception:
+        width, height = 0, 0
+    prompt_text = _compose_prompt(
+        header="Plan deterministic micro-repairs for a final scientific poster image.",
+        instructions=[
+            "Return a repair plan for local deterministic patching only. Do not ask to regenerate the poster or move layout elements.",
+            "Use this only for small final QA problems such as typos, wrong glyphs, Greek-letter substitutions, or one short unsupported phrase.",
+            "Every repair must have a tight pixel box [x0,y0,x1,y1] in the displayed image coordinates.",
+            "Prefer glyph_patch for isolated wrong symbols such as y that should be γ. Prefer text_patch/text_box for short words or badges.",
+            "Keep boxes as small as possible while covering the wrong visible text/glyph. Do not cover scientific figures or large design areas.",
+            "For dark header/background text, use erase='text_mask' when possible and a light text color. For light cards, use erase='box' or 'text_mask' and dark text.",
+            "Set font_size in pixels for this image resolution. Match approximate visual weight; exact typeface matching is less important than scientific correctness and local containment.",
+            "If the QA problem requires changing layout, moving figures, or broad redrawing, set unsafe_to_repair=true and return no repairs.",
+            f"Return at most {max_repairs} repairs.",
+            extra_instructions or "",
+        ],
+        context={
+            "image_size": {"width": width, "height": height},
+            "final_qa": dict(final_qa or {}),
+            "poster_spec_excerpt": _truncate(json.dumps(spec or {}, ensure_ascii=False), 6000),
+        },
+    )
+    envelope = provider.generate_json(
+        stage_name="plan_micro_repairs_from_qa",
+        prompt=prompt_text,
+        schema=micro_repair_plan_schema(),
+        system_prompt=SYSTEM_PROMPT,
+        image_paths=[path],
+        image_detail="high",
+    )
+    envelope["result"] = _normalize_micro_repair_plan(envelope["result"], image_size=(width, height), max_repairs=max_repairs)
+    return envelope
+
+
 def _qa_detected_placeholders_context(detected_placeholders: Mapping[str, Any], qa_mode: str) -> dict[str, Any]:
     detected = dict(detected_placeholders or {})
     if qa_mode != "final":
@@ -547,6 +713,8 @@ def critique_poster_template(
             "Do not require deterministic text overlays or manual post-editing. If text/information is weak, propose prompt repairs for regenerating the whole poster with image_generation.",
             "Fail if the poster is merely decorative, too sparse, PPT-like, has serious text corruption, leaks internal workflow text, has dark figure blocks, or contains fake scientific plots/diagrams outside placeholders.",
             "Fail if any placeholder appears to contain real/fake scientific content, is missing/duplicated, unreadable, or clearly violates its declared aspect ratio.",
+            "Fail if the visible replacement boundary of any placeholder would include public poster text such as section headings, local captions, bullets, flowchart nodes, result badges, or conclusion rows.",
+            "For plot/result/likelihood/distribution placeholders, fail if the figure slot is only a tiny thumbnail that would make axes and legends unreadable; simplify prose or rebalance cards before shrinking scientific figures.",
             "Do not penalize placeholder labels or aspect-ratio text when they are inside the dashed placeholder; the contract requires each placeholder to contain exactly the ID, intended label, and aspect ratio.",
             "Prompt repairs must never contradict the placeholder contract: do not ask for only the [FIG NN] token, do not remove aspect-ratio text, and do not move labels outside the placeholder.",
             "Keep prompt_repairs concrete, short, and directly usable as additional image-generation instructions.",
@@ -887,6 +1055,76 @@ def _normalize_content_outline(
         "essential_formulas": essential_formulas,
         "figure_text_guidance": figure_text_guidance,
         "coverage_priorities": coverage_priorities,
+    }
+
+
+def _normalize_domain_profile(
+    result: Mapping[str, Any],
+    *,
+    available_profiles: Sequence[str],
+) -> dict[str, Any]:
+    available = {str(item).strip().lower().replace("-", "_") for item in available_profiles if str(item).strip()}
+    aliases = {
+        "high_energy_physics": "hep",
+        "particle_physics": "hep",
+        "hep-ex": "hep",
+        "hep_ph": "hep",
+        "hep_th": "hep",
+        "hep_lat": "hep",
+        "nuclear_experiment": "hep",
+        "nucl_ex": "hep",
+        "machine_learning": "cs_ml",
+        "ml": "cs_ml",
+        "cs": "cs_ml",
+        "computer_science": "cs_ml",
+        "artificial_intelligence": "cs_ml",
+        "biology_biomedicine": "bio",
+        "biomedicine": "bio",
+        "biomedical": "bio",
+        "medicine": "bio",
+        "astrophysics": "astro",
+        "astronomy": "astro",
+        "cosmology": "astro",
+        "mathematics": "math",
+        "theory": "math",
+        "materials": "chemistry",
+        "materials_science": "chemistry",
+        "chemistry_materials": "chemistry",
+    }
+    raw_profile = str(result.get("domain_profile") or result.get("profile") or result.get("domain_label") or "generic")
+    profile = raw_profile.strip().lower().replace("-", "_").replace(".", "_")
+    profile = aliases.get(profile, profile)
+    if profile not in available:
+        profile = "generic" if "generic" in available else (sorted(available)[0] if available else "generic")
+
+    def clean_list(values: Any, *, limit: int, max_chars: int = 180) -> list[str]:
+        out: list[str] = []
+        for value in values or []:
+            text = sanitize_public_text(str(value)).strip()
+            text = re.sub(r"\s+", " ", text)
+            if text and text not in out:
+                out.append(_truncate(text, max_chars))
+            if len(out) >= limit:
+                break
+        return out
+
+    try:
+        confidence = float(result.get("confidence", 0.5))
+    except Exception:
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+    return {
+        "domain_label": _compact_token(str(result.get("domain_label") or profile), default=profile),
+        "domain_profile": profile,
+        "confidence": confidence,
+        "arxiv_categories": clean_list(result.get("arxiv_categories") or [], limit=8, max_chars=40),
+        "rationale": _truncate(sanitize_public_text(str(result.get("rationale") or "")).strip(), 400),
+        "visual_grammar": clean_list(result.get("visual_grammar") or [], limit=8),
+        "figure_types": clean_list(result.get("figure_types") or [], limit=12, max_chars=80),
+        "layout_priorities": clean_list(result.get("layout_priorities") or [], limit=8),
+        "text_priorities": clean_list(result.get("text_priorities") or [], limit=10),
+        "cautionary_rules": clean_list(result.get("cautionary_rules") or [], limit=8),
+        "suggested_style": _compact_token(str(result.get("suggested_style") or ""), default=""),
     }
 
 
@@ -1407,6 +1645,62 @@ def _normalize_template_critique(result: Mapping[str, Any]) -> dict[str, Any]:
         "issues": issues,
         "checks": {str(key): bool(value) for key, value in checks.items()},
         "prompt_repairs": prompt_repairs,
+    }
+
+
+def _normalize_micro_repair_plan(
+    result: Mapping[str, Any],
+    *,
+    image_size: tuple[int, int],
+    max_repairs: int,
+) -> dict[str, Any]:
+    width, height = image_size
+    repairs: list[dict[str, Any]] = []
+    for idx, item in enumerate(result.get("repairs") or [], start=1):
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        kind = str(row.get("type") or row.get("kind") or "text_patch")
+        if kind not in {"text_patch", "text_box", "glyph_patch"}:
+            continue
+        box = _read_numeric_box(row.get("box"))
+        if not box:
+            continue
+        x0, y0, x1, y1 = box
+        if width and height:
+            x0 = max(0, min(width, x0))
+            x1 = max(0, min(width, x1))
+            y0 = max(0, min(height, y0))
+            y1 = max(0, min(height, y1))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        text = sanitize_public_text(str(row.get("text") or "")).strip()
+        lines = [sanitize_public_text(str(line)).strip() for line in row.get("lines") or [] if str(line).strip()]
+        if not text and not lines:
+            continue
+        repair: dict[str, Any] = {
+            "id": str(row.get("id") or f"R{idx:02d}"),
+            "type": kind,
+            "box": [x0, y0, x1, y1],
+            "text": text,
+        }
+        if lines:
+            repair["lines"] = lines[:4]
+        for key in ("font_size", "font_style", "erase", "fill_prefer", "align", "wrap", "rationale"):
+            if key in row:
+                repair[key] = row[key]
+        for key in ("color", "fill", "padding", "stroke_fill", "stroke_width", "radius", "dilate", "text_threshold"):
+            if key in row:
+                repair[key] = row[key]
+        repairs.append(repair)
+        if len(repairs) >= max_repairs:
+            break
+    unsafe = bool(result.get("unsafe_to_repair")) or not repairs
+    return {
+        "summary": sanitize_public_text(str(result.get("summary") or "")).strip(),
+        "unsafe_to_repair": unsafe,
+        "confidence": _clamp_score(result.get("confidence"), default=0.0),
+        "repairs": repairs,
     }
 
 

@@ -56,6 +56,8 @@ AI 图片模型有一个致命问题：它会"发明"看起来很专业的科学
 ```text
 arXiv / 本地论文
   → 提取文本 + 图片素材
+  → domain classifier 自动识别学科（如 HEP / CS-ML / Bio / Astro / Math / Chemistry）
+  → 根据 domain_profile 组合领域视觉语法、文字重点和 figure 类型提示词
   → 可选 hep_dense：LLM 生成 paper content outline（专业事实、SR/CR、fit、systematics、figure-nearby text）
   → LLM 起草 poster_spec（包含版式描述、章节、占位符规格）
   → LLM 生成 storyboard（叙事主线、阅读顺序、图文角色、读者问题、信息密度计划）
@@ -69,6 +71,8 @@ arXiv / 本地论文
   → 将真实论文图片按坐标插入
   → 4× 超分放大
   → 最终 QA（检查文字是否公开、图片是否正常）
+  → 若只剩局部公开文字/符号 typo，则用 image_generation edit 微修 placeholder layout
+  → 对修好的 layout 重新检测占位符、重新贴真实图、重新 final QA
 ```
 
 每一步的产物（spec、manifest、prompt、QA 报告）都会保存到 `runs/<run>/`，方便审阅和调试。
@@ -108,6 +112,18 @@ autoposter:
 
 默认最终产出 2 组合格海报供用户选择。框架会先生成候选模板，并启用 template critic；每个候选还要通过 placeholder QA、替图 containment QA 和 final QA。若合格成品不足 2 组，会继续生成下一批候选，直到达到 `required_successes` 或超过 `max_candidate_batches` 后报错。
 
+局部小修只支持生图编辑，不会用确定性白框补丁替代：
+
+```yaml
+autoposter:
+  micro_repair:
+    enabled: true
+    backend: image_edit
+    max_rounds: 1
+```
+
+`micro_repair` 只处理 final QA 认为可局部修复的公开文字/符号问题。它编辑的是 **placeholder layout/template**，不是已经贴好真实图的 final poster；修好 layout 后会重新检测占位符、重新贴入真实论文图片、重新 final QA。若修复后仍不过 QA，严格模式会失败。
+
 
 ### Template critic / 整张重生图
 
@@ -125,17 +141,54 @@ autoposter:
 
 这个阶段借鉴 Paper2Poster 的 visual-in-the-loop 思路，但仍保留我们的路线：**不手工补文字、不拼接旧图，而是把 critic 反馈交回生图模型重新生成完整 poster**。
 
-### 样式预设
+### 样式预设与领域感知
+
+默认 main 流程使用通用样式 + 自动领域识别：
 
 ```yaml
 autoposter:
-  style: cms-hep   # 或 generic
+  style: generic
+  domain_profile: auto
 ```
 
-- **`cms-hep`**：CMS/CERN 风格，深色标题栏、探测器艺术抽象、非对称 HEP 版式
-- **`generic`**：通用学术海报风格
+`domain_profile: auto` 会让 LLM 根据论文文本、arXiv 信息和图片素材选择领域配置，例如：
 
-可以在 `styles` 段下自定义或添加新的样式预设。
+- `hep`：高能物理 / 粒子物理 / 中微子 / 重离子 / flavor / precision
+- `cs_ml`：计算机科学 / 机器学习
+- `bio`：生命科学 / 生物医学
+- `astro`：天文 / 宇宙学
+- `math`：数学 / 理论
+- `chemistry`：化学 / 材料
+- `generic`：无法可靠归类时的通用科学海报
+
+领域配置只控制 **视觉语法、figure 类型、文字重点、禁止伪造的科学图像类型**；占位符检测和真实图片替换 pipeline 不变。
+
+也可以手动指定领域，跳过自动识别：
+
+```bash
+poster-harness autoposter --config poster_harness.yaml \
+  --arxiv-id 2206.08956 \
+  --domain-profile hep
+```
+
+如果只想要纯通用模式：
+
+```bash
+poster-harness autoposter --config poster_harness.yaml \
+  --paper paper.pdf \
+  --domain-profile generic
+```
+
+`cms-hep` 仍可作为显式 style preset 使用，但不再是默认值：
+
+```bash
+poster-harness autoposter --config poster_harness.yaml \
+  --arxiv-id 2206.08956 \
+  --style cms-hep \
+  --domain-profile hep
+```
+
+可以在 `domain_profiles` 和 `styles` 段下自定义新学科或新视觉风格。
 
 ### 内容密度模式
 
@@ -168,7 +221,7 @@ autoposter:
   content_mode: hep_dense
 ```
 
-注意：`hep_dense` 是 opt-in，不会改变默认 `standard` / main 流程。
+注意：`hep_dense` 是 opt-in，只提高 HEP 信息密度；`domain_profile` 负责学科适配，两者相互独立。
 
 ## 使用方式
 

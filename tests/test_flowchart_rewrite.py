@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from poster_harness.flowchart_rewrite import apply_flowchart_rewrites, rewrite_flowcharts_from_paper
-from poster_harness.llm_stages import FLOWCHART_NODE_RULES, draft_spec_from_text, paper_content_outline_from_text
+from poster_harness.llm_stages import FLOWCHART_NODE_RULES, draft_spec_from_text, paper_content_outline_from_text, paper_domain_profile_from_text
 
 
 class FakeProvider:
@@ -54,7 +54,11 @@ def test_draft_spec_prompt_contains_flowchart_node_rules() -> None:
             }
         }
     )
-    draft_spec_from_text("paper text", provider=provider)
+    draft_spec_from_text(
+        "paper text",
+        provider=provider,
+        domain_profile={"domain_profile": "hep", "domain_label": "high_energy_physics", "confidence": 0.99},
+    )
     prompt = captured["prompt"].lower()
     assert "information capsule" in prompt
     assert "branch" in prompt
@@ -110,6 +114,35 @@ def test_content_outline_stage_normalizes_dynamic_sections_and_facts() -> None:
     assert result["dynamic_sections"][0]["figure_links"] == ["limit.png"]
     assert result["high_density_facts"][0]["render_as"] == "fit_chip"
     assert result["figure_text_guidance"][0]["nearby_text"] == "Observed 95% CL limit"
+
+
+def test_domain_profile_stage_normalizes_available_profile_alias() -> None:
+    provider = FakeProvider(
+        {
+            "paper_domain_profile_from_text": {
+                "domain_label": "High Energy Physics",
+                "domain_profile": "particle-physics",
+                "confidence": 0.92,
+                "arxiv_categories": ["hep-ex"],
+                "rationale": "Collider analysis terminology",
+                "visual_grammar": ["result-led HEP poster"],
+                "figure_types": ["limit plot", "post-fit distribution"],
+                "layout_priorities": ["hero result card"],
+                "text_priorities": ["dataset/channel/result"],
+                "cautionary_rules": ["no fake Feynman diagrams"],
+            }
+        }
+    )
+    env = paper_domain_profile_from_text(
+        "CMS pp collisions and CLs limits",
+        assets_manifest={"assets": []},
+        provider=provider,
+        available_profiles=["generic", "hep", "cs_ml"],
+    )
+    result = env["result"]
+    assert result["domain_profile"] == "hep"
+    assert result["confidence"] == 0.92
+    assert result["figure_types"] == ["limit plot", "post-fit distribution"]
 
 
 def test_rewrite_flowcharts_skips_when_no_section_has_flowchart() -> None:

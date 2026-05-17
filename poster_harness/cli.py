@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from PIL import Image
+
 from .arxiv import download_arxiv_bundle, normalize_arxiv_id, resolve_arxiv_with_llm
 from .assets import (
     apply_detections_to_spec,
@@ -18,6 +20,7 @@ from .assets import (
 from .auth_login import DEFAULT_CALLBACK_PORT, run_browser_login
 from .config import (
     cfg_get,
+    deep_merge,
     load_config,
     dump_config,
     load_autoposter_config,
@@ -31,7 +34,7 @@ from .layout_contract import build_layout_contract
 from .micro_repair import apply_micro_repairs
 from .prompt import build_prompt, sanitize_public_text
 from .replace import audit_generated_placeholder_geometry, audit_figure_containment, normalize_placeholder_geometry, replace_placeholders, upscale_image
-from .image_backend import generate_images_from_config
+from .image_backend import edit_image_from_config, generate_images_from_config
 from .llm import ChatGPTAccountResponsesProvider, OpenAICompatibleResponsesProvider
 from .llm_stages import (
     copy_deck_from_text,
@@ -39,6 +42,7 @@ from .llm_stages import (
     detect_placeholders_from_image,
     draft_spec_from_text,
     paper_content_outline_from_text,
+    paper_domain_profile_from_text,
     physics_quiz_from_text,
     qa_poster,
     select_figures,
@@ -280,6 +284,24 @@ def cmd_llm_content_outline(args: argparse.Namespace) -> None:
     print(args.out)
 
 
+def cmd_llm_domain_profile(args: argparse.Namespace) -> None:
+    text = _read_text_file(args.text)
+    config = load_harness_config(args.config)
+    profiles = list((cfg_get(config, "domain_profiles", {}) or {}).keys())
+    classifier_cfg = cfg_get(config, "autoposter.domain_classifier", {}) or {}
+    envelope = paper_domain_profile_from_text(
+        text,
+        assets_manifest=_load_optional_config(args.assets_manifest),
+        provider=_llm_provider(args),
+        arxiv_metadata=_load_optional_config(args.arxiv_metadata),
+        available_profiles=profiles,
+        max_text_chars=args.max_text_chars or int(cfg_get(config, "autoposter.domain_classifier.max_text_chars", 12000) or 12000),
+        extra_instructions=args.extra_instructions or str((classifier_cfg or {}).get("extra_instructions") or ""),
+    )
+    _dump_llm_result(envelope, args.out)
+    print(args.out)
+
+
 def cmd_llm_select_figures(args: argparse.Namespace) -> None:
     text = _read_text_file(args.text)
     spec = _load_spec_arg(args.spec) if args.spec else None
@@ -454,6 +476,30 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
     style_name = args.style or cfg_get(config, "autoposter.style", "generic")
     project_overrides, style_overrides, spec_extras = _style_preset(style_name, config)
 
+    domain_profile: dict[str, Any] | None = None
+    domain_profile_path: Path | None = None
+    domain_profile = _resolve_domain_profile(
+        text=text,
+        assets_manifest=assets_manifest,
+        provider=provider,
+        config=config,
+        dirs=dirs,
+        args=args,
+        resolution=resolution,
+        arxiv_bundle=arxiv_bundle,
+    )
+    if domain_profile:
+        domain_profile_path = dirs["specs"] / "domain_profile.yaml"
+        dump_config(domain_profile, domain_profile_path)
+        domain_project, domain_style, domain_extras = _domain_profile_preset(
+            str(domain_profile.get("domain_profile") or "generic"),
+            config,
+            detected=domain_profile,
+        )
+        project_overrides = deep_merge(project_overrides, domain_project)
+        style_overrides = deep_merge(style_overrides, domain_style)
+        spec_extras = _merge_spec_extras(spec_extras, domain_extras)
+
     content_outline: dict[str, Any] | None = None
     content_outline_path: Path | None = None
     outline_cfg = cfg_get(config, "autoposter.content_outline", {})
@@ -498,6 +544,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         project_overrides=project_overrides,
         style_overrides=style_overrides,
         content_outline=content_outline,
+        domain_profile=domain_profile,
     )
     draft_spec = _apply_spec_extras(dict(draft_envelope["result"]), spec_extras)
     draft_spec_path = dirs["specs"] / "poster_spec.draft.yaml"
@@ -522,6 +569,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             assets_manifest=assets_manifest,
             spec=draft_spec,
             content_outline=content_outline,
+            domain_profile=domain_profile,
             provider=provider,
             extra_instructions=storyboard_extra,
         )
@@ -554,6 +602,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             spec=draft_spec,
             storyboard=storyboard,
             content_outline=content_outline,
+            domain_profile=domain_profile,
             provider=provider,
             max_questions=quiz_max,
             extra_instructions=quiz_extra,
@@ -572,6 +621,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         spec=draft_spec,
         storyboard=storyboard,
         content_outline=content_outline,
+        domain_profile=domain_profile,
         provider=provider,
         max_figures=_opt(args.max_figures, config, "autoposter.max_figures", None),
         extra_instructions=str(cfg_get(config, "autoposter.figure_layout_policy", "") or ""),
@@ -591,6 +641,8 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         final_spec["physics_quiz"] = physics_quiz
     if content_outline:
         final_spec["content_outline"] = content_outline
+    if domain_profile:
+        final_spec["domain_profile"] = domain_profile
     final_spec = _apply_spec_extras(final_spec, spec_extras)
     copy_deck: dict[str, Any] | None = None
     copy_deck_path: Path | None = None
@@ -616,6 +668,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             physics_quiz=physics_quiz,
             figure_selection=figure_selection,
             content_outline=content_outline,
+            domain_profile=domain_profile,
             provider=provider,
             max_units=copy_max,
             extra_instructions=copy_extra,
@@ -672,6 +725,8 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         "out": str(root),
         "style": style_name,
         "content_mode": str(cfg_get(config, "autoposter.content_mode", "standard")),
+        "domain_profile": str(domain_profile_path) if domain_profile_path else "",
+        "domain_profile_name": str(domain_profile.get("domain_profile") if domain_profile else ""),
         "config": str(args.config) if args.config else "",
         "arxiv": resolution or {},
         "arxiv_bundle": {
@@ -801,9 +856,11 @@ def _process_generated_template_candidate(
     generated_scale: float,
     run_manifest: dict[str, Any],
     placeholder_failures: list[str],
+    geometry_repair_depth: int = 0,
 ) -> list[str] | None:
     """Run detection, replacement, and QA for one generated placeholder layout."""
     stem = Path(image_path).stem
+    effective_generated_scale = _effective_generated_scale_for_layout(image_path, generated_scale, config)
     detection_envelope = _call_llm_stage_with_retries(
         "detect_placeholders_from_image",
         config,
@@ -836,9 +893,36 @@ def _process_generated_template_candidate(
         ratio_tolerance=float(cfg_get(config, "autoposter.placeholder_aspect_tolerance", 0.20)),
     )
     if geometry_issues:
+        geometry_qa = {"passes": False, "issues": geometry_issues}
         geometry_issue_path = dirs["qa"] / f"{stem}.placeholder-geometry.qa.yaml"
-        dump_config({"passes": False, "issues": geometry_issues}, geometry_issue_path)
+        dump_config(geometry_qa, geometry_issue_path)
         run_manifest["qa"].append(str(geometry_issue_path))
+        repaired_layout = _attempt_placeholder_geometry_micro_repair(
+            image_path=image_path,
+            geometry_qa=geometry_qa,
+            final_spec=final_spec,
+            prompt=prompt,
+            dirs=dirs,
+            config=config,
+            args=args,
+            run_manifest=run_manifest,
+            repair_depth=geometry_repair_depth,
+        )
+        if repaired_layout is not None:
+            return _process_generated_template_candidate(
+                image_path=repaired_layout,
+                index=index,
+                final_spec=final_spec,
+                prompt=prompt,
+                dirs=dirs,
+                config=config,
+                args=args,
+                provider=provider,
+                generated_scale=generated_scale,
+                run_manifest=run_manifest,
+                placeholder_failures=placeholder_failures,
+                geometry_repair_depth=geometry_repair_depth + 1,
+            )
         placeholder_failures.append(
             f"{image_path}: failed deterministic placeholder geometry QA; see {geometry_issue_path}"
         )
@@ -875,70 +959,26 @@ def _process_generated_template_candidate(
     placeholder_qa_path = dirs["qa"] / f"{stem}.placeholder.qa.yaml"
     dump_config(placeholder_qa_result, placeholder_qa_path)
     run_manifest["qa"].append(str(placeholder_qa_path))
-    if not bool(placeholder_qa_result.get("passes")):
+    if not _qa_result_passes_strict(placeholder_qa_result, qa_mode="placeholder"):
         placeholder_failures.append(
             f"{image_path}: failed strict placeholder QA; see {placeholder_qa_path}"
         )
         return None
 
-    export_path = dirs["exports"] / f"{stem}-realfigures.png"
-    # Use the original generated poster as the final visual base.  Geometry
-    # normalization is a hidden replacement plan, not a second visible
-    # placeholder layer; this avoids white normalized boxes that do not align
-    # with the model's original card art.
-    replacement_base_path = Path(image_path)
-    try:
-        replace_placeholders(
-            base_image=replacement_base_path,
-            spec=spec_with_placements,
-            asset_dir=dirs["assets"],
-            out_path=export_path,
-        )
-    except Exception as exc:
-        placeholder_failures.append(
-            f"{image_path}: failed deterministic replacement; {exc}"
-        )
+    export_result = _export_realfigures_from_layout(
+        stem=stem,
+        layout_path=Path(image_path),
+        spec_with_placements=spec_with_placements,
+        dirs=dirs,
+        config=config,
+        args=args,
+        generated_scale=effective_generated_scale,
+        run_manifest=run_manifest,
+        placeholder_failures=placeholder_failures,
+    )
+    if export_result is None:
         return None
-    # Run deterministic containment audit on the replacement plan.
-    containment_issues = audit_figure_containment(spec=spec_with_placements)
-    if containment_issues:
-        containment_path = dirs["qa"] / f"{stem}.containment.qa.yaml"
-        dump_config({"passes": False, "issues": containment_issues}, containment_path)
-        run_manifest["qa"].append(str(containment_path))
-        placeholder_failures.append(
-            f"{image_path}: failed deterministic figure containment QA; see {containment_path}"
-        )
-        return None
-    candidate_exports = [str(export_path)]
-    qa_image = export_path
-    upscale_factor = float(_opt(args.upscale_factor, config, "image_generation.upscale_factor", 4.0) or 0)
-    if upscale_factor and upscale_factor > 1:
-        upscaled_path = dirs["exports"] / f"{stem}-realfigures-{int(upscale_factor)}x.png"
-        if generated_scale >= upscale_factor:
-            _link_or_copy(export_path, upscaled_path)
-        else:
-            # For the production high-res export, upscale the generated
-            # template first and paste real scientific figures directly at
-            # the target coordinates. This keeps paper figures sharper than
-            # enlarging the already-composited result.
-            extra_scale = upscale_factor / max(1.0, generated_scale)
-            upscaled_base_path = dirs["generated"] / f"{stem}-production-base-{int(upscale_factor)}x.png"
-            upscale_image(replacement_base_path, upscaled_base_path, factor=extra_scale)
-            try:
-                replace_placeholders(
-                    base_image=upscaled_base_path,
-                    spec=spec_with_placements,
-                    asset_dir=dirs["assets"],
-                    out_path=upscaled_path,
-                    scale=extra_scale,
-                )
-            except Exception as exc:
-                placeholder_failures.append(
-                    f"{image_path}: failed deterministic high-resolution replacement; {exc}"
-                )
-                return None
-        candidate_exports.append(str(upscaled_path))
-        qa_image = upscaled_path
+    candidate_exports, qa_image = export_result
 
     qa_envelope = _call_llm_stage_with_retries(
         "qa_poster_final",
@@ -955,17 +995,689 @@ def _process_generated_template_candidate(
     qa_path = dirs["qa"] / f"{stem}.final.qa.yaml"
     dump_config(qa_result, qa_path)
     run_manifest["qa"].append(str(qa_path))
-    if not bool(qa_result.get("passes")):
+    if not _qa_result_passes_strict(qa_result, qa_mode="final"):
+        repaired_exports = _attempt_final_micro_repair(
+            stem=stem,
+            final_spec=spec_with_placements,
+            prompt=prompt,
+            dirs=dirs,
+            config=config,
+            provider=provider,
+            qa_result=qa_result,
+            candidate_exports=[Path(item) for item in candidate_exports],
+            layout_base_path=Path(image_path),
+            args=args,
+            generated_scale=effective_generated_scale,
+            run_manifest=run_manifest,
+            placeholder_failures=placeholder_failures,
+        )
+        if repaired_exports:
+            return [str(item) for item in repaired_exports]
         for failed_export in candidate_exports:
             try:
                 Path(failed_export).unlink(missing_ok=True)
             except Exception:
                 pass
+        failed_target = candidate_exports[0] if candidate_exports else str(image_path)
         placeholder_failures.append(
-            f"{export_path}: failed strict final QA; see {qa_path}"
+            f"{failed_target}: failed strict final QA; see {qa_path}"
         )
         return None
     return candidate_exports
+
+
+def _export_realfigures_from_layout(
+    *,
+    stem: str,
+    layout_path: Path,
+    spec_with_placements: Mapping[str, Any],
+    dirs: Mapping[str, Path],
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+    generated_scale: float,
+    run_manifest: dict[str, Any],
+    placeholder_failures: list[str],
+) -> tuple[list[str], Path] | None:
+    """Paste real source figures into a placeholder layout and build exports."""
+    export_path = dirs["exports"] / f"{stem}-realfigures.png"
+    # Use the visible generated/edited layout as the final visual base.  Any
+    # geometry normalization is a hidden replacement plan, not a second visible
+    # placeholder layer; this avoids normalized white boxes that do not align
+    # with the model's original card art.
+    try:
+        replace_placeholders(
+            base_image=layout_path,
+            spec=spec_with_placements,
+            asset_dir=dirs["assets"],
+            out_path=export_path,
+        )
+    except Exception as exc:
+        placeholder_failures.append(
+            f"{layout_path}: failed deterministic replacement; {exc}"
+        )
+        return None
+
+    # Run deterministic containment audit on the replacement plan.
+    containment_issues = audit_figure_containment(spec=spec_with_placements)
+    if containment_issues:
+        containment_path = dirs["qa"] / f"{stem}.containment.qa.yaml"
+        dump_config({"passes": False, "issues": containment_issues}, containment_path)
+        run_manifest["qa"].append(str(containment_path))
+        placeholder_failures.append(
+            f"{layout_path}: failed deterministic figure containment QA; see {containment_path}"
+        )
+        export_path.unlink(missing_ok=True)
+        return None
+
+    candidate_exports = [str(export_path)]
+    qa_image = export_path
+    upscale_factor = float(_opt(args.upscale_factor, config, "image_generation.upscale_factor", 4.0) or 0)
+    if upscale_factor and upscale_factor > 1:
+        upscaled_path = dirs["exports"] / f"{stem}-realfigures-{int(upscale_factor)}x.png"
+        if generated_scale >= upscale_factor:
+            _link_or_copy(export_path, upscaled_path)
+        else:
+            # For the production high-res export, upscale the generated/edited
+            # template first and paste real scientific figures directly at the
+            # target coordinates. This keeps paper figures sharper than
+            # enlarging the already-composited result.
+            extra_scale = upscale_factor / max(1.0, generated_scale)
+            upscaled_base_path = dirs["generated"] / f"{stem}-production-base-{int(upscale_factor)}x.png"
+            upscale_image(layout_path, upscaled_base_path, factor=extra_scale)
+            try:
+                replace_placeholders(
+                    base_image=upscaled_base_path,
+                    spec=spec_with_placements,
+                    asset_dir=dirs["assets"],
+                    out_path=upscaled_path,
+                    scale=extra_scale,
+                )
+            except Exception as exc:
+                placeholder_failures.append(
+                    f"{layout_path}: failed deterministic high-resolution replacement; {exc}"
+                )
+                export_path.unlink(missing_ok=True)
+                return None
+        candidate_exports.append(str(upscaled_path))
+        qa_image = upscaled_path
+    return candidate_exports, qa_image
+
+
+def _attempt_placeholder_geometry_micro_repair(
+    *,
+    image_path: Path,
+    geometry_qa: Mapping[str, Any],
+    final_spec: Mapping[str, Any],
+    prompt: str,
+    dirs: Mapping[str, Path],
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+    run_manifest: dict[str, Any],
+    repair_depth: int,
+) -> Path | None:
+    repair_cfg = cfg_get(dict(config), "autoposter.micro_repair", {}) or {}
+    if isinstance(repair_cfg, Mapping):
+        enabled = bool(repair_cfg.get("enabled", True))
+        backend = str(repair_cfg.get("backend") or "image_edit").strip().lower()
+        max_rounds = int(repair_cfg.get("placeholder_geometry_max_rounds") or repair_cfg.get("max_rounds") or 1)
+        extra = str(repair_cfg.get("extra_instructions") or "")
+    else:
+        enabled = bool(repair_cfg)
+        backend = "image_edit"
+        max_rounds = 1
+        extra = ""
+    if not enabled or backend not in {"image_edit", "image_generation_edit", "generation_edit"}:
+        return None
+    if repair_depth >= max_rounds:
+        return None
+    issues = [item for item in geometry_qa.get("issues") or [] if isinstance(item, Mapping)]
+    if not issues:
+        return None
+    stem = image_path.stem
+    round_index = repair_depth + 1
+    repair_prompt = _build_placeholder_geometry_image_edit_prompt(
+        geometry_qa=geometry_qa,
+        spec=final_spec,
+        extra_instructions=extra,
+    )
+    prompt_path = dirs["prompts"] / f"{stem}.placeholder-geometry-microrepair{round_index}.image_edit_prompt.txt"
+    prompt_path.write_text(repair_prompt, encoding="utf-8")
+    run_manifest.setdefault("placeholder_geometry_micro_repairs", []).append(
+        {
+            "backend": "image_edit",
+            "stage": "placeholder_geometry",
+            "prompt": str(prompt_path),
+            "source_layout": str(image_path),
+            "repaired_layout": "",
+        }
+    )
+    edit_input = _prepare_micro_repair_edit_input(
+        source=image_path,
+        scratch_dir=dirs["scratch"],
+        stem=f"{stem}.placeholder-geometry-microrepair{round_index}",
+        round_index=round_index,
+        config=config,
+    )
+    try:
+        edited_source = edit_image_from_config(
+            image_path=edit_input,
+            prompt=repair_prompt,
+            out_dir=dirs["generated"],
+            basename=f"{stem}-placeholder-geometry-microrepair{round_index}-native",
+            config=config,
+            model=args.image_model or cfg_get(dict(config), "image_generation.model", "gpt-5.5"),
+            size=args.size or cfg_get(dict(config), "image_generation.size", "1024x1536"),
+            quality=args.quality or cfg_get(dict(config), "image_generation.quality", "high"),
+            account=args.account or cfg_get(dict(config), "image_generation.account.account", ""),
+        )
+        repaired_layout = _materialize_image_edit_layout(
+            edited_source=Path(edited_source),
+            previous_layout=image_path,
+            out_path=dirs["generated"] / f"{stem}-placeholder-geometry-microrepair{round_index}.png",
+        )
+    except Exception:
+        return None
+    if run_manifest.get("placeholder_geometry_micro_repairs"):
+        last = run_manifest["placeholder_geometry_micro_repairs"][-1]
+        if isinstance(last, dict):
+            last["repaired_layout"] = str(repaired_layout)
+            if edit_input.resolve() != image_path.resolve():
+                last["edit_input"] = str(edit_input)
+    return repaired_layout
+
+
+def _build_placeholder_geometry_image_edit_prompt(
+    *,
+    geometry_qa: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    extra_instructions: str = "",
+) -> str:
+    project = spec.get("project") if isinstance(spec.get("project"), Mapping) else {}
+    title = str(project.get("title") or spec.get("title") or "scientific poster")
+    issues = [item for item in geometry_qa.get("issues") or [] if isinstance(item, Mapping)]
+    issue_lines: list[str] = []
+    for idx, issue in enumerate(issues[:8], start=1):
+        fig_id = str(issue.get("id") or f"FIG {idx:02d}")
+        expected = issue.get("expected_ratio")
+        actual = issue.get("actual_ratio")
+        msg = str(issue.get("message") or "")
+        issue_lines.append(
+            f"{idx}. {fig_id}: expected visible dashed-placeholder ratio {expected}:1, currently about {actual}:1. {msg}"
+        )
+    parts = [
+        "Perform a local placeholder-geometry MICRO-REPAIR on the provided scientific poster template.",
+        f"Poster title/topic: {title}",
+        "",
+        "The input is a placeholder-layout image BEFORE real figure replacement.",
+        "Do NOT redraw the full poster. Preserve the overall design, colors, text, section cards, and all [FIG NN] IDs.",
+        "Do NOT insert real or fake scientific figures. Every figure area must remain a blank dashed placeholder.",
+        "",
+        "Repair only these placeholder rectangle proportions:",
+        *issue_lines,
+        "",
+        "For each listed [FIG NN], locally resize the dashed rectangle and its light figure mat so the visible placeholder box matches the expected aspect ratio. Keep the ID, label, and aspect-ratio text inside the placeholder. It is acceptable to move nearby callout text slightly within the same card to make room, but do not change the reading order or overall layout.",
+        "Aspect-ratio intuition: 2.7:1 is a shallow wide strip; 1.32:1 is a modest landscape rectangle; 1.22:1 is close to square but still landscape. Avoid panoramic boxes for 1.22:1 or 1.32:1.",
+        "Return the complete edited placeholder-layout poster image, not a crop.",
+    ]
+    if extra_instructions.strip():
+        parts.extend(["", "Additional strict user instructions:", extra_instructions.strip()])
+    return "\n".join(parts)
+
+
+def _attempt_final_micro_repair(
+    *,
+    stem: str,
+    final_spec: Mapping[str, Any],
+    prompt: str,
+    dirs: Mapping[str, Path],
+    config: Mapping[str, Any],
+    provider: ChatGPTAccountResponsesProvider,
+    qa_result: Mapping[str, Any],
+    candidate_exports: list[Path],
+    layout_base_path: Path,
+    args: argparse.Namespace,
+    generated_scale: float,
+    run_manifest: dict[str, Any],
+    placeholder_failures: list[str],
+) -> list[Path] | None:
+    repair_cfg = cfg_get(dict(config), "autoposter.micro_repair", {}) or {}
+    if isinstance(repair_cfg, Mapping):
+        enabled = bool(repair_cfg.get("enabled", True))
+        backend = str(repair_cfg.get("backend") or "image_edit").strip().lower()
+        max_rounds = int(repair_cfg.get("max_rounds") or 1)
+        extra = str(repair_cfg.get("extra_instructions") or "")
+    else:
+        enabled = bool(repair_cfg)
+        backend = "image_edit"
+        max_rounds = 1
+        extra = ""
+    if not enabled or max_rounds <= 0 or not _final_qa_is_micro_repairable(qa_result):
+        return None
+    if backend not in {"image_edit", "image_generation_edit", "generation_edit"}:
+        raise RuntimeError(
+            "autoposter.micro_repair only supports backend: image_edit in the strict autoposter pipeline; "
+            "deterministic box patching is available only via the standalone micro-repair CLI command."
+        )
+
+    current_layout = layout_base_path
+    current_exports = [Path(item) for item in candidate_exports]
+    current_qa = dict(qa_result)
+    produced_artifacts: list[Path] = []
+    for round_index in range(1, max_rounds + 1):
+        repair_prompt = _build_image_edit_micro_repair_prompt(
+            final_qa=current_qa,
+            spec=final_spec,
+            extra_instructions=extra,
+        )
+        prompt_path = dirs["prompts"] / f"{stem}.microrepair{round_index}.image_edit_prompt.txt"
+        prompt_path.write_text(repair_prompt, encoding="utf-8")
+        run_manifest.setdefault("micro_repairs", []).append(
+            {
+                "backend": "image_edit",
+                "stage": "layout",
+                "prompt": str(prompt_path),
+                "source_layout": "",
+                "repaired_layout": "",
+                "exports": [],
+                "qa": "",
+            }
+        )
+
+        edit_input = _prepare_micro_repair_edit_input(
+            source=current_layout,
+            scratch_dir=dirs["scratch"],
+            stem=stem,
+            round_index=round_index,
+            config=config,
+        )
+        try:
+            edited_source = edit_image_from_config(
+                image_path=edit_input,
+                prompt=repair_prompt,
+                out_dir=dirs["generated"],
+                basename=f"{stem}-microrepair{round_index}-layout-native",
+                config=config,
+                model=args.image_model or cfg_get(dict(config), "image_generation.model", "gpt-5.5"),
+                size=args.size or cfg_get(dict(config), "image_generation.size", "1024x1536"),
+                quality=args.quality or cfg_get(dict(config), "image_generation.quality", "high"),
+                account=args.account or cfg_get(dict(config), "image_generation.account.account", ""),
+            )
+        except Exception:
+            for item in produced_artifacts:
+                item.unlink(missing_ok=True)
+            return None
+        produced_artifacts.append(Path(edited_source))
+
+        try:
+            repaired_layout = _materialize_image_edit_layout(
+                edited_source=Path(edited_source),
+                previous_layout=current_layout,
+                out_path=dirs["generated"] / f"{stem}-microrepair{round_index}-layout.png",
+            )
+        except Exception:
+            Path(edited_source).unlink(missing_ok=True)
+            for item in produced_artifacts:
+                item.unlink(missing_ok=True)
+            return None
+        produced_artifacts.append(repaired_layout)
+
+        repaired_detection_envelope = _call_llm_stage_with_retries(
+            "detect_placeholders_from_image_microrepair",
+            config,
+            detect_placeholders_from_image,
+            repaired_layout,
+            expected_placeholders=final_spec.get("placeholders") or [],
+            provider=provider,
+        )
+        repaired_detections = dict(repaired_detection_envelope["result"])
+        repaired_detections_path = dirs["scratch"] / f"{stem}.microrepair{round_index}.detections.yaml"
+        dump_config(repaired_detections, repaired_detections_path)
+
+        repaired_spec = apply_detections_to_spec(
+            copy.deepcopy(dict(final_spec)),
+            repaired_detections,
+            min_confidence=float(_opt(args.min_detection_confidence, config, "autoposter.min_detection_confidence", 0.15)),
+        )
+        layout_contract_issues = list(repaired_spec.get("_layout_contract_issues") or [])
+        if layout_contract_issues and bool(cfg_get(config, "autoposter.layout_contract.reject_misaligned", True)):
+            layout_contract_qa_path = dirs["qa"] / f"{stem}.microrepair{round_index}.layout-contract.qa.yaml"
+            dump_config({"passes": False, "issues": layout_contract_issues}, layout_contract_qa_path)
+            run_manifest["qa"].append(str(layout_contract_qa_path))
+            for item in produced_artifacts:
+                item.unlink(missing_ok=True)
+            return None
+        geometry_issues = audit_generated_placeholder_geometry(
+            base_image=repaired_layout,
+            spec=repaired_spec,
+            ratio_tolerance=float(cfg_get(config, "autoposter.placeholder_aspect_tolerance", 0.20)),
+        )
+        if geometry_issues:
+            geometry_issue_path = dirs["qa"] / f"{stem}.microrepair{round_index}.placeholder-geometry.qa.yaml"
+            dump_config({"passes": False, "issues": geometry_issues}, geometry_issue_path)
+            run_manifest["qa"].append(str(geometry_issue_path))
+            for item in produced_artifacts:
+                item.unlink(missing_ok=True)
+            return None
+
+        repaired_placeholder_qa_image = repaired_layout
+        if bool(cfg_get(config, "autoposter.normalize_placeholder_geometry", True)):
+            redraw_geometry = bool(cfg_get(config, "autoposter.redraw_normalized_placeholders", False))
+            repaired_placeholder_qa_image, repaired_spec = normalize_placeholder_geometry(
+                base_image=repaired_layout,
+                spec=repaired_spec,
+                out_path=dirs["generated"] / f"{stem}-microrepair{round_index}-geometry-normalized.png",
+                redraw=redraw_geometry,
+            )
+            produced_artifacts.append(Path(repaired_placeholder_qa_image))
+            _overwrite_detection_boxes(repaired_detections, repaired_spec.get("placements") or {})
+            dump_config(repaired_detections, repaired_detections_path)
+        repaired_spec_path = dirs["specs"] / f"{stem}.microrepair{round_index}.with_placements.yaml"
+        dump_config(repaired_spec, repaired_spec_path)
+
+        placeholder_qa_envelope = _call_llm_stage_with_retries(
+            "qa_poster_placeholder_microrepair",
+            config,
+            qa_poster,
+            repaired_spec,
+            prompt=prompt,
+            image_path=repaired_placeholder_qa_image,
+            detected_placeholders=repaired_detections,
+            provider=provider,
+            qa_mode="placeholder",
+        )
+        placeholder_qa_result = dict(placeholder_qa_envelope["result"])
+        placeholder_qa_path = dirs["qa"] / f"{stem}.microrepair{round_index}.placeholder.qa.yaml"
+        dump_config(placeholder_qa_result, placeholder_qa_path)
+        run_manifest["qa"].append(str(placeholder_qa_path))
+        if not _qa_result_passes_strict(placeholder_qa_result, qa_mode="placeholder"):
+            for item in produced_artifacts:
+                item.unlink(missing_ok=True)
+            return None
+
+        if run_manifest.get("micro_repairs"):
+            last = run_manifest["micro_repairs"][-1]
+            if isinstance(last, dict):
+                last["source_layout"] = str(current_layout)
+                last["repaired_layout"] = str(repaired_layout)
+                if edit_input.resolve() != current_layout.resolve():
+                    last["edit_input"] = str(edit_input)
+
+        export_result = _export_realfigures_from_layout(
+            stem=f"{stem}-microrepair{round_index}",
+            layout_path=repaired_layout,
+            spec_with_placements=repaired_spec,
+            dirs=dirs,
+            config=config,
+            args=args,
+            generated_scale=generated_scale,
+            run_manifest=run_manifest,
+            placeholder_failures=placeholder_failures,
+        )
+        if export_result is None:
+            for item in produced_artifacts:
+                item.unlink(missing_ok=True)
+            return None
+        repaired_exports_str, repaired_qa_image = export_result
+        repaired_exports = [Path(item) for item in repaired_exports_str]
+        produced_artifacts.extend(repaired_exports)
+        if run_manifest.get("micro_repairs"):
+            last = run_manifest["micro_repairs"][-1]
+            if isinstance(last, dict):
+                last["exports"] = [str(item) for item in repaired_exports]
+
+        qa_envelope = _call_llm_stage_with_retries(
+            "qa_poster_final_microrepair",
+            config,
+            qa_poster,
+            repaired_spec,
+            prompt=prompt,
+            image_path=repaired_qa_image,
+            detected_placeholders=repaired_detections,
+            provider=provider,
+            qa_mode="final",
+        )
+        current_qa = dict(qa_envelope["result"])
+        qa_path = dirs["qa"] / f"{stem}.microrepair{round_index}.final.qa.yaml"
+        dump_config(current_qa, qa_path)
+        run_manifest["qa"].append(str(qa_path))
+        if run_manifest.get("micro_repairs"):
+            last = run_manifest["micro_repairs"][-1]
+            if isinstance(last, dict):
+                last["qa"] = str(qa_path)
+        if _qa_result_passes_strict(current_qa, qa_mode="final"):
+            for old in current_exports:
+                try:
+                    old.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return repaired_exports
+        current_exports = repaired_exports
+        current_layout = repaired_layout
+    for item in produced_artifacts:
+        item.unlink(missing_ok=True)
+    return None
+
+
+def _build_image_edit_micro_repair_prompt(
+    *,
+    final_qa: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    extra_instructions: str = "",
+) -> str:
+    project = spec.get("project") if isinstance(spec.get("project"), Mapping) else {}
+    title = str(project.get("title") or spec.get("title") or "scientific poster")
+    issues = final_qa.get("issues") if isinstance(final_qa.get("issues"), list) else []
+    repairs = final_qa.get("recommended_repairs") if isinstance(final_qa.get("recommended_repairs"), list) else []
+    qa_blob = " ".join(
+        str(item)
+        for item in [
+            final_qa.get("summary"),
+            *(issues or []),
+            *(repairs or []),
+        ]
+    ).lower()
+    issue_lines: list[str] = []
+    for idx, issue in enumerate(issues[:8], start=1):
+        if not isinstance(issue, Mapping):
+            continue
+        severity = str(issue.get("severity") or "issue")
+        category = str(issue.get("category") or "")
+        message = str(issue.get("message") or "")
+        location = str(issue.get("location") or "")
+        suggested = str(issue.get("suggested_fix") or "")
+        line = f"{idx}. [{severity}/{category}] {message}"
+        if location:
+            line += f" Location: {location}."
+        if suggested:
+            line += f" Fix: {suggested}"
+        issue_lines.append(line)
+    repair_lines = [f"- {str(item)}" for item in repairs[:10] if str(item).strip()]
+    if not issue_lines and not repair_lines:
+        issue_lines.append("1. Correct only the small local public-text problems identified by the final QA.")
+
+    parts = [
+        "Perform a MICRO-REPAIR image edit on the provided placeholder-layout poster template.",
+        f"Poster title/topic: {title}",
+        "",
+        "This image is the source layout BEFORE real scientific figure replacement. It intentionally contains blank [FIG NN] placeholders.",
+        "Keep the same canvas size/aspect, overall layout, section cards, colors, background art, typography style, placeholder IDs, and placeholder aspect ratios.",
+        "Do NOT redraw the poster from scratch. Do NOT cover areas with opaque patch rectangles. Do NOT insert real or fake scientific plots.",
+        "Preserve every [FIG NN] as a blank dashed placeholder with its ID, label, and aspect-ratio text. If QA says a final real figure/frame covered public text, you may make only a tiny local layout repair within that same section: move nearby public text/callouts out from under the placeholder, or nudge/resize the blank placeholder slightly while preserving its aspect ratio and section association.",
+        "",
+        "Allowed edit scope: tiny local public-text/glyph corrections and tiny local placeholder/text spacing repairs requested by QA. Do not change the science story or section order.",
+        "After this edit, the harness will re-detect placeholders, paste the real paper figures again, and rerun final QA.",
+        "Required corrections from QA:",
+        *issue_lines,
+    ]
+    if repair_lines:
+        parts.extend(["", "Recommended repairs to apply exactly:", *repair_lines])
+    parts.extend(
+        [
+            "",
+            "Preserve evidence-vs-observation wording exactly unless QA asks to fix a typo.",
+            "Return the complete edited placeholder-layout poster image, not a crop.",
+        ]
+    )
+    if any(marker in qa_blob for marker in ("gamma", "h→z", "h->z", "mzy", "zγ", "zy")):
+        parts.append(
+            "QA-specific notation hint: if a Latin y is visibly substituting for Greek gamma, replace only that erroneous glyph/string with γ/gamma as requested by QA."
+        )
+    if any(marker in qa_blob for marker in ("m_ee", "dilepton", "mℓℓ", "mll")):
+        parts.append(
+            "QA-specific notation hint: if QA asks for dilepton mass notation, correct only that local text to the requested mℓℓ/mll form."
+        )
+    if extra_instructions.strip():
+        parts.extend(["", "Additional strict user instructions:", extra_instructions.strip()])
+    return "\n".join(parts)
+
+
+def _prepare_micro_repair_edit_input(
+    *,
+    source: Path,
+    scratch_dir: Path,
+    stem: str,
+    round_index: int,
+    config: Mapping[str, Any],
+) -> Path:
+    max_w, max_h = _image_size_from_config(
+        cfg_get(dict(config), "autoposter.micro_repair.edit_input_size", None)
+        or cfg_get(dict(config), "autoposter.micro_repair.size", None)
+        or cfg_get(dict(config), "image_generation.size", "1024x1536")
+    )
+    try:
+        with Image.open(source) as im:
+            width, height = im.size
+            scale = min(max_w / width, max_h / height, 1.0)
+            if scale >= 0.999:
+                return source
+            resized = im.convert("RGB").resize(
+                (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+                Image.Resampling.LANCZOS,
+            )
+    except Exception:
+        return source
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    out = scratch_dir / f"{stem}.microrepair{round_index}.edit-input.png"
+    resized.save(out)
+    return out
+
+
+def _materialize_image_edit_layout(
+    *,
+    edited_source: Path,
+    previous_layout: Path,
+    out_path: Path,
+) -> Path:
+    try:
+        with Image.open(edited_source) as im:
+            edited_w, edited_h = im.size
+    except Exception:
+        edited_w, edited_h = 0, 0
+    with Image.open(previous_layout) as im:
+        target_w, target_h = im.size
+    if edited_w <= 0 or edited_h <= 0:
+        raise RuntimeError(f"cannot read edited image dimensions: {edited_source}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if (target_w, target_h) == (edited_w, edited_h):
+        _link_or_copy(edited_source, out_path)
+        return out_path
+    factor_w = target_w / edited_w
+    factor_h = target_h / edited_h
+    if abs(factor_w - factor_h) > 0.03:
+        raise RuntimeError(
+            f"micro_repair image_edit layout aspect mismatch: edited={edited_w}x{edited_h}, target={target_w}x{target_h}"
+        )
+    upscale_image(edited_source, out_path, factor=factor_w)
+    return out_path
+
+
+def _final_qa_is_micro_repairable(qa_result: Mapping[str, Any]) -> bool:
+    checks = qa_result.get("checks") if isinstance(qa_result.get("checks"), Mapping) else {}
+    if checks and checks.get("placeholders_accounted_for") is False:
+        return False
+    critical = [
+        item for item in qa_result.get("issues") or []
+        if isinstance(item, Mapping) and str(item.get("severity") or "").lower() == "critical"
+    ]
+    if not critical:
+        return True
+    repairable_markers = (
+        "text",
+        "typo",
+        "glyph",
+        "notation",
+        "symbol",
+        "gamma",
+        "public_text",
+        "claim_precision",
+        "scientific_claim",
+    )
+    blocking_markers = (
+        "figure",
+        "crop",
+        "overlap",
+        "containment",
+        "placeholder",
+        "missing",
+        "fake_science",
+        "fake_scientific_content",
+        "layout",
+        "geometry",
+    )
+    for issue in critical:
+        blob = " ".join(str(issue.get(key) or "").lower() for key in ("category", "message", "suggested_fix"))
+        if any(marker in blob for marker in blocking_markers) and not any(marker in blob for marker in repairable_markers):
+            return False
+        if not any(marker in blob for marker in repairable_markers):
+            return False
+    return True
+
+
+def _qa_result_passes_strict(qa_result: Mapping[str, Any], *, qa_mode: str) -> bool:
+    """Interpret VLM QA conservatively for automated release gating.
+
+    Some VLM answers contain ``passes: true`` while also setting authoritative
+    boolean checks such as ``public_text_clean: false`` or reporting release-
+    blocking warning categories.  The harness should not accept those as final
+    posters; it should run the same strict repair loop instead.
+    """
+    if not bool(qa_result.get("passes")):
+        return False
+    checks = qa_result.get("checks") if isinstance(qa_result.get("checks"), Mapping) else {}
+    common_required = ("placeholders_accounted_for", "no_internal_text")
+    for key in common_required:
+        if checks.get(key) is False:
+            return False
+    if qa_mode == "placeholder":
+        for key in ("placeholder_contract_clean", "no_fake_science"):
+            if checks.get(key) is False:
+                return False
+    if qa_mode == "final":
+        if checks.get("public_text_clean") is False:
+            return False
+        release_blocking_warning_categories = {
+            "public_text_cleanliness",
+            "public_text_readability",
+            "text_readability",
+            "text_accuracy",
+            "readability",
+            "unreplaced_placeholder",
+            "placeholder_artifact",
+            "final_cleanup_artifact",
+            "figure_placement",
+            "figure_overlap",
+            "figure_containment",
+        }
+        for issue in qa_result.get("issues") or []:
+            if not isinstance(issue, Mapping):
+                continue
+            severity = str(issue.get("severity") or "").lower()
+            category = str(issue.get("category") or "").lower()
+            if severity == "critical":
+                return False
+            if severity == "warning" and category in release_blocking_warning_categories:
+                return False
+    return True
 
 
 def _call_llm_stage_with_retries(
@@ -1011,6 +1723,8 @@ def _looks_transient_llm_error(exc: Exception) -> bool:
             "remote end closed",
             "incompleteread",
             "incomplete read",
+            "405",
+            "method not allowed",
             "502",
             "503",
             "504",
@@ -1097,14 +1811,16 @@ def _generate_templates_with_critic(
         accepted: list[Path] = []
         round_repairs: list[str] = []
         for image_path in generated:
-            stem = Path(image_path).stem
+            image_path = Path(image_path)
+            critic_image_path = _native_sibling_for_promoted_layout(image_path) or image_path
+            stem = critic_image_path.stem
             critique_envelope = _call_llm_stage_with_retries(
                 "critique_poster_template",
                 config,
                 critique_poster_template,
                 final_spec,
                 prompt=current_prompt,
-                image_path=image_path,
+                image_path=critic_image_path,
                 provider=provider,
                 extra_instructions=str(cfg_get(dict(config), "autoposter.template_critic.extra_instructions", "") or ""),
             )
@@ -1114,8 +1830,32 @@ def _generate_templates_with_critic(
             run_manifest["qa"].append(str(critique_path))
             run_manifest["template_critiques"].append(str(critique_path))
             if _template_critic_accepts(critique, config):
-                accepted.append(Path(image_path))
+                accepted.append(critic_image_path)
             else:
+                repaired = _attempt_template_critic_micro_repair(
+                    image_path=critic_image_path,
+                    critique=critique,
+                    final_spec=final_spec,
+                    prompt=current_prompt,
+                    dirs=dirs,
+                    config=config,
+                    args=args,
+                    provider=provider,
+                    run_manifest=run_manifest,
+                )
+                if repaired is not None:
+                    accepted.append(repaired)
+                    continue
+                if _template_critique_can_defer_to_downstream(critique):
+                    run_manifest.setdefault("template_critic_deferred", []).append(
+                        {
+                            "image": str(critic_image_path),
+                            "qa": str(critique_path),
+                            "reason": "repairable template issues deferred to deterministic placeholder QA/final layout micro-repair",
+                        }
+                    )
+                    accepted.append(critic_image_path)
+                    continue
                 summary = str(critique.get("summary") or "template critic rejected generated poster")
                 template_failures.append(f"{image_path}: failed template critic; see {critique_path}; {summary}")
                 round_repairs.extend(_template_critic_repairs(critique))
@@ -1133,6 +1873,255 @@ def _generate_templates_with_critic(
 
     run_manifest["generated"] = []
     return [], current_prompt, template_failures
+
+
+def _attempt_template_critic_micro_repair(
+    *,
+    image_path: Path,
+    critique: Mapping[str, Any],
+    final_spec: Mapping[str, Any],
+    prompt: str,
+    dirs: Mapping[str, Path],
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+    provider: ChatGPTAccountResponsesProvider,
+    run_manifest: dict[str, Any],
+) -> Path | None:
+    repair_cfg = cfg_get(dict(config), "autoposter.micro_repair", {}) or {}
+    if isinstance(repair_cfg, Mapping):
+        enabled = bool(repair_cfg.get("enabled", True))
+        backend = str(repair_cfg.get("backend") or "image_edit").strip().lower()
+        max_rounds = int(repair_cfg.get("template_critic_max_rounds") or repair_cfg.get("max_rounds") or 1)
+        extra = str(repair_cfg.get("extra_instructions") or "")
+    else:
+        enabled = bool(repair_cfg)
+        backend = "image_edit"
+        max_rounds = 1
+        extra = ""
+    if not enabled or max_rounds <= 0 or backend not in {"image_edit", "image_generation_edit", "generation_edit"}:
+        return None
+    if not _template_critique_is_micro_repairable(critique):
+        return None
+
+    current_layout = image_path
+    current_critique = dict(critique)
+    for round_index in range(1, max_rounds + 1):
+        stem = current_layout.stem
+        repair_prompt = _build_template_image_edit_micro_repair_prompt(
+            critique=current_critique,
+            spec=final_spec,
+            extra_instructions=extra,
+        )
+        prompt_path = dirs["prompts"] / f"{stem}.template-microrepair{round_index}.image_edit_prompt.txt"
+        prompt_path.write_text(repair_prompt, encoding="utf-8")
+        run_manifest.setdefault("template_micro_repairs", []).append(
+            {
+                "backend": "image_edit",
+                "stage": "template_critic",
+                "prompt": str(prompt_path),
+                "source_layout": str(current_layout),
+                "repaired_layout": "",
+                "qa": "",
+            }
+        )
+        edit_input = _prepare_micro_repair_edit_input(
+            source=current_layout,
+            scratch_dir=dirs["scratch"],
+            stem=f"{stem}.template-microrepair{round_index}",
+            round_index=round_index,
+            config=config,
+        )
+        try:
+            edited_source = edit_image_from_config(
+                image_path=edit_input,
+                prompt=repair_prompt,
+                out_dir=dirs["generated"],
+                basename=f"{stem}-template-microrepair{round_index}-native",
+                config=config,
+                model=args.image_model or cfg_get(dict(config), "image_generation.model", "gpt-5.5"),
+                size=args.size or cfg_get(dict(config), "image_generation.size", "1024x1536"),
+                quality=args.quality or cfg_get(dict(config), "image_generation.quality", "high"),
+                account=args.account or cfg_get(dict(config), "image_generation.account.account", ""),
+            )
+            repaired_layout = _materialize_image_edit_layout(
+                edited_source=Path(edited_source),
+                previous_layout=current_layout,
+                out_path=dirs["generated"] / f"{stem}-template-microrepair{round_index}.png",
+            )
+        except Exception:
+            return None
+
+        critique_envelope = _call_llm_stage_with_retries(
+            "critique_poster_template_microrepair",
+            config,
+            critique_poster_template,
+            final_spec,
+            prompt=prompt,
+            image_path=repaired_layout,
+            provider=provider,
+            extra_instructions=str(cfg_get(dict(config), "autoposter.template_critic.extra_instructions", "") or ""),
+        )
+        repaired_critique = dict(critique_envelope["result"])
+        qa_path = dirs["qa"] / f"{repaired_layout.stem}.template-critic.qa.yaml"
+        dump_config(repaired_critique, qa_path)
+        run_manifest["qa"].append(str(qa_path))
+        run_manifest.setdefault("template_critiques", []).append(str(qa_path))
+        if run_manifest.get("template_micro_repairs"):
+            last = run_manifest["template_micro_repairs"][-1]
+            if isinstance(last, dict):
+                last["repaired_layout"] = str(repaired_layout)
+                if edit_input.resolve() != current_layout.resolve():
+                    last["edit_input"] = str(edit_input)
+                last["qa"] = str(qa_path)
+        if _template_critic_accepts(repaired_critique, config):
+            return repaired_layout
+        if _template_critique_can_defer_to_downstream(repaired_critique):
+            run_manifest.setdefault("template_critic_deferred", []).append(
+                {
+                    "image": str(repaired_layout),
+                    "qa": str(qa_path),
+                    "reason": "repairable template issues deferred to deterministic placeholder QA/final layout micro-repair",
+                }
+            )
+            return repaired_layout
+        if not _template_critique_is_micro_repairable(repaired_critique):
+            return None
+        current_layout = repaired_layout
+        current_critique = repaired_critique
+    return None
+
+
+def _template_critique_is_micro_repairable(critique: Mapping[str, Any]) -> bool:
+    issues = [item for item in critique.get("issues") or [] if isinstance(item, Mapping)]
+    if not issues:
+        return True
+    repairable_markers = (
+        "text",
+        "typo",
+        "glyph",
+        "notation",
+        "gamma",
+        "placeholder_contract",
+        "aspect",
+        "ratio",
+        "geometry",
+        "spelling",
+        "scientific_accuracy",
+        "result-copy",
+        "copy",
+    )
+    blocking_markers = (
+        "fake_science",
+        "fake scientific",
+        "fake data",
+        "real plot",
+        "fabricated plot",
+        "missing placeholder",
+        "missing [fig",
+        "no placeholder",
+        "internal",
+    )
+    critical = [item for item in issues if str(item.get("severity") or "").lower() == "critical"]
+    candidates = critical or issues
+    for issue in candidates:
+        blob = " ".join(
+            str(issue.get(key) or "").lower()
+            for key in ("category", "message", "suggested_prompt_repair", "location")
+        )
+        if any(marker in blob for marker in blocking_markers) and not any(marker in blob for marker in repairable_markers):
+            return False
+        if not any(marker in blob for marker in repairable_markers):
+            return False
+    return True
+
+
+def _template_critique_can_defer_to_downstream(critique: Mapping[str, Any]) -> bool:
+    if not _template_critique_is_micro_repairable(critique):
+        return False
+    checks = critique.get("checks") if isinstance(critique.get("checks"), Mapping) else {}
+    if checks:
+        if checks.get("no_internal_text") is False or checks.get("no_fake_science") is False:
+            return False
+        if checks.get("information_plan_visible") is False or checks.get("art_direction_strong") is False:
+            return False
+        if checks.get("placeholder_contract_clean") is False:
+            return False
+    # Do not defer placeholder geometry/aspect failures.  The regression that
+    # made real figures look worse came from accepting a visually wrong
+    # placeholder, then letting hidden replacement planning expand the figure
+    # frame upward into public text.  Geometry problems must be fixed by
+    # template image-edit/regeneration before real figures are pasted.
+    for issue in critique.get("issues") or []:
+        if not isinstance(issue, Mapping):
+            continue
+        blob = " ".join(
+            str(issue.get(key) or "").lower()
+            for key in ("category", "message", "suggested_prompt_repair", "location")
+        )
+        if any(marker in blob for marker in ("placeholder", "aspect", "ratio", "geometry", "figure card")):
+            return False
+    # Template critic is intentionally broad.  Only defer local public-text/glyph
+    # issues that downstream strict QA can safely re-check.
+    return True
+
+
+def _build_template_image_edit_micro_repair_prompt(
+    *,
+    critique: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    extra_instructions: str = "",
+) -> str:
+    project = spec.get("project") if isinstance(spec.get("project"), Mapping) else {}
+    title = str(project.get("title") or spec.get("title") or "scientific poster")
+    issues = [item for item in critique.get("issues") or [] if isinstance(item, Mapping)]
+    repairs = _template_critic_repairs(critique)
+    issue_lines: list[str] = []
+    for idx, issue in enumerate(issues[:8], start=1):
+        severity = str(issue.get("severity") or "issue")
+        category = str(issue.get("category") or "")
+        message = str(issue.get("message") or "")
+        location = str(issue.get("location") or "")
+        suggested = str(issue.get("suggested_prompt_repair") or "")
+        line = f"{idx}. [{severity}/{category}] {message}"
+        if location:
+            line += f" Location: {location}."
+        if suggested:
+            line += f" Repair target: {suggested}"
+        issue_lines.append(line)
+    if not issue_lines:
+        issue_lines.append("1. Repair only the small local template issues identified by the critic.")
+    repair_lines = [f"- {item}" for item in repairs[:10] if item.strip()]
+    qa_blob = " ".join([str(critique.get("summary") or ""), *issue_lines, *repair_lines]).lower()
+    parts = [
+        "Perform a MICRO-REPAIR image edit on the provided scientific poster placeholder-layout template.",
+        f"Poster title/topic: {title}",
+        "",
+        "The input image is a generated template BEFORE real scientific figure replacement. It intentionally contains blank dashed [FIG NN] placeholders.",
+        "Do NOT redraw the poster from scratch. Preserve the overall composition, colors, background art, card hierarchy, typography style, and all placeholder IDs.",
+        "Do NOT insert real or fake scientific figures. Keep every figure area as a blank dashed placeholder with its [FIG NN] label and aspect-ratio text.",
+        "",
+        "Allowed edit scope:",
+        "- Correct local public-text typos, corrupted glyphs, and notation errors.",
+        "- If the critic says a placeholder aspect ratio is wrong, locally resize that dashed placeholder rectangle/card so it visibly matches the printed aspect ratio, while keeping the same [FIG NN] ID and blank-placeholder contract.",
+        "- If the critic says a result value is unsupported, replace only that local text with the supplied/critic-approved value.",
+        "",
+        "Critic findings to repair:",
+        *issue_lines,
+    ]
+    if repair_lines:
+        parts.extend(["", "Apply these repair targets:", *repair_lines])
+    if any(marker in qa_blob for marker in ("gamma", "h→z", "h->z", "zγ", "mzy", "latin y")):
+        parts.append(
+            "Notation hint: where the decay means H to Z gamma, render it as H→Zγ in large headings, or use the words 'Z gamma' in small labels if γ risks looking like Latin y."
+        )
+    if any(marker in qa_blob for marker in ("aspect", "ratio", "placeholder")):
+        parts.append(
+            "Placeholder hint: prioritize visible rectangle proportions over decorative symmetry; a 2.7:1 placeholder must be a shallow wide strip, while 1.22:1 and 1.32:1 placeholders should be modest landscape rectangles, not panoramic or portrait boxes."
+        )
+    parts.append("Return the complete edited placeholder-layout poster image, not a crop.")
+    if extra_instructions.strip():
+        parts.extend(["", "Additional strict user instructions:", extra_instructions.strip()])
+    return "\n".join(parts)
 
 
 def _template_critic_accepts(critique: Mapping[str, Any], config: Mapping[str, Any]) -> bool:
@@ -1320,6 +2309,34 @@ def _image_size_from_config(value: Any) -> tuple[int, int]:
         return int(match.group(1)), int(match.group(2))
     # Codex image_generation portrait default.
     return 1024, 1536
+
+
+def _native_sibling_for_promoted_layout(path: Path) -> Path | None:
+    native = path.with_name(f"{path.stem}-native{path.suffix}")
+    return native if native.exists() else None
+
+
+def _effective_generated_scale_for_layout(
+    image_path: Path,
+    generated_scale: float,
+    config: Mapping[str, Any],
+) -> float:
+    """Return the true scale of the layout image being processed.
+
+    The harness may keep a 4x review copy for users while routing VLM/replacement
+    work through the native 1024×1536 image to avoid large-image transport
+    failures.  Export scaling must use the true work-layout scale, otherwise a
+    native export can be mislabeled as a 4x export.
+    """
+    try:
+        with Image.open(image_path) as im:
+            width, height = im.size
+    except Exception:
+        return generated_scale
+    native_w, native_h = _image_size_from_config(cfg_get(dict(config), "image_generation.size", "1024x1536"))
+    if width <= native_w * 1.5 and height <= native_h * 1.5:
+        return 1.0
+    return generated_scale
 
 
 def _default_run_dir(paper: str | None, config: Mapping[str, Any], resolution: Mapping[str, Any] | None) -> str:
@@ -1556,13 +2573,13 @@ def _style_preset(name: str, config: Mapping[str, Any] | None = None) -> tuple[d
     return (
         {},
         {
-            "summary": "premium CERN/LHCC-inspired scientific poster, modern editorial HEP design, artistic but readable, not a collage",
+            "summary": "premium domain-adaptive scientific conference poster, modern editorial design, artistic but readable, not a collage",
             "aspect": "A0 vertical / 2:3 ratio",
             "top_band": "strong title banner with concise identity text and abstract scientific artwork",
             "body_layout": "4-6 large numbered modules with one dominant result region, generous gutters, varied card shapes, and light paper-like figure cards",
             "color_grammar": "one primary accent color for headline results and one secondary accent color for contrasts; all figure surfaces remain warm-white or very pale neutral",
             "typography": "Modern editorial sans-serif with bold title, crisp section headers, compact readable bullets, and a disciplined type scale.",
-            "color_palette": "Deep indigo or graphite atmosphere, cobalt/cyan primary accents, violet/magenta secondary accents, restrained amber/gold highlights, and warm-white content/figure cards.",
+            "color_palette": "Deep indigo or graphite atmosphere, one disciplined primary accent, one secondary contrast, restrained warm highlights, and warm-white content/figure cards.",
             "figure_surface": "Every scientific figure placeholder must live on a warm-white, pearl, or very pale neutral card/mat; never on a dark content block.",
         },
         {
@@ -1573,6 +2590,161 @@ def _style_preset(name: str, config: Mapping[str, Any] | None = None) -> tuple[d
             "forbidden_phrases": ["internal workflow", "production workflow", "production-process", "replacement", "placeholder explanation"],
         },
     )
+
+
+def _resolve_domain_profile(
+    *,
+    text: str,
+    assets_manifest: Mapping[str, Any],
+    provider: ChatGPTAccountResponsesProvider,
+    config: Mapping[str, Any],
+    dirs: Mapping[str, Path],
+    args: argparse.Namespace,
+    resolution: Mapping[str, Any] | None,
+    arxiv_bundle: Any,
+) -> dict[str, Any] | None:
+    requested = str(getattr(args, "domain_profile", None) or cfg_get(dict(config), "autoposter.domain_profile", "auto") or "auto")
+    normalized = _normalize_domain_profile_name(requested)
+    if normalized in {"none", "off", "disabled", "false"}:
+        return None
+    profile_configs = cfg_get(dict(config), "domain_profiles", {}) or {}
+    available = [str(key) for key in profile_configs.keys()] or ["generic"]
+    if normalized != "auto":
+        if normalized not in profile_configs:
+            raise RuntimeError(f"unknown domain_profile={requested!r}; available: auto, " + ", ".join(sorted(available)))
+        return _explicit_domain_profile(normalized, profile_configs.get(normalized) or {})
+
+    classifier_cfg = cfg_get(dict(config), "autoposter.domain_classifier", {}) or {}
+    if isinstance(classifier_cfg, Mapping) and not bool(classifier_cfg.get("enabled", True)):
+        return _explicit_domain_profile("generic", profile_configs.get("generic") or {})
+
+    arxiv_metadata: dict[str, Any] = {}
+    if resolution:
+        arxiv_metadata.update(dict(resolution))
+    metadata_path = getattr(arxiv_bundle, "metadata_path", None) if arxiv_bundle else None
+    if metadata_path:
+        try:
+            arxiv_metadata["downloaded_metadata"] = load_config(metadata_path)
+        except Exception:
+            arxiv_metadata["downloaded_metadata_path"] = str(metadata_path)
+
+    envelope = _call_llm_stage_with_retries(
+        "paper_domain_profile_from_text",
+        config,
+        paper_domain_profile_from_text,
+        text,
+        assets_manifest=assets_manifest,
+        provider=provider,
+        arxiv_metadata=arxiv_metadata,
+        available_profiles=available,
+        max_text_chars=int(cfg_get(dict(config), "autoposter.domain_classifier.max_text_chars", 12000) or 12000),
+        extra_instructions=str(cfg_get(dict(config), "autoposter.domain_classifier.extra_instructions", "") or ""),
+    )
+    detected = dict(envelope["result"])
+    detected.setdefault("mode", "auto")
+    detected.setdefault("available_profiles", available)
+    return detected
+
+
+def _normalize_domain_profile_name(name: str) -> str:
+    normalized = (name or "generic").strip().lower().replace("-", "_").replace(".", "_")
+    aliases = {
+        "default": "auto",
+        "adaptive": "auto",
+        "field_auto": "auto",
+        "high_energy_physics": "hep",
+        "particle_physics": "hep",
+        "hep_ex": "hep",
+        "hep_ph": "hep",
+        "hep_th": "hep",
+        "machine_learning": "cs_ml",
+        "computer_science": "cs_ml",
+        "cs": "cs_ml",
+        "ml": "cs_ml",
+        "biomed": "bio",
+        "biomedical": "bio",
+        "astrophysics": "astro",
+        "astronomy": "astro",
+        "materials": "chemistry",
+        "materials_science": "chemistry",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _explicit_domain_profile(name: str, profile_cfg: Mapping[str, Any]) -> dict[str, Any]:
+    style = dict(profile_cfg.get("style") or {})
+    return {
+        "domain_label": str(style.get("domain_label") or name),
+        "domain_profile": name,
+        "confidence": 1.0,
+        "arxiv_categories": [],
+        "rationale": "Explicit domain profile selected by configuration or CLI.",
+        "visual_grammar": _as_string_list(style.get("domain_poster_grammar") or style.get("visual_grammar") or [], limit=8),
+        "figure_types": _as_string_list(style.get("figure_types") or [], limit=12),
+        "layout_priorities": _as_string_list(style.get("layout_priorities") or [], limit=8),
+        "text_priorities": _as_string_list([style.get("domain_text_guidance")] if style.get("domain_text_guidance") else [], limit=8),
+        "cautionary_rules": _as_string_list((profile_cfg.get("extras") or {}).get("decorative_art_constraints") or [], limit=8),
+        "suggested_style": "",
+        "mode": "explicit",
+    }
+
+
+def _domain_profile_preset(
+    name: str,
+    config: Mapping[str, Any] | None = None,
+    *,
+    detected: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    normalized = _normalize_domain_profile_name(name)
+    profiles = cfg_get(dict(config or {}), "domain_profiles", {}) or {}
+    profile_cfg = profiles.get(normalized) or profiles.get(name) or profiles.get("generic") or {}
+    project = dict(profile_cfg.get("project") or {})
+    style = dict(profile_cfg.get("style") or {})
+    extras = dict(profile_cfg.get("extras") or {})
+    if detected:
+        style["domain_profile"] = str(detected.get("domain_profile") or normalized)
+        style["domain_detection_summary"] = str(detected.get("rationale") or "")
+        if detected.get("visual_grammar"):
+            style["detected_visual_grammar"] = _as_string_list(detected.get("visual_grammar"), limit=8)
+        if detected.get("layout_priorities"):
+            style["detected_layout_priorities"] = _as_string_list(detected.get("layout_priorities"), limit=8)
+        if detected.get("text_priorities"):
+            style["detected_text_priorities"] = _as_string_list(detected.get("text_priorities"), limit=8)
+        if detected.get("cautionary_rules"):
+            extras = _merge_spec_extras(
+                extras,
+                {"decorative_art_constraints": _as_string_list(detected.get("cautionary_rules"), limit=8)},
+            )
+    return project, style, extras
+
+
+def _as_string_list(value: Any, *, limit: int = 12) -> list[str]:
+    values = value if isinstance(value, (list, tuple)) else ([value] if value else [])
+    out: list[str] = []
+    for item in values:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _merge_spec_extras(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(dict(left or {}))
+    for key, value in (right or {}).items():
+        if key in {"decorative_art_constraints", "forbidden_phrases"}:
+            existing = [str(item) for item in merged.get(key) or []]
+            low = {item.lower() for item in existing}
+            for item in value or []:
+                text = str(item)
+                if text.lower() not in low:
+                    existing.append(text)
+                    low.add(text.lower())
+            merged[key] = existing
+        else:
+            merged[key] = deep_merge(merged.get(key), value)
+    return merged
 
 
 def _apply_spec_extras(spec: dict[str, Any], extras: Mapping[str, Any]) -> dict[str, Any]:
@@ -1764,6 +2936,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--config")
     p.set_defaults(func=cmd_llm_content_outline)
 
+    p = sub.add_parser("llm-domain-profile", help="classify paper domain and produce domain-adaptive prompt guidance")
+    p.add_argument("--text", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--assets-manifest")
+    p.add_argument("--arxiv-metadata")
+    p.add_argument("--max-text-chars", type=int)
+    p.add_argument("--extra-instructions")
+    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--config")
+    p.set_defaults(func=cmd_llm_domain_profile)
+
     p = sub.add_parser("llm-storyboard", help="draft a structured storyboard from source text and assets")
     p.add_argument("--text", required=True)
     p.add_argument("--out", required=True)
@@ -1837,6 +3020,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", help="run directory; defaults to config paths.runs_dir plus paper/arXiv id")
     p.add_argument("--assets-dir", action="append", default=[], help="extra directory of real figure assets; can be repeated")
     p.add_argument("--style", help="style preset from config, e.g. cms-hep or generic")
+    p.add_argument("--domain-profile", help="domain profile: auto (default), generic, hep, cs_ml, bio, astro, math, chemistry, or none")
     p.add_argument(
         "--content-mode",
         help=(

@@ -251,10 +251,10 @@ class ChatGPTAccountResponsesProvider:
             "model": self.model,
             "stream": True,
             "store": False,
+            "instructions": system_prompt
+            or "You are a strict structured-output assistant. Return only content that satisfies the requested JSON schema.",
             "input": [{"type": "message", "role": "user", "content": content}],
         }
-        if system_prompt:
-            body["instructions"] = system_prompt
         if tools:
             body["tools"] = [copy.deepcopy(dict(tool)) for tool in tools]
         if tool_choice:

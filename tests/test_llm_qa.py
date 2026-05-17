@@ -258,6 +258,30 @@ def test_template_critic_acceptance_thresholds():
     assert not _template_critic_accepts(sparse, config)
 
 
+def test_template_critic_does_not_defer_placeholder_geometry_failures():
+    from poster_harness.cli import _template_critique_can_defer_to_downstream
+
+    critique = {
+        "passes": False,
+        "checks": {
+            "information_plan_visible": True,
+            "art_direction_strong": True,
+            "no_internal_text": True,
+            "no_fake_science": True,
+            "placeholder_contract_clean": False,
+        },
+        "issues": [
+            {
+                "severity": "critical",
+                "category": "placeholder_contract",
+                "message": "FIG 01 aspect ratio is wrong and the placeholder geometry is too wide.",
+                "suggested_prompt_repair": "Resize the dashed placeholder to 1.32:1.",
+            }
+        ],
+    }
+    assert not _template_critique_can_defer_to_downstream(critique)
+
+
 def test_regen_prompt_keeps_whole_poster_generation_and_no_overlay():
     from poster_harness.cli import _prompt_with_template_critic_repairs
 

@@ -7,10 +7,16 @@ def test_standard_content_mode_keeps_main_defaults(monkeypatch):
     config = load_autoposter_config()
 
     assert config["autoposter"]["content_mode"] == "standard"
+    assert config["autoposter"]["style"] == "generic"
+    assert config["autoposter"]["domain_profile"] == "auto"
+    assert config["autoposter"]["domain_classifier"]["enabled"] is True
+    assert config["autoposter"]["micro_repair"]["backend"] == "image_edit"
     assert config["autoposter"]["content_outline"]["enabled"] is False
     assert config["autoposter"]["copy_deck"]["max_units"] == 34
     assert "text_density" not in config["styles"]["cms-hep"]["style"]
     assert "12-20 short bullets/fact chips" in config["styles"]["cms-hep"]["style"]["information_density"]
+    assert "hep" in config["domain_profiles"]
+    assert "cs_ml" in config["domain_profiles"]
 
 
 def test_hep_dense_content_mode_is_opt_in(monkeypatch, tmp_path):

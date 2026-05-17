@@ -584,6 +584,51 @@ def test_hidden_normalize_keeps_exact_wide_fit_plot_above_following_bullets(tmp_
     assert abs(((box[2] - box[0]) / (box[3] - box[1])) - 2.5) < 0.03
 
 
+def test_hidden_normalize_wide_plot_does_not_erase_section_subtitle(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (620, 500), "white")
+    draw = ImageDraw.Draw(im)
+    # Public section subtitle/underline above the true dashed placeholder.  The
+    # broad detected source box includes this row, but replacement cleanup should
+    # start at the inner dashed placeholder top instead.
+    draw.line([(50, 100), (570, 100)], fill=(40, 110, 190), width=3)
+    draw.text((60, 105), "Post-fit H_T/pT^mu1 distributions across SRs and CRs", fill=(20, 80, 160))
+    for x in range(50, 570, 28):
+        draw.line([(x, 132), (min(x + 14, 570), 132)], fill=(100, 100, 100), width=3)
+        draw.line([(x, 310), (min(x + 14, 570), 310)], fill=(100, 100, 100), width=3)
+    for y in range(132, 310, 28):
+        draw.line([(50, y), (50, min(y + 14, 310))], fill=(100, 100, 100), width=3)
+        draw.line([(570, y), (570, min(y + 14, 310))], fill=(100, 100, 100), width=3)
+    draw.rounded_rectangle([50, 318, 570, 390], radius=8, outline=(190, 170, 220), width=2)
+    draw.text((86, 340), "Profile-likelihood CLs", fill=(20, 20, 20))
+    im.save(base)
+    spec = {
+        "placeholders": [
+            {
+                "id": "FIG 02",
+                "label": "Post-fit H_T/pT^mu1 distributions in SRs and CRs",
+                "aspect": "2.5:1 wide",
+                "role": "supporting_validation",
+            }
+        ],
+        "placements": {"FIG 02": [50, 100, 570, 310]},
+    }
+    _, updated = normalize_placeholder_geometry(
+        base_image=base,
+        spec=spec,
+        out_path=tmp_path / "planned.png",
+        redraw=False,
+    )
+    box = updated["placements"]["FIG 02"]
+    frame = updated["_replacement_frame_boxes"]["FIG 02"]
+    erase = updated["_replacement_erase_boxes"]["FIG 02"]
+    assert box[1] >= 125
+    assert frame[1] >= 125
+    assert erase[1] >= 125
+    assert frame[3] <= 310
+    assert abs(((box[2] - box[0]) / (box[3] - box[1])) - 2.5) < 0.03
+
+
 def test_hidden_normalize_keeps_edge_detection_inside_canvas_gutter(tmp_path: Path):
     base = tmp_path / "base.png"
     Image.new("RGB", (1000, 900), "white").save(base)
@@ -696,6 +741,105 @@ def test_audit_generated_placeholder_geometry_rejects_wide_ribbon(tmp_path: Path
     assert issues
     assert issues[0]["id"] == "FIG 02"
     assert issues[0]["actual_ratio"] > 5
+
+
+def test_audit_rejects_ratio_correct_box_that_includes_public_text(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (640, 520), "white")
+    draw = ImageDraw.Draw(im)
+    # Simulate the bad Zγ regression: a ratio-correct detected/dashed panel whose
+    # top band actually contains a public headline/callout, not blank placeholder
+    # space.  Replacing this box would cover the headline.
+    draw.rectangle([100, 100, 500, 403], outline=(110, 110, 120), width=2)
+    for y in range(116, 180, 18):
+        draw.rectangle([130, y, 470, y + 8], fill=(20, 35, 60))
+    draw.text((265, 270), "[FIG 01]", fill=(80, 80, 80))
+    im.save(base)
+    spec = {
+        "placeholders": [{"id": "FIG 01", "label": "Hero result", "aspect": "1.32:1"}],
+        "placements": {"FIG 01": [100, 100, 500, 403]},
+    }
+    issues = audit_generated_placeholder_geometry(base_image=base, spec=spec, ratio_tolerance=0.20)
+    assert any(issue.get("category") == "placeholder_text_overlap" for issue in issues)
+
+
+def test_hidden_normalize_recovers_inner_placeholder_when_detection_includes_heading(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (640, 520), "white")
+    draw = ImageDraw.Draw(im)
+    # Public heading/caption above the real placeholder.  A VLM may incorrectly
+    # return one ratio-correct bbox covering both the heading and dashed slot.
+    for y in range(128, 172, 16):
+        draw.rectangle([62, y, 330, y + 7], fill=(20, 35, 60))
+    # Actual clean dashed placeholder, lower and narrower than the mistaken bbox.
+    for x in range(34, 258, 24):
+        draw.line([(x, 213), (min(x + 12, 258), 213)], fill=(110, 110, 120), width=3)
+        draw.line([(x, 382), (min(x + 12, 258), 382)], fill=(110, 110, 120), width=3)
+    for y in range(213, 382, 24):
+        draw.line([(34, y), (34, min(y + 12, 382))], fill=(110, 110, 120), width=3)
+        draw.line([(258, y), (258, min(y + 12, 382))], fill=(110, 110, 120), width=3)
+    draw.text((116, 286), "[FIG 02]", fill=(80, 80, 80))
+    im.save(base)
+    spec = {
+        "placeholders": [{"id": "FIG 02", "label": "Profile likelihood scan", "aspect": "1.22:1"}],
+        "placements": {"FIG 02": [35, 112, 353, 373]},
+    }
+    assert audit_generated_placeholder_geometry(base_image=base, spec=spec, ratio_tolerance=0.20) == []
+    _, updated = normalize_placeholder_geometry(
+        base_image=base,
+        spec=spec,
+        out_path=tmp_path / "planned.png",
+        redraw=False,
+    )
+    clear = updated["_replacement_clear_boxes"]["FIG 02"]
+    box = updated["placements"]["FIG 02"]
+    assert clear[1] >= 205
+    assert clear[3] <= 390
+    assert box[0] >= clear[0] and box[1] >= clear[1]
+    assert box[2] <= clear[2] and box[3] <= clear[3]
+
+
+def test_hidden_normalize_uses_contract_x_to_separate_paired_placeholders(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (640, 520), "white")
+    draw = ImageDraw.Draw(im)
+    # Two adjacent near-square dashed diagram placeholders.
+    for left, right in ((32, 222), (247, 440)):
+        for x in range(left, right, 24):
+            draw.line([(x, 220), (min(x + 12, right), 220)], fill=(85, 85, 85), width=3)
+            draw.line([(x, 378), (min(x + 12, right), 378)], fill=(85, 85, 85), width=3)
+        for y in range(220, 378, 24):
+            draw.line([(left, y), (left, min(y + 12, 378))], fill=(85, 85, 85), width=3)
+            draw.line([(right, y), (right, min(y + 12, 378))], fill=(85, 85, 85), width=3)
+    im.save(base)
+    spec = {
+        "placeholders": [
+            {"id": "FIG 03", "label": "Left VBF diagram", "aspect": "1.2:1"},
+            {"id": "FIG 04", "label": "Right VBF diagram", "aspect": "1.2:1"},
+        ],
+        "placements": {
+            "FIG 03": [32, 220, 222, 378],
+            # Simulate a VLM detection that is ratio-correct but starts inside
+            # the left tile because it included a shared heading/card band.
+            "FIG 04": [119, 146, 440, 414],
+        },
+        "_layout_contract_search_boxes": {
+            "FIG 03": [14, 200, 296, 430],
+            "FIG 04": [236, 200, 518, 430],
+        },
+    }
+    _, updated = normalize_placeholder_geometry(
+        base_image=base,
+        spec=spec,
+        out_path=tmp_path / "planned.png",
+        redraw=False,
+    )
+    left = updated["placements"]["FIG 03"]
+    right = updated["placements"]["FIG 04"]
+    assert left[2] < right[0]
+    assert right[0] >= 240
+    assert updated["_replacement_clear_boxes"]["FIG 04"][0] >= 240
+    assert abs(((right[2] - right[0]) / (right[3] - right[1])) - 1.2) < 0.04
 
 
 def test_audit_tolerates_moderately_imperfect_wide_placeholder(tmp_path: Path):

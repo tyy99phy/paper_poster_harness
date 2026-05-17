@@ -525,21 +525,49 @@ def normalize_placeholder_geometry(
             ratio = max(0.1, (x1 - x0) / max(1, y1 - y0))
         original_box = (x0, y0, x1, y1)
         label = str(ph.get("label") or fig_id)
-        source_box = _find_enclosing_placeholder_panel(canvas, original_box, ratio) or original_box
-        source_box = _repair_edge_wide_source_box(source_box, original_box, ratio, canvas.size)
-        source_box = _enforce_canvas_gutter(source_box, canvas.size)
         contract_search_box = _read_optional_box(
             contract_search_mapping,
             str(fig_id),
             scale=scale,
             canvas_size=canvas.size,
         )
-        source_box = _apply_layout_contract_search_constraint(
-            source_box,
-            original_box,
-            contract_search_box,
-            ratio,
+        source_candidate = _find_enclosing_placeholder_panel(canvas, original_box, ratio)
+        source_candidate_acceptable = bool(
+            source_candidate
+            and (
+                redraw
+                or _nearby_placeholder_panel(source_candidate, original_box)
+                or _placeholder_panel_strongly_overlaps_seed(source_candidate, original_box)
+            )
         )
+        contract_panel = None
+        if not source_candidate_acceptable:
+            contract_panel = _recover_dashed_panel_with_contract(
+                canvas,
+                original_box=original_box,
+                search_box=contract_search_box,
+                ratio=ratio,
+            )
+        if source_candidate_acceptable and source_candidate:
+            source_box = source_candidate
+        elif contract_panel is not None:
+            source_box = contract_panel
+        else:
+            # Hidden production planning must not jump to a distant enclosing
+            # light panel: dense posters can have neighboring figure cards in
+            # the same column, and a broad scan can paste the real figure into
+            # the wrong section.  When the recovered panel is far from the seed,
+            # keep the detected placeholder as the hard visual envelope.
+            source_box = original_box
+        source_box = _repair_edge_wide_source_box(source_box, original_box, ratio, canvas.size)
+        source_box = _enforce_canvas_gutter(source_box, canvas.size)
+        if redraw:
+            source_box = _apply_layout_contract_search_constraint(
+                source_box,
+                original_box,
+                contract_search_box,
+                ratio,
+            )
         source_box = _refine_square_result_source_to_dashed_placeholder(
             canvas,
             source_box,
@@ -606,6 +634,16 @@ def normalize_placeholder_geometry(
                 box = _inset_supporting_wide_target_box(source_box, ratio)
                 frame_box = _supporting_wide_frame_around_target(box, source_box)
                 erase_box = source_box
+                safe_top = _supporting_wide_safe_visual_top(canvas, source_box)
+                if safe_top is not None and safe_top > box[1]:
+                    box = _shift_box_down_to_top_inside(box, safe_top, source_box, ratio)
+                    visual_source = (source_box[0], safe_top, source_box[2], source_box[3])
+                    frame_box = _supporting_wide_frame_around_target(box, visual_source)
+                    # Do not erase section subtitles/headings above the true
+                    # dashed placeholder top.  The broad source_box remains the
+                    # containment envelope, but the visible cleanup starts at
+                    # the inner dashed line.
+                    erase_box = visual_source
             # For square result plots, LLM detection often captures a good
             # ratio-correct seed that is visually just a little too low/right
             # inside a decorative result block.  Do not expand to the full
@@ -728,6 +766,25 @@ def audit_generated_placeholder_geometry(
         actual = _box_ratio(visible_box)
         rel_error = _ratio_relative_error(actual, expected)
         effective_tolerance = _effective_placeholder_ratio_tolerance(expected, ratio_tolerance)
+        text_metrics = _placeholder_candidate_public_text_metrics(canvas, visible_box)
+        if _placeholder_candidate_has_public_text_overlap(canvas, visible_box):
+            issues.append(
+                {
+                    "id": str(fig_id),
+                    "category": "placeholder_text_overlap",
+                    "expected_ratio": round(expected, 4),
+                    "actual_ratio": round(actual, 4),
+                    "detected_box": list(detected_box),
+                    "visible_box": list(visible_box),
+                    "top25_busy_fraction": round(text_metrics["top25"], 4),
+                    "top35_busy_fraction": round(text_metrics["top35"], 4),
+                    "message": (
+                        f"{fig_id} detected placeholder panel appears to include public poster text "
+                        f"(top-band busy fraction {text_metrics['top25']:.0%}); replacing it would "
+                        "cover headings, result callouts, or analysis copy"
+                    ),
+                }
+            )
         if rel_error > effective_tolerance:
             issues.append(
                 {
@@ -919,6 +976,48 @@ def _box_light_fraction(canvas: Image.Image, box: tuple[int, int, int, int]) -> 
             if _is_light_figure_surface_pixel(pixels[x, y]):
                 light += 1
     return light / total if total else 0.0
+
+
+def _nearby_placeholder_panel(
+    candidate: tuple[int, int, int, int],
+    seed: tuple[int, int, int, int],
+) -> bool:
+    seed_w = max(1, seed[2] - seed[0])
+    seed_h = max(1, seed[3] - seed[1])
+    cand_cx = (candidate[0] + candidate[2]) / 2
+    cand_cy = (candidate[1] + candidate[3]) / 2
+    seed_cx = (seed[0] + seed[2]) / 2
+    seed_cy = (seed[1] + seed[3]) / 2
+    dx = abs(cand_cx - seed_cx)
+    dy = abs(cand_cy - seed_cy)
+    return dx <= max(48, seed_w * 0.45) and dy <= max(48, seed_h * 0.45)
+
+
+def _placeholder_panel_strongly_overlaps_seed(
+    candidate: tuple[int, int, int, int],
+    seed: tuple[int, int, int, int],
+) -> bool:
+    """Allow a recovered dashed panel that is locally overlapping but shifted.
+
+    Wide placeholders are sometimes detected as their lower half; the true
+    dashed rectangle can be shifted upward by slightly more than the generic
+    ``_nearby_placeholder_panel`` threshold while still sharing most of the seed
+    footprint.  Use overlap as stronger evidence than center distance.
+    """
+
+    overlap = _box_overlap(candidate, seed)
+    if overlap <= 0:
+        return False
+    min_area = max(1, min(_box_area(candidate), _box_area(seed)))
+    if overlap / min_area < 0.42:
+        return False
+    seed_w = max(1, seed[2] - seed[0])
+    seed_h = max(1, seed[3] - seed[1])
+    cand_cx = (candidate[0] + candidate[2]) / 2
+    cand_cy = (candidate[1] + candidate[3]) / 2
+    seed_cx = (seed[0] + seed[2]) / 2
+    seed_cy = (seed[1] + seed[3]) / 2
+    return abs(cand_cx - seed_cx) <= max(72, seed_w * 0.60) and abs(cand_cy - seed_cy) <= max(72, seed_h * 0.85)
 
 
 def _effective_placeholder_ratio_tolerance(expected_ratio: float, base_tolerance: float) -> float:
@@ -1143,7 +1242,10 @@ def _repair_edge_wide_source_box(
     if ratio < 1.8:
         return source_box
     canvas_w, canvas_h = canvas_size
-    edge_margin = max(8, int(round(canvas_w * 0.02)))
+    # Only true canvas-edge detections need this recovery.  A normally inset
+    # wide placeholder at x≈15-30 px should not be expanded vertically; doing so
+    # can erase the bullets immediately below the dashed figure box.
+    edge_margin = max(6, int(round(canvas_w * 0.01)))
     if source_box[0] > edge_margin and original_box[0] > edge_margin:
         return source_box
     ox0, oy0, ox1, oy1 = original_box
@@ -1382,13 +1484,33 @@ def _find_enclosing_placeholder_panel(
     it returns ``None`` and the caller keeps the LLM box.
     """
     raw_error = _ratio_relative_error(_box_ratio(box), ratio)
-    if raw_error <= _effective_placeholder_ratio_tolerance(ratio, 0.20) and _box_has_placeholder_edge_evidence(canvas, box):
+    if (
+        raw_error <= _effective_placeholder_ratio_tolerance(ratio, 0.20)
+        and _placeholder_candidate_has_public_text_overlap(canvas, box)
+    ):
+        recovered = _recover_clean_inner_placeholder_from_text_overlap(canvas, box, ratio)
+        if recovered is not None:
+            return recovered
+        # A ratio-correct seed that includes public text is unsafe.  Keep the
+        # original for strict geometry audit so it can be rejected or repaired at
+        # the template level rather than replacing a box that covers headings,
+        # callouts, or analysis copy.
+        return None
+    if (
+        raw_error <= _effective_placeholder_ratio_tolerance(ratio, 0.20)
+        and _box_has_placeholder_edge_evidence(canvas, box)
+        and not _placeholder_candidate_has_public_text_overlap(canvas, box)
+    ):
         # When the vision model already reports a ratio-correct box with visible
         # placeholder border evidence, trust that seed.  Expanding a good seed to
         # the surrounding light card/section is what made wide post-fit plots
         # cover the bullet rows below and made square result erasers reach into
         # public callouts.
         return None
+
+    local_panel = _recover_local_clean_dashed_placeholder_panel(canvas, box, ratio)
+    if local_panel is not None:
+        return local_panel
 
     dashed_panel = _find_dashed_placeholder_panel(canvas, box, ratio)
     if dashed_panel is not None:
@@ -1528,6 +1650,135 @@ def _find_enclosing_placeholder_panel(
     if area_growth > 1.15 and panel_error > raw_error + 0.08:
         return None
     return panel
+
+
+def _recover_clean_inner_placeholder_from_text_overlap(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int] | None:
+    """Tighten a VLM bbox that included a heading/caption above a placeholder.
+
+    The vision detector sometimes returns a ratio-correct rectangle that starts
+    at a local section heading and ends at the actual dashed placeholder bottom.
+    Rejecting that whole template is unnecessarily expensive if the real inner
+    dashed placeholder is visible and clean.  This recovery is deliberately
+    shrink-only/local: it searches lower sub-windows of the reported box and
+    accepts only a clean dashed rectangle that overlaps the original detection.
+    """
+
+    x0, y0, x1, y1 = _pad_box(box, 0, canvas.size)
+    width = max(1, x1 - x0)
+    height = max(1, y1 - y0)
+    raw_area = max(1, width * height)
+    candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+    # Headings/captions usually occupy the top 15-35% of the mistaken bbox.
+    # Try progressively lower, slightly left-biased windows; the right side of
+    # the mistaken box often includes adjacent prose or an outer light card.
+    for top_fraction in (0.16, 0.22, 0.28, 0.34):
+        for right_fraction in (0.72, 0.82, 0.92, 1.00):
+            sx0 = max(0, x0 - int(round(width * 0.06)))
+            sy0 = min(canvas.height, y0 + int(round(height * top_fraction)))
+            sx1 = min(canvas.width, x0 + int(round(width * right_fraction)))
+            sy1 = min(canvas.height, y1 + int(round(height * 0.06)))
+            if sx1 <= sx0 + 32 or sy1 <= sy0 + 32:
+                continue
+            panel = _find_dashed_placeholder_panel(canvas, (sx0, sy0, sx1, sy1), ratio)
+            if panel is None:
+                continue
+            if _placeholder_candidate_has_public_text_overlap(canvas, panel):
+                continue
+            area = max(1, _box_area(panel))
+            if area < raw_area * 0.18 or area > raw_area * 1.05:
+                continue
+            overlap_panel = _box_overlap(panel, box) / area
+            if overlap_panel < 0.45:
+                continue
+            rel = _ratio_relative_error(_box_ratio(panel), ratio)
+            if rel > _effective_placeholder_ratio_tolerance(ratio, 0.20):
+                continue
+            # Prefer clean, tight panels that remove the busy top band while
+            # preserving the source aspect.  A lower top edge is a feature here.
+            top_shift = max(0.0, (panel[1] - y0) / height)
+            area_fraction = area / raw_area
+            score = rel + abs(area_fraction - 0.50) * 0.05 - min(0.08, top_shift * 0.06)
+            candidates.append((score, panel))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def _recover_local_clean_dashed_placeholder_panel(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int] | None:
+    """Recover a nearby dashed placeholder when the VLM seed is an inset crop.
+
+    This is more conservative than the broad fallback search in
+    ``_find_enclosing_placeholder_panel``: it uses only small windows around the
+    reported seed and rejects panels whose center drifts into neighboring text or
+    section/card borders.  It fixes cases where the VLM reports the lower half of
+    a wide placeholder, causing downstream contract recovery to latch onto the
+    following bullet/conclusion block.
+    """
+
+    x0, y0, x1, y1 = _pad_box(box, 0, canvas.size)
+    width = max(1, x1 - x0)
+    height = max(1, y1 - y0)
+    raw_area = max(1, width * height)
+    candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+    if ratio >= 1.8:
+        window_specs = (
+            (0.06, 0.75, 0.25),
+            (0.10, 0.95, 0.35),
+            (0.16, 0.60, 0.45),
+        )
+    else:
+        window_specs = (
+            (0.08, 0.45, 0.35),
+            (0.14, 0.65, 0.45),
+            (0.20, 0.35, 0.60),
+        )
+    seed_cx = (x0 + x1) / 2
+    seed_cy = (y0 + y1) / 2
+    max_dx = max(56.0, width * 0.40)
+    max_dy = max(56.0, height * (0.72 if ratio >= 1.8 else 0.55))
+    for x_pad_f, y_up_f, y_down_f in window_specs:
+        sx0 = max(0, x0 - int(round(width * x_pad_f)))
+        sx1 = min(canvas.width, x1 + int(round(width * x_pad_f)))
+        sy0 = max(0, y0 - int(round(height * y_up_f)))
+        sy1 = min(canvas.height, y1 + int(round(height * y_down_f)))
+        if sx1 <= sx0 + 32 or sy1 <= sy0 + 32:
+            continue
+        panel = _find_dashed_placeholder_panel(canvas, (sx0, sy0, sx1, sy1), ratio)
+        if panel is None:
+            continue
+        if _placeholder_candidate_has_public_text_overlap(canvas, panel):
+            continue
+        area = max(1, _box_area(panel))
+        if area < raw_area * 0.28 or area > raw_area * 3.20:
+            continue
+        overlap = _box_overlap(panel, box) / max(1, min(area, raw_area))
+        if overlap < 0.22:
+            continue
+        panel_cx = (panel[0] + panel[2]) / 2
+        panel_cy = (panel[1] + panel[3]) / 2
+        dx = abs(panel_cx - seed_cx)
+        dy = abs(panel_cy - seed_cy)
+        if dx > max_dx or dy > max_dy:
+            continue
+        rel = _ratio_relative_error(_box_ratio(panel), ratio)
+        if rel > _effective_placeholder_ratio_tolerance(ratio, 0.20):
+            continue
+        center_penalty = (dx / max(1.0, width)) + (dy / max(1.0, height))
+        score = rel + 0.08 * center_penalty - 0.02 * min(1.0, overlap)
+        candidates.append((score, panel))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
 
 def _find_light_placeholder_panel(
@@ -1810,6 +2061,8 @@ def _find_dashed_placeholder_panel(
                 left = left_group[0]
                 right = right_group[1] + 1
                 panel = _pad_box((left, top, right, bottom), 0, canvas.size)
+                if _placeholder_candidate_has_public_text_overlap(canvas, panel):
+                    continue
                 panel_ratio = _box_ratio(panel)
                 ratio_error = _ratio_relative_error(panel_ratio, ratio)
                 if ratio_error > max_ratio_error:
@@ -1860,6 +2113,191 @@ def _find_dashed_placeholder_panel(
     if _box_area(best) < seed_area * 0.18:
         return None
     return best
+
+
+def _placeholder_candidate_public_text_metrics(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+) -> dict[str, float]:
+    """Estimate whether a candidate figure panel contains public text.
+
+    Blank placeholders do contain their [FIG NN] label and aspect-ratio text,
+    usually centered in the figure slot.  What is unsafe is a replacement panel
+    whose upper band contains section headings, result claims, callout badges, or
+    flowchart text; pasting a real figure into such a panel visibly covers public
+    poster content.  A simple upper-band busy-pixel check is intentionally
+    conservative and catches the regression where FIG01/FIG02 expanded upward
+    into nearby copy.
+    """
+    x0, y0, x1, y1 = _pad_box(box, 0, canvas.size)
+    w = max(0, x1 - x0)
+    h = max(0, y1 - y0)
+    if w < 48 or h < 48:
+        return {"top25": 0.0, "top35": 0.0, "overall": 0.0}
+    pixels = canvas.load()
+
+    def fraction(y_end: int) -> float:
+        busy = 0
+        total = 0
+        for y in range(y0, max(y0 + 1, min(y1, y_end)), 2):
+            for x in range(x0, x1, 2):
+                total += 1
+                if _is_busy_pixel(pixels[x, y]):
+                    busy += 1
+        return busy / total if total else 0.0
+
+    return {
+        "top25": fraction(y0 + int(round(h * 0.25))),
+        "top35": fraction(y0 + int(round(h * 0.35))),
+        "overall": fraction(y1),
+    }
+
+
+def _placeholder_candidate_has_public_text_overlap(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+) -> bool:
+    metrics = _placeholder_candidate_public_text_metrics(canvas, box)
+    return (
+        metrics["top25"] >= 0.22
+        or metrics["top35"] >= 0.18
+        or (metrics["top25"] >= 0.16 and metrics["overall"] >= 0.14)
+    )
+
+
+def _recover_dashed_panel_with_contract(
+    canvas: Image.Image,
+    *,
+    original_box: tuple[int, int, int, int],
+    search_box: tuple[int, int, int, int] | None,
+    ratio: float,
+) -> tuple[int, int, int, int] | None:
+    """Recover a visible dashed placeholder using VLM detection plus contract.
+
+    The layout contract is not used as a fallback placement.  It only widens the
+    pixel-search window around a VLM seed so the harness can recover an actually
+    drawn dashed rectangle when the VLM locks onto a plausible label/text box
+    slightly above or inside the true placeholder.
+    """
+    if search_box is None:
+        return None
+    hybrid_panel = _recover_dashed_panel_from_contract_hybrid(
+        canvas,
+        original_box=original_box,
+        search_box=search_box,
+        ratio=ratio,
+    )
+    if hybrid_panel is not None:
+        return hybrid_panel
+    union = _union_box(original_box, search_box)
+    ux0, uy0, ux1, uy1 = union
+    pad = int(round(max(12, min(96, max(ux1 - ux0, uy1 - uy0) * 0.08))))
+    search_seed = _pad_box(union, pad, canvas.size)
+    panel = _find_dashed_placeholder_panel(canvas, search_seed, ratio)
+    if panel is None:
+        return None
+    if _placeholder_candidate_has_public_text_overlap(canvas, panel):
+        return None
+    if _ratio_relative_error(_box_ratio(panel), ratio) > _effective_placeholder_ratio_tolerance(ratio, 0.20):
+        return None
+    panel_area = max(1, _box_area(panel))
+    if panel_area > max(1, _box_area(search_seed)) * 1.20:
+        return None
+    overlap_original = _box_overlap(panel, original_box) / max(1, min(panel_area, _box_area(original_box)))
+    overlap_search = _box_overlap(panel, search_box) / max(1, min(panel_area, _box_area(search_box)))
+    if max(overlap_original, overlap_search) < 0.20:
+        return None
+    original_w = max(1, original_box[2] - original_box[0])
+    original_h = max(1, original_box[3] - original_box[1])
+    panel_cx = (panel[0] + panel[2]) / 2
+    panel_cy = (panel[1] + panel[3]) / 2
+    original_cx = (original_box[0] + original_box[2]) / 2
+    original_cy = (original_box[1] + original_box[3]) / 2
+    if (
+        abs(panel_cx - original_cx) > max(80.0, original_w * 0.55)
+        or abs(panel_cy - original_cy) > max(80.0, original_h * 0.65)
+    ):
+        return None
+    cx = (panel[0] + panel[2]) / 2
+    cy = (panel[1] + panel[3]) / 2
+    if not (search_seed[0] <= cx <= search_seed[2] and search_seed[1] <= cy <= search_seed[3]):
+        return None
+    return panel
+
+
+def _recover_dashed_panel_from_contract_hybrid(
+    canvas: Image.Image,
+    *,
+    original_box: tuple[int, int, int, int],
+    search_box: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int] | None:
+    """Recover paired placeholders using contract x-position + detected y-span.
+
+    In dense two-tile sections, the VLM can return a ratio-correct bbox for the
+    right placeholder that starts inside the left placeholder because it included
+    a shared heading/card region.  The layout-contract y-zone may be stale after
+    image-generation/micro-repair, but its x-zone still distinguishes the two
+    side-by-side tiles.  Search locally in the contract x-window and the detected
+    vertical band before falling back to the broad union search.
+    """
+
+    ox0, oy0, ox1, oy1 = original_box
+    sx0, sy0, sx1, sy1 = search_box
+    ow = max(1, ox1 - ox0)
+    oh = max(1, oy1 - oy0)
+    sw = max(1, sx1 - sx0)
+    # Only use this when the contract and detection disagree enough that the
+    # broad union search could include a neighboring tile.
+    original_cx = (ox0 + ox1) / 2
+    search_cx = (sx0 + sx1) / 2
+    if abs(original_cx - search_cx) < max(32, min(ow, sw) * 0.20):
+        return None
+
+    pad_x = int(round(max(12, min(72, sw * 0.10))))
+    pad_y = int(round(max(12, min(96, oh * 0.22))))
+    candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+    windows = [
+        # Tightest and most useful for the common failure: the VLM included a
+        # heading/top card band, while the contract x-zone identifies the right
+        # tile.  Start below the suspicious top band.
+        (sx0 - pad_x, oy0 + int(round(oh * 0.18)), sx1 + pad_x, oy1 + int(round(oh * 0.04))),
+        (sx0 - pad_x, oy0 + int(round(oh * 0.08)), sx1 + pad_x, oy1 + int(round(oh * 0.08))),
+        (sx0 - pad_x, oy0 - pad_y, sx1 + pad_x, oy1 + pad_y),
+        (sx0 - pad_x, min(oy0, sy0) - pad_y, sx1 + pad_x, max(oy1, sy1) + pad_y),
+    ]
+    for raw_window in windows:
+        window = _clamp_box(tuple(int(round(v)) for v in raw_window), canvas.size)
+        if window[2] <= window[0] + 32 or window[3] <= window[1] + 32:
+            continue
+        panel = _find_dashed_placeholder_panel(canvas, window, ratio)
+        if panel is None:
+            continue
+        if panel[0] < sx0 - max(8, int(round(sw * 0.08))) or panel[2] > sx1 + max(8, int(round(sw * 0.12))):
+            # The recovered panel wandered into the neighboring side-by-side
+            # placeholder.  Do not let a broad dashed search override the
+            # contract's identity cue.
+            continue
+        if _placeholder_candidate_has_public_text_overlap(canvas, panel):
+            continue
+        rel = _ratio_relative_error(_box_ratio(panel), ratio)
+        if rel > _effective_placeholder_ratio_tolerance(ratio, 0.20):
+            continue
+        panel_area = max(1, _box_area(panel))
+        overlap_original = _box_overlap(panel, original_box) / max(1, min(panel_area, _box_area(original_box)))
+        overlap_search = _box_overlap(panel, search_box) / max(1, min(panel_area, _box_area(search_box)))
+        if max(overlap_original, overlap_search) < 0.15:
+            continue
+        panel_cx = (panel[0] + panel[2]) / 2
+        # Bias toward the contract x-zone, because this helper is specifically
+        # resolving side-by-side placeholder identity.
+        contract_dx = abs(panel_cx - search_cx) / max(1, sw)
+        score = rel + 0.10 * contract_dx - 0.03 * max(overlap_original, overlap_search)
+        candidates.append((score, panel))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
 
 def _line_segments_on_row(
@@ -2445,6 +2883,65 @@ def _supporting_wide_frame_around_target(
     return x0, y0, x1, min(y1, box[3] + bottom_pad)
 
 
+def _supporting_wide_safe_visual_top(
+    canvas: Image.Image,
+    source_box: tuple[int, int, int, int],
+) -> int | None:
+    """Find the true dashed top below a section subtitle/underline.
+
+    A wide supporting plot can sit under a short public subtitle.  Vision/pixel
+    recovery may include the subtitle underline as the top of the placeholder
+    card, causing the replacement eraser to cover that text.  The real dashed
+    placeholder top is usually a moderate-length dashed row a few pixels below a
+    full-width section rule.  Return a safer visual top just above that row.
+    """
+
+    x0, y0, x1, y1 = _pad_box(source_box, 0, canvas.size)
+    width = max(1, x1 - x0)
+    height = max(1, y1 - y0)
+    if width < 120 or height < 80:
+        return None
+    pixels = canvas.load()
+    row_counts: list[tuple[int, int]] = []
+    scan_end = min(y1, y0 + max(42, int(round(height * 0.34))))
+    for y in range(y0 + 5, scan_end):
+        count = 0
+        for x in range(x0, x1, 2):
+            if _is_placeholder_line_pixel(pixels[x, y]):
+                count += 2
+        if count >= width * 0.24:
+            row_counts.append((y, count))
+    if not row_counts:
+        return None
+    groups = _cluster_line_positions([y for y, _ in row_counts], max_gap=2)
+    counts = _group_max_counts(groups, row_counts)
+    # Ignore full-width section/card rules.  Prefer the first moderate dashed
+    # row inside the figure slot.
+    for group in groups:
+        count = counts.get(group, 0)
+        if width * 0.24 <= count <= width * 0.82 and group[0] >= y0 + max(8, int(round(height * 0.08))):
+            return max(y0, group[0] - max(3, min(8, int(round(height * 0.025)))))
+    return None
+
+
+def _shift_box_down_to_top_inside(
+    box: tuple[int, int, int, int],
+    desired_top: int,
+    outer: tuple[int, int, int, int],
+    ratio: float,
+) -> tuple[int, int, int, int]:
+    if desired_top <= box[1]:
+        return box
+    shift = desired_top - box[1]
+    shifted = (box[0], box[1] + shift, box[2], box[3] + shift)
+    if _is_contained(shifted, outer, margin=0):
+        return shifted
+    constrained = (outer[0], desired_top, outer[2], outer[3])
+    if constrained[3] <= constrained[1] + 8:
+        return box
+    return _fit_box_to_ratio_inside(constrained, ratio)
+
+
 def _square_result_frame_around_target(
     box: tuple[int, int, int, int],
     clear_box: tuple[int, int, int, int],
@@ -2611,12 +3108,25 @@ def _is_lower_hero_placeholder(
     if not (1.20 <= ratio <= 2.20):
         return False
     label = str(ph.get("label") or "").lower()
-    group = str(ph.get("group") or "").lower()
-    if not (
-        "hero" in group
-        or "result" in group
-        or any(word in label for word in ("comparison", "result", "mass measurement", "electroweak"))
-    ):
+    role = str(ph.get("role") or "").lower()
+    # Keep this heuristic narrow.  A broad ``group: hero_result`` tag can also
+    # appear on profile-likelihood or validation plots; forcing those upward
+    # leaves visible placeholder labels/dashed borders behind.  Only lower
+    # comparison/limit-style result cards need the anti-protrusion clipping.
+    limit_like = any(
+        word in label
+        for word in (
+            "limit",
+            "comparison",
+            "upper",
+            "exclusion",
+            "mass measurement",
+            "electroweak",
+        )
+    )
+    if not limit_like:
+        return False
+    if "support" in role and not any(word in label for word in ("limit", "comparison", "upper", "exclusion")):
         return False
     return box[1] >= max(1, canvas_size[1]) * 0.66
 

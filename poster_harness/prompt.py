@@ -17,6 +17,18 @@ HEP_POSTER_GRAMMAR = [
     "Keep the body modular: 4-6 large cards or shaped blocks, 2-3 columns, generous gutters, and a clear left-to-right/top-to-bottom reading path.",
     "Let 40-55% of the body be reserved for figure placeholders; HEP posters are figure-led, not paragraph-led.",
     "Use small badges for dataset, collision energy, luminosity, channel, or experiment only when present in the supplied text; never invent numbers.",
+    "Render HEP symbols unambiguously: Greek gamma must look like γ, never Latin y; if a small label risks ambiguity, use the word gamma instead of a corrupted glyph.",
+]
+
+SCIENTIFIC_POSTER_GRAMMAR = [
+    "Use a clear scientific story spine: question → approach → evidence → key result → implication.",
+    "Use a strong top banner occupying roughly 10-16% of the canvas with title, author/institute line, and abstract field-appropriate artwork.",
+    "Use colored section ribbons or numbered tabs so the viewer can scan the poster from 2 meters away.",
+    "Create one dominant hero region for the central evidence/result; do not divide the body into many equal tiny boxes.",
+    "Cards/blocks do not need to be square: use wide bands, tall sidebars, pill headers, circular callouts, curved connectors, and staggered panels when it improves hierarchy.",
+    "Keep the body modular: 4-6 large cards or shaped blocks, 2-3 columns, generous gutters, and a clear left-to-right/top-to-bottom reading path.",
+    "Let important source figures lead the narrative; use concise text to frame what each real figure will communicate.",
+    "Use small badges for dataset, sample, method, metric, instrument, organism, condition, theorem, or result only when present in the supplied text; never invent numbers.",
 ]
 
 TEXT_DENSITY_RULES = [
@@ -42,6 +54,18 @@ FIGURE_COMPOSITION_RULES = [
     "If a section mixes portrait, near-square, and square plots, give each placeholder its own correctly shaped light mat; do not force them into equal tall columns or equal square tiles.",
 ]
 
+GENERIC_FIGURE_COMPOSITION_RULES = [
+    "Allocate the largest placeholder to the paper's most important empirical result, method diagram, visual evidence, or theorem/analysis figure.",
+    "Every placeholder rectangle must match its selected source image aspect ratio; enlarge or reshape the surrounding block instead of stretching the placeholder.",
+    "Method, validation, diagnostic, qualitative, or supporting-result placeholders should support the story, not dominate it unless the paper's contribution is methodological.",
+    "Dense multi-panel figures need large absolute area; preserve their native wide/tall ratio rather than forcing a square slot.",
+    "For wide plots/tables/examples, reserve enough vertical height for axes, legends, labels, or row text; reduce nearby prose before making the figure hard to read.",
+    "Use domain-specific method/detail cards rather than generic data-processing pipelines.",
+    "Placeholders should align to the card grid and be easy to replace: rectangular, unobstructed, with visible margins.",
+    "All figure-containing cards must use a light paper/lab-white surface around the placeholder; dark or saturated fills may be outer accents only, never the block background directly behind a future white plot.",
+    "If a section mixes portrait, near-square, and square figures, give each placeholder its own correctly shaped light mat; do not force them into equal tall columns or equal square tiles.",
+]
+
 FIGURE_SURFACE_RULES = [
     "Mandatory: every [FIG NN] placeholder sits inside a light neutral figure card or mat (warm white, pearl, very pale blue, or very pale gray), never inside a dark navy/purple/black content block.",
     "The placeholder rectangle and its immediate surrounding card surface should read as one clean paper-like area, so a future white-background plot blends naturally instead of looking pasted onto a dark sticker.",
@@ -59,7 +83,7 @@ TYPOGRAPHY_RULES = [
 ]
 
 COLOR_MATERIAL_RULES = [
-    "Palette should feel premium rather than default-PPT: deep navy/indigo atmospheric field, CMS/cobalt blue, violet/magenta contrast, restrained amber/gold highlights, and warm-white figure cards.",
+    "Palette should feel premium rather than default-PPT: deep navy/indigo or graphite atmospheric field, one disciplined primary accent, one secondary contrast, restrained warm highlights, and warm-white figure cards.",
     "Maintain high contrast for text: dark text on light content cards, white text only in the top banner or non-figure dark accents.",
     "Use gradients, glows, and metallic accents in the background and frames, while keeping text cards and figure cards calm.",
     "Avoid large flat dark rectangles behind plots; avoid random rainbow palettes, neon clutter, and low-contrast gray text.",
@@ -86,6 +110,63 @@ def _sentence(text: Any) -> str:
     return value if value.endswith((".", "!", "?")) else value + "."
 
 
+def _decorative_symbol_rule(style: dict[str, Any]) -> str:
+    domain = str(style.get("domain_profile") or style.get("domain_label") or "").lower()
+    if "hep" in domain or "high_energy" in domain or "particle" in domain:
+        return "- Decorative icons/badges outside placeholders must be generic only (stars, checks, arrows, abstract circles). Do not put physics symbols, particle labels, equations, ΔL=2, μ/ν/q/W/N, axes, vertices, or event-display schematics in decorative badges."
+    return "- Decorative icons/badges outside placeholders must be generic only (stars, checks, arrows, abstract circles). Do not put field-specific symbols, equations, data marks, axes, table cells, microscopic/algorithmic/chemical/astronomical content, or scientific schematics in decorative badges unless they are public text."
+
+
+def _scientific_shorthand_rule(style: dict[str, Any]) -> str:
+    domain = str(style.get("domain_profile") or style.get("domain_label") or "").lower()
+    if "hep" in domain or "high_energy" in domain or "particle" in domain:
+        return "- Flowcharts, summary pills, and callout badges must not turn scientific shorthand into icons. Use plain words in normal text (for example 'dimuon' or 'muon-sector limit'), never standalone μμ/ν/W/N/ΔL/equation badges or pictograms."
+    return "- Flowcharts, summary pills, and callout badges must not turn scientific shorthand into decorative icons. Use plain public text; never standalone equation badges, fake data glyphs, schematic pictograms, or field-specific symbols outside placeholders."
+
+
+def _is_hep_style(style: dict[str, Any]) -> bool:
+    domain = str(style.get("domain_profile") or style.get("domain_label") or style.get("domain_grammar_heading") or "").lower()
+    return "hep" in domain or "high_energy" in domain or "particle" in domain or "cern" in domain
+
+
+def _outside_placeholder_symbol_rule(style: dict[str, Any]) -> str:
+    if _is_hep_style(style):
+        return "- Outside placeholders, do not draw particle-labeled icons, equation badges, process badges, or symbolic physics diagrams. Use public text only for scientific claims and generic abstract icons for decoration."
+    return "- Outside placeholders, do not draw field-specific symbolic icons, equation badges, process/data badges, fake algorithms, fake microscopy, fake molecules, fake sky maps, or scientific schematics. Use public text only for scientific claims and generic abstract icons for decoration."
+
+
+def _domain_guidance_prompt_lines(style: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    items: list[tuple[str, Any]] = [
+        ("Detected domain profile", style.get("domain_profile") or style.get("domain_label")),
+        ("Domain detection summary", style.get("domain_detection_summary")),
+        ("Domain text guidance", style.get("domain_text_guidance")),
+    ]
+    for label, value in items:
+        text = str(value or "").strip()
+        if text:
+            if not lines:
+                lines += ["DOMAIN-ADAPTIVE GUIDANCE (internal design brief; do not render this heading):"]
+            lines.append(f"- {label}: {_q(text)}")
+    for key, label in (
+        ("detected_visual_grammar", "Detected visual grammar"),
+        ("detected_layout_priorities", "Detected layout priorities"),
+        ("detected_text_priorities", "Detected text priorities"),
+    ):
+        values = _style_rule_list(style, key, [])
+        if values:
+            if not lines:
+                lines += ["DOMAIN-ADAPTIVE GUIDANCE (internal design brief; do not render this heading):"]
+            lines.append(f"- {label}: " + "; ".join(_q(str(item)) for item in values[:6]) + ".")
+    if _is_hep_style(style):
+        if not lines:
+            lines += ["DOMAIN-ADAPTIVE GUIDANCE (internal design brief; do not render this heading):"]
+        lines.append("- HEP notation legibility: Greek gamma must look like γ, never Latin y; if a compact label risks glyph ambiguity, use the word gamma.")
+    if lines:
+        lines.append("")
+    return lines
+
+
 def build_prompt(spec: dict[str, Any]) -> str:
     project = spec.get("project", {})
     style = spec.get("style", {})
@@ -101,6 +182,11 @@ def build_prompt(spec: dict[str, Any]) -> str:
         f"Audience: {project.get('audience', 'academic conference audience')}.",
         f"Overall style: {style.get('summary', 'premium scientific conference poster, modern, artistic, clean, not a collage')}.",
         "",
+        "TITLE SPELLING LOCK:",
+        f"- Render the top main title exactly as: \"{_q(project.get('title', 'Untitled Scientific Poster'))}\".",
+        "- Do not paraphrase, abbreviate, or visually autocorrect any title word. The word 'for' must be spelled f-o-r, never 'fon'.",
+        "- Keep Greek letters unambiguous in the title; if γ would look like Latin y, use clearer glyph spacing rather than a corrupted y.",
+        "",
         "POSITIVE ART DIRECTION:",
         f"- Art direction: {_sentence(style.get('art_direction', 'premium editorial science design with layered abstract geometry, luminous gradients, subtle depth, and clear hierarchy'))}",
         f"- Layout rhythm: {_sentence(style.get('layout_rhythm', 'asymmetric but balanced; avoid uniformly tiled white boxes'))}",
@@ -109,15 +195,17 @@ def build_prompt(spec: dict[str, Any]) -> str:
         f"- Color/material palette: {_sentence(style.get('color_palette', 'deep navy/indigo atmosphere with cobalt blue, violet, restrained gold accents, and warm-white content/figure cards'))}",
         f"- Figure-card surface: {_sentence(style.get('figure_surface', 'all plot/diagram placeholders must sit on light paper-like cards or mats, never on dark content blocks'))}",
         "- Start from a beautiful editorial composition, not from a slide deck or wireframe.",
-        "- Use abstract, non-data artwork outside placeholders: gradients, light trails, detector-like geometry, atmospheric glow, soft depth, and subtle material texture.",
-        "- Decorative icons/badges outside placeholders must be generic only (stars, checks, arrows, abstract circles). Do not put physics symbols, particle labels, equations, ΔL=2, μ/ν/q/W/N, axes, vertices, or event-display schematics in decorative badges.",
-        "- Flowcharts, summary pills, and callout badges must not turn scientific shorthand into icons. Use plain words in normal text (for example 'dimuon' or 'muon-sector limit'), never standalone μμ/ν/W/N/ΔL/equation badges or pictograms.",
+        "- Use abstract, non-data artwork outside placeholders: gradients, light trails, field-appropriate geometry, atmospheric glow, soft depth, and subtle material texture.",
+        _decorative_symbol_rule(style),
+        _scientific_shorthand_rule(style),
         "- Give the poster varied visual mass: one dominant hero region, secondary supporting modules, small badges, shaped callouts, and breathing room.",
         "- Section blocks may be rounded rectangles, capsules, circular badges, vertical sidebars, L-shaped wraps, staggered panels, or translucent overlays when this improves hierarchy.",
         "- Keep every scientific figure placeholder itself a clean rectangle on a light paper-like figure card, but make the surrounding poster expressive and premium.",
         "- Use official-looking identity as plain text badges only; do not hallucinate complex collaboration or institute logos unless explicitly supplied as assets.",
         "",
     ]
+
+    lines += _domain_guidance_prompt_lines(style)
 
     storyboard = spec.get("storyboard") if isinstance(spec.get("storyboard"), dict) else {}
     storyboard_sections = _storyboard_section_map(storyboard)
@@ -170,11 +258,12 @@ def build_prompt(spec: dict[str, Any]) -> str:
     copy_units_by_section = _copy_units_by_section(copy_deck)
     copy_deck_enabled = bool(copy_deck.get("copy_units")) if isinstance(copy_deck, dict) else False
 
-    grammar_rules = _style_rule_list(style, "hep_poster_grammar", HEP_POSTER_GRAMMAR)
+    grammar_rules = _style_rule_list(style, "domain_poster_grammar", SCIENTIFIC_POSTER_GRAMMAR)
     density_rules = _style_rule_list(style, "text_density", TEXT_DENSITY_RULES)
-    figure_rules = _style_rule_list(style, "figure_composition", FIGURE_COMPOSITION_RULES)
+    figure_rules = _style_rule_list(style, "figure_composition", GENERIC_FIGURE_COMPOSITION_RULES)
 
-    lines += ["HEP POSTER DESIGN GRAMMAR (calibrated from public CERN/LHCC posters):"]
+    grammar_heading = str(style.get("domain_grammar_heading") or "SCIENTIFIC POSTER DESIGN GRAMMAR")
+    lines += [f"{grammar_heading}:"]
     for rule in grammar_rules:
         lines.append(f"- {rule}")
     lines += ["", "TEXT DENSITY AND READABILITY:"]
@@ -222,7 +311,7 @@ def build_prompt(spec: dict[str, Any]) -> str:
     lines += [
         "ABSOLUTE PLACEHOLDER CONTRACT (mandatory; failure means the design is rejected):",
         "- Do NOT draw, approximate, summarize, miniaturize, stylize, or recreate ANY scientific figure content.",
-        "- This prohibition includes plots, axes, bars, bins, curves, legends, heatmaps, tables, Feynman diagrams, detector diagrams, process diagrams, equations-as-figures, screenshots, or tiny preview thumbnails.",
+        "- This prohibition includes plots, axes, bars, bins, curves, legends, heatmaps, tables, architecture diagrams, microscopy panels, spectra, molecular structures, sky maps, Feynman/process/detector diagrams, equations-as-figures, screenshots, or tiny preview thumbnails.",
         "- Even if a placeholder label says 'diagram', 'plot', 'distribution', 'limits', or 'table', you must NOT draw that item. Draw a blank placeholder only.",
         "- Every location where a plot/diagram/table/image should go must be a clean rectangular placeholder panel.",
         "- Use ONLY the placeholder IDs explicitly listed in this prompt. Do not invent, add, skip ahead to, or render any extra placeholder such as [FIG 06] unless it is listed in the PLACEHOLDER REFERENCE LIST.",
@@ -235,7 +324,7 @@ def build_prompt(spec: dict[str, Any]) -> str:
         "- Do not draw a generic 1.6:1 landscape rectangle for every placeholder. Each placeholder must use its own declared ratio.",
         "- Rejected geometry examples: a 2.5:1 plot as a 950×90 ribbon, a 1:1 result as a 300×190 landscape card, or any placeholder whose text cluster is detected instead of the whole figure panel.",
         "- No fake data and no real-looking scientific content may appear inside placeholders. Faint abstract grid texture is allowed only if it cannot be mistaken for data.",
-        "- Outside placeholders, do not draw particle-labeled icons, equation badges, process badges, or symbolic physics diagrams. Use public text only for scientific claims and generic abstract icons for decoration.",
+        _outside_placeholder_symbol_rule(style),
         "- Later, these placeholders will be replaced with real figures. Therefore they must be rectangular, unobstructed, and have enough padding.",
         "- Never add captions under placeholders that describe drawn content as if the figure were already present; captions may describe the future intended content only.",
         "",
@@ -267,7 +356,8 @@ def build_prompt(spec: dict[str, Any]) -> str:
             "- Interpret X:Y literally as width:height = X:Y. For example, 2.5:1 means the width is about two and a half heights, not three, four, or seven heights.",
             "- A square placeholder should look square; a wide placeholder should have real vertical presence and should not become a thin banner.",
             "- A moderate landscape placeholder such as 1.49:1 should look only about one and a half times wider than tall; never stretch it into a panoramic 2.5:1 or 3:1 banner.",
-            "- A portrait or near-portrait placeholder such as 1:1.16 should look only slightly taller than wide; do not draw it as a narrow vertical strip or tall column.",
+            "- A true portrait placeholder such as 1:1.99 should be a vertical panel about twice as tall as wide; do not make it square or landscape.",
+            "- A near-portrait placeholder such as 1:1.16 should look only slightly taller than wide; do not exaggerate it into a narrow tall column.",
             "- A square headline-result placeholder should be prominent but not oversized: keep its side around 30-34% of the canvas width, visibly larger than supporting scientific placeholders, never a giant sticker covering most of the result card.",
             "- For square placeholders, the visible light/white placeholder fill itself must also be square; do not put the [FIG NN] label inside a wide white rounded rectangle and only draw a square-ish dashed fragment inside it.",
             "- Keep the square headline-result placeholder clearly above the bottom summary/conclusion modules; its bottom edge should sit before the lower fifth of the poster begins, with an obvious gutter below it.",
@@ -391,13 +481,25 @@ def build_prompt(spec: dict[str, Any]) -> str:
                     "Hero visual priority: make this section's hero placeholder visibly dominant within its card while preserving the exact placeholder aspect ratio and light figure surface."
                 )
             ratios = [_parse_aspect_ratio_text(str(fig.get("aspect") or "")) or 1.0 for fig in sec_figs]
-            if any(ratio < 0.92 for ratio in ratios):
+            if any(ratio < 0.75 for ratio in ratios):
                 shape_notes = ", ".join(
                     f"[{fig.get('id')}]=~{(_parse_aspect_ratio_text(str(fig.get('aspect') or '')) or 1.0):.2f}:1"
                     for fig in sec_figs
                 )
                 lines.append(
-                    "Mixed portrait/square placeholder section design: "
+                    "True-portrait placeholder section design: "
+                    f"{shape_notes}. Preserve each placeholder's own ratio. "
+                    "A 0.50:1 or 1:2 placeholder must be visibly vertical, about twice as tall as wide; "
+                    "do not convert it into a square, a landscape card, or a wide table strip. "
+                    "If space is tight, use a tall sidebar/card or reduce prose rather than distorting the placeholder."
+                )
+            elif any(ratio < 0.92 for ratio in ratios):
+                shape_notes = ", ".join(
+                    f"[{fig.get('id')}]=~{(_parse_aspect_ratio_text(str(fig.get('aspect') or '')) or 1.0):.2f}:1"
+                    for fig in sec_figs
+                )
+                lines.append(
+                    "Mixed near-portrait/square placeholder section design: "
                     f"{shape_notes}. Preserve each placeholder's own ratio. "
                     "A near-portrait 0.86:1 or 1:1.16 placeholder is only slightly taller than wide; do not make it a narrow tall column. "
                     "A square placeholder must stay square. If space is tight, enlarge the whole section or reduce prose rather than distorting either placeholder."
@@ -456,13 +558,20 @@ def build_prompt(spec: dict[str, Any]) -> str:
                     "Optional compact public text-only analysis flowchart: draw it only if the wide placeholder remains visually substantial; simplify the flowchart before shrinking or distorting any placeholder."
                 )
             else:
-                lines.append("Draw this as a polished public text-only HEP analysis schematic, not a source-figure placeholder:")
+                if _is_hep_style(style):
+                    lines.append("Draw this as a polished public text-only HEP analysis schematic, not a source-figure placeholder:")
+                else:
+                    lines.append("Draw this as a polished public text-only domain-specific method/evidence schematic, not a source-figure placeholder:")
             lines.append("- Render only the listed node labels and short directional arrows; do NOT render instruction sentences verbatim and do NOT add generic stage labels.")
             lines.append("- Use equal-sized rounded rectangular nodes, light node interiors, accent-color borders/arrows, subtle shadows, and readable compact typography.")
             lines.append("- If a node label contains '|', show it as a clean branch or split node with parallel sub-flow labels; otherwise keep a simple left-to-right or top-to-bottom chain.")
             lines.append("- Preserve explicit analysis symbols, subscripts, units, and region names in node text when supplied; do not convert them into standalone icons.")
-            lines.append("- No circular node icons, pictograms, mini charts, fake axes, particle/equation-symbol badges, or decorative Feynman/process diagrams.")
-            lines.append("- This schematic should look like a professional SR/CR/fit summary for HEP readers, with concrete cuts, regions, observables, uncertainties, or statistical methods visible in the nodes.")
+            if _is_hep_style(style):
+                lines.append("- No circular node icons, pictograms, mini charts, fake axes, particle/equation-symbol badges, or decorative Feynman/process diagrams.")
+                lines.append("- This schematic should look like a professional SR/CR/fit summary for HEP readers, with concrete cuts, regions, observables, uncertainties, or statistical methods visible in the nodes.")
+            else:
+                lines.append("- No circular node icons, pictograms, mini charts, fake axes, equation-symbol badges, or decorative field-specific diagrams.")
+                lines.append("- This schematic should look like a professional paper-specific method/evidence summary with concrete datasets, assays, algorithms, observations, variables, metrics, theorem conditions, or controls visible in the nodes when supplied.")
             if len(flowchart_items) > 5:
                 lines.append("- Use only the five highest-value concrete nodes; omit lower-priority flowchart nodes before shrinking nearby text or placeholders.")
             for item in flowchart_items[:5]:
@@ -903,7 +1012,7 @@ def _copy_deck_prompt_lines(copy_deck: dict[str, Any], placeholders: list[dict[s
         "- The copy deck is exhaustive for body text, badges, takeaways, and figure-near headlines. Do not add extra public claims, generic future-prospect tiles, or methodology slogans that are not listed here.",
         "- Must-priority units are required unless they would break placeholder geometry or legibility; should/could units are optional density.",
         "- Copy text may be typeset as hero headlines, badges, section bullets, callouts, figure-near headlines, or conclusion bullets according to its type.",
-        "- Scientific symbols that appear in copy text are plain text only. Do not convert them into decorative particle icons, standalone symbol badges, equations, or fake diagrams.",
+        "- Scientific symbols that appear in copy text are plain text only. Do not convert them into decorative field-specific icons, standalone symbol badges, equations, or fake diagrams.",
         "- Keep wording short and legible. Use a smaller but readable tier for should/could microcopy; do not reduce whitespace/gutters just to fit extra text.",
         "- If there is not enough room, drop could-priority units first, then should-priority units, before shrinking any [FIG NN] placeholder.",
     ]
