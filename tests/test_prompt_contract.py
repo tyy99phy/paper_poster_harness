@@ -649,7 +649,8 @@ def test_square_hero_layout_suppresses_summary_strip_and_optional_fit_chips():
     assert "square-first hero layout" in section_line
     assert "plus summary strip" not in section_line
     assert "No significant excess" in prompt
-    assert "Profile likelihood with nuisance parameters" not in prompt
+    assert "Profile likelihood with nuisance parameters" in prompt
+    assert "rewrite should/could units as compact chips or side labels before shrinking placeholders" in prompt
 
 
 def test_single_copy_deck_conclusion_is_augmented_with_public_conclusions():

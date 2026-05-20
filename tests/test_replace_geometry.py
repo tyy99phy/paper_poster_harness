@@ -4,6 +4,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from poster_harness.replace import (
+    _hidden_source_candidate_is_shrink_or_same,
     audit_figure_containment,
     audit_generated_placeholder_geometry,
     normalize_placeholder_geometry,
@@ -651,7 +652,7 @@ def test_hidden_normalize_keeps_edge_detection_inside_canvas_gutter(tmp_path: Pa
     assert abs(((box[2] - box[0]) / (box[3] - box[1])) - 2.5) < 0.03
 
 
-def test_hidden_normalize_recovers_vertical_extent_for_edge_wide_detection(tmp_path: Path):
+def test_hidden_normalize_does_not_expand_edge_wide_detection(tmp_path: Path):
     base = tmp_path / "base.png"
     Image.new("RGB", (1000, 900), "white").save(base)
     spec = {
@@ -667,10 +668,11 @@ def test_hidden_normalize_recovers_vertical_extent_for_edge_wide_detection(tmp_p
         redraw=False,
     )
     clear = updated["_replacement_clear_boxes"]["FIG 02"]
-    assert clear[3] >= 590
+    assert clear[3] == 540
+    assert updated["placements"]["FIG 02"][3] <= clear[3]
 
 
-def test_hidden_normalize_expands_square_inner_detection_to_visible_panel(tmp_path: Path):
+def test_hidden_normalize_keeps_square_inner_detection_as_hard_envelope(tmp_path: Path):
     base = tmp_path / "base.png"
     im = Image.new("RGB", (360, 360), "white")
     draw = ImageDraw.Draw(im)
@@ -695,8 +697,7 @@ def test_hidden_normalize_expands_square_inner_detection_to_visible_panel(tmp_pa
     )
     clear = updated["_replacement_clear_boxes"]["FIG 01"]
     box = updated["placements"]["FIG 01"]
-    assert clear[0] <= 55 and clear[1] <= 55
-    assert clear[2] >= 285 and clear[3] >= 285
+    assert clear == [100, 100, 240, 240]
     assert box[0] >= clear[0] and box[1] >= clear[1]
     assert box[2] <= clear[2] and box[3] <= clear[3]
     assert abs(((box[2] - box[0]) / (box[3] - box[1])) - 1.0) < 0.03
@@ -1016,6 +1017,78 @@ def test_hidden_normalize_refines_gray_wide_placeholder_inside_overlarge_section
     assert abs(((box[2] - box[0]) / (box[3] - box[1])) - 2.5) < 0.03
 
 
+def test_hidden_normalize_trusts_ratio_correct_seed_over_contract_decoy(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (900, 700), "white")
+    draw = ImageDraw.Draw(im)
+    # Correct wide placeholder detected by the VLM.
+    for x in range(360, 810, 28):
+        draw.line([(x, 320), (min(x + 14, 810), 320)], fill=(110, 110, 120), width=3)
+        draw.line([(x, 500), (min(x + 14, 810), 500)], fill=(110, 110, 120), width=3)
+    for y in range(320, 500, 28):
+        draw.line([(360, y), (360, min(y + 14, 500))], fill=(110, 110, 120), width=3)
+        draw.line([(810, y), (810, min(y + 14, 500))], fill=(110, 110, 120), width=3)
+    draw.text((550, 405), "[FIG 02]", fill=(80, 80, 80))
+    # A flowchart/callout decoy inside the soft layout-contract search zone.
+    for x in range(60, 250, 24):
+        draw.line([(x, 390), (min(x + 12, 250), 390)], fill=(40, 130, 190), width=3)
+        draw.line([(x, 466), (min(x + 12, 250), 466)], fill=(40, 130, 190), width=3)
+    for y in range(390, 466, 24):
+        draw.line([(60, y), (60, min(y + 12, 466))], fill=(40, 130, 190), width=3)
+        draw.line([(250, y), (250, min(y + 12, 466))], fill=(40, 130, 190), width=3)
+    im.save(base)
+    spec = {
+        "placeholders": [{"id": "FIG 02", "label": "Post-fit distributions", "aspect": "2.5:1 wide"}],
+        "placements": {"FIG 02": [360, 320, 810, 500]},
+        "_layout_contract_search_boxes": {"FIG 02": [40, 360, 280, 500]},
+    }
+    _, updated = normalize_placeholder_geometry(
+        base_image=base,
+        spec=spec,
+        out_path=tmp_path / "planned.png",
+        redraw=False,
+    )
+    box = updated["placements"]["FIG 02"]
+    assert box[0] >= 360 and box[2] <= 810
+    assert box[1] >= 320 and box[3] <= 500
+    assert box[0] > 300  # did not jump to the contract-zone decoy
+    assert abs(((box[2] - box[0]) / (box[3] - box[1])) - 2.5) < 0.03
+
+
+def test_hidden_normalize_shrinks_near_square_seed_instead_of_expanding_downward(tmp_path: Path):
+    base = tmp_path / "base.png"
+    im = Image.new("RGB", (420, 360), "white")
+    draw = ImageDraw.Draw(im)
+    # Slightly too-wide generated placeholder with public text immediately below.
+    for x in range(40, 238, 24):
+        draw.line([(x, 90), (min(x + 12, 238), 90)], fill=(110, 110, 120), width=3)
+        draw.line([(x, 222), (min(x + 12, 238), 222)], fill=(110, 110, 120), width=3)
+    for y in range(90, 222, 24):
+        draw.line([(40, y), (40, min(y + 12, 222))], fill=(110, 110, 120), width=3)
+        draw.line([(238, y), (238, min(y + 12, 222))], fill=(110, 110, 120), width=3)
+    draw.text((75, 245), "Public bullet text below figure", fill=(10, 10, 10))
+    # Larger section/card outline that a contract-guided search might otherwise
+    # mistake for more placeholder room.
+    draw.rounded_rectangle([30, 80, 250, 290], radius=12, outline=(160, 190, 220), width=2)
+    im.save(base)
+    spec = {
+        "placeholders": [{"id": "FIG 03", "label": "Near-square diagram", "aspect": "1.2:1"}],
+        "placements": {"FIG 03": [40, 90, 238, 222]},
+        "_layout_contract_search_boxes": {"FIG 03": [25, 75, 260, 300]},
+    }
+    _, updated = normalize_placeholder_geometry(
+        base_image=base,
+        spec=spec,
+        out_path=tmp_path / "planned.png",
+        redraw=False,
+    )
+    box = updated["placements"]["FIG 03"]
+    clear = updated["_replacement_clear_boxes"]["FIG 03"]
+    assert box[3] <= 222
+    assert clear[3] <= 222
+    assert abs(((box[2] - box[0]) / (box[3] - box[1])) - 1.2) < 0.03
+
+
 def test_hidden_normalize_square_uses_dashed_bottom_not_lower_section_card(tmp_path: Path):
     base = tmp_path / "base.png"
     im = Image.new("RGB", (900, 700), "white")
@@ -1064,3 +1137,11 @@ def test_audit_allows_square_result_just_above_summary_boundary(tmp_path: Path):
     }
     issues = audit_generated_placeholder_geometry(base_image=base, spec=spec, ratio_tolerance=0.20)
     assert not [issue for issue in issues if "too low" in issue["message"]]
+
+
+def test_hidden_source_candidate_does_not_expand_outside_seed():
+    seed = (100, 100, 240, 300)
+    assert _hidden_source_candidate_is_shrink_or_same((110, 120, 230, 285), seed)
+    assert _hidden_source_candidate_is_shrink_or_same((96, 96, 244, 304), seed)
+    assert not _hidden_source_candidate_is_shrink_or_same((80, 100, 260, 300), seed)
+    assert not _hidden_source_candidate_is_shrink_or_same((100, 70, 240, 330), seed)

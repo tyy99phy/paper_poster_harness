@@ -11,6 +11,7 @@ def test_standard_content_mode_keeps_main_defaults(monkeypatch):
     assert config["autoposter"]["domain_profile"] == "auto"
     assert config["autoposter"]["domain_classifier"]["enabled"] is True
     assert config["autoposter"]["micro_repair"]["backend"] == "image_edit"
+    assert config["autoposter"]["layout_contract"]["reject_misaligned"] is False
     assert config["autoposter"]["content_outline"]["enabled"] is False
     assert config["autoposter"]["copy_deck"]["max_units"] == 34
     assert "text_density" not in config["styles"]["cms-hep"]["style"]

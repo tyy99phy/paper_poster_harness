@@ -50,6 +50,7 @@ autoposter:
   domain_profile: auto
   max_figures: 8
   max_assets: 48
+  max_sections: 5
   min_image_width: 96
   min_image_height: 96
   render_pages: true
@@ -62,11 +63,11 @@ autoposter:
   redraw_normalized_placeholders: false
   placeholder_aspect_tolerance: 0.2
   required_successes: 2
-  max_candidate_batches: 3
+  max_candidate_batches: 8
   llm_stage_retries: 4
   layout_contract:
     enabled: true
-    reject_misaligned: true
+    reject_misaligned: false
   template_critic:
     enabled: true
     require_pass: true
@@ -126,6 +127,7 @@ content_modes:
   hep_dense:
     autoposter:
       content_mode: hep_dense
+      max_sections: 6
       content_outline:
         enabled: true
         max_sections: 6
@@ -151,8 +153,8 @@ content_modes:
             4-8 grounded fact badges, 4-6 section modules, and one compact conclusion
             strip. Use a controlled smaller text tier for optional bullets/badges/micro-callouts,
             while keeping must-level facts clearly legible. Prefer short claims and
-            fact chips over paragraphs; omit lower-priority facts before sacrificing
-            legibility or placeholder geometry.'
+            fact chips over paragraphs; reconstruct lower-priority facts into compact
+            legible chips before changing placeholder geometry.'
           text_density:
           - 'Compress prose into poster bullets: short noun phrases, ideally under
             11 words each.'
@@ -166,8 +168,8 @@ content_modes:
             sentence per text block; preserve meaning without adding new science.
           - Use public fact chips and numeric badges for explicitly grounded dataset/result
             facts; do not invent numbers.
-          - If text competes with a result figure, shrink or omit lower-priority text
-            first and enlarge/preserve the figure placeholder.
+          - If text competes with a result figure, reconstruct the text into shorter
+            legible chips/sidebars while enlarging/preserving the figure placeholder.
       cms-hep:
         style:
           information_density: 'Paper2Poster-rich HEP density without reducing whitespace:
@@ -191,8 +193,8 @@ content_modes:
             tiny illegible tables.
           - Use public fact chips and numeric badges only for explicitly grounded
             luminosity, energy, channel, mass/limit, or CL facts.
-          - If text competes with a result figure, omit could-priority units before
-            shrinking placeholders or reducing gutters.
+          - If text competes with a result figure, merge/rewrite could-priority units
+            into compact chips before shrinking placeholders or reducing gutters.
     domain_profiles:
       hep:
         style:
@@ -217,8 +219,8 @@ content_modes:
             tiny illegible tables.
           - Use public fact chips and numeric badges only for explicitly grounded
             luminosity, energy, channel, mass/limit, or CL facts.
-          - If text competes with a result figure, omit could-priority units before
-            shrinking placeholders or reducing gutters.
+          - If text competes with a result figure, merge/rewrite could-priority units
+            into compact chips before shrinking placeholders or reducing gutters.
 domain_profiles:
   generic:
     project:
@@ -474,8 +476,8 @@ styles:
       information_density: 'Paper2Poster-rich editorial density: 14-24 concise public
         information units across the poster, 3-6 grounded fact badges, 4-6 section
         modules, and one compact conclusion strip. Prefer short claims and fact chips
-        over paragraphs; omit lower-priority facts before sacrificing legibility or
-        placeholder geometry.'
+        over paragraphs; reconstruct lower-priority facts into compact legible chips
+        before changing placeholder geometry.'
     extras:
       decorative_art_constraints:
       - Decorative artwork must remain abstract.

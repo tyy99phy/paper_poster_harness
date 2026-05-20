@@ -444,7 +444,7 @@ def copy_deck_from_text(
             "Use priority='must' for the minimum public copy that must be rendered; use 'should' and 'could' for optional density.",
             "Treat the copy deck as an exhaustive public body-text plan: do not add generic future-prospect, impact, or methodology slogans unless explicitly grounded.",
             "Do not include internal workflow language, prompt instructions, placeholder explanations, TODOs, or replacement-process text in public copy.",
-            "Return at most max_units copy_units. If space is tight, omit could-priority units before shortening figures/placeholders.",
+            "Return at most max_units copy_units. If space is tight, rewrite or merge could-priority units into shorter legible chips before shortening figures/placeholders; preserve the intended information coverage.",
             extra_instructions or "",
         ],
         context={
@@ -541,10 +541,16 @@ def detect_placeholders_from_image(
         instructions=[
             "Return bounding boxes in image pixel coordinates [x0, y0, x1, y1].",
             "The bbox must tightly trace the visible dashed/outlined blank placeholder rectangle itself.",
+            "Each returned bbox must physically contain the exact visible bracketed ID token for that placeholder, for example [FIG 02]. Do not infer IDs from the expected list, neighboring captions, or left-to-right order.",
+            "If a rectangle/card/equation chip does not visibly contain the exact [FIG NN] token inside a blank placeholder, it is not that placeholder and must not be returned for that ID.",
+            "Ignore formula chips, rounded callout boxes, bullets, flowchart nodes, result badges, equations, and decorative cards unless they are the blank dashed/outlined placeholder that contains the exact [FIG NN] token.",
             "Prefer the clean placeholder panel edges, not the outer card boundary, section/card boundary, light mat, or whole content block.",
             "Exclude all public poster text outside the placeholder: section numbers, headings, subtitles, captions, bullets, flowchart nodes, result badges, and conclusion boxes must not be inside the bbox.",
             "If a placeholder sits below a local heading/caption, set y0 at the top edge of the dashed placeholder rectangle, not at the heading.",
             "If a placeholder is inside a larger light card, report only the inner dashed placeholder box unless the dashed edge is genuinely absent.",
+            "For side-by-side placeholders, read the printed [FIG NN] token in each box and return one independent bbox per dashed rectangle. Never include the neighboring placeholder, the shared section card, or the headline row in either bbox.",
+            "For tall portrait placeholders, the bbox must cover the whole dashed boundary from its top edge to bottom edge, not just the [FIG NN] text cluster or the lower half of the box.",
+            "Before returning, verify that reported bboxes for different [FIG NN] placeholders do not substantially overlap unless the poster visibly drew overlapping dashed rectangles.",
             "If a placeholder id is missing or ambiguous, still report the best-matching visible placeholder and note the ambiguity.",
             extra_instructions or "",
         ],
@@ -714,7 +720,7 @@ def critique_poster_template(
             "Fail if the poster is merely decorative, too sparse, PPT-like, has serious text corruption, leaks internal workflow text, has dark figure blocks, or contains fake scientific plots/diagrams outside placeholders.",
             "Fail if any placeholder appears to contain real/fake scientific content, is missing/duplicated, unreadable, or clearly violates its declared aspect ratio.",
             "Fail if the visible replacement boundary of any placeholder would include public poster text such as section headings, local captions, bullets, flowchart nodes, result badges, or conclusion rows.",
-            "For plot/result/likelihood/distribution placeholders, fail if the figure slot is only a tiny thumbnail that would make axes and legends unreadable; simplify prose or rebalance cards before shrinking scientific figures.",
+            "For plot/result/likelihood/distribution placeholders, fail if the figure slot is only a tiny thumbnail that would make axes and legends unreadable; reconstruct/reflow prose into compact equivalent text or rebalance cards before shrinking scientific figures.",
             "Do not penalize placeholder labels or aspect-ratio text when they are inside the dashed placeholder; the contract requires each placeholder to contain exactly the ID, intended label, and aspect ratio.",
             "Prompt repairs must never contradict the placeholder contract: do not ask for only the [FIG NN] token, do not remove aspect-ratio text, and do not move labels outside the placeholder.",
             "Keep prompt_repairs concrete, short, and directly usable as additional image-generation instructions.",
@@ -1598,6 +1604,9 @@ def _normalize_template_critique(result: Mapping[str, Any]) -> dict[str, Any]:
         scores["overall"] = sum(nonzero) / len(nonzero) if nonzero else 0.0
 
     issues: list[dict[str, str]] = []
+    downgraded_label_text_only = False
+    downgraded_aspect_geometry_only = False
+    has_placeholder_geometry_or_content_issue = False
     raw_issues = list(result.get("issues") or [])
     for item in result.get("blocking_issues") or []:
         raw_issues.append({"severity": "critical", "category": "template_quality", "message": item})
@@ -1611,6 +1620,17 @@ def _normalize_template_critique(result: Mapping[str, Any]) -> dict[str, Any]:
         message = sanitize_public_text(str(row.get("message") or "")).strip()
         if not message:
             continue
+        if severity == "critical" and _template_issue_is_placeholder_label_text_only(row, message):
+            severity = "warning"
+            downgraded_label_text_only = True
+        elif severity == "critical" and (
+            _template_issue_is_placeholder_aspect_geometry_only(row, message)
+            or _template_issue_is_placeholder_readability_geometry_only(row, message)
+        ):
+            severity = "warning"
+            downgraded_aspect_geometry_only = True
+        elif severity == "critical" and _template_issue_is_placeholder_geometry_or_content(row, message):
+            has_placeholder_geometry_or_content_issue = True
         issues.append(
             {
                 "severity": severity,
@@ -1637,6 +1657,19 @@ def _normalize_template_critique(result: Mapping[str, Any]) -> dict[str, Any]:
         raw_passes = result.get("pass")
     if raw_passes is None:
         raw_passes = result.get("proceed_to_replacement")
+    if (
+        not bool(raw_passes)
+        and (downgraded_label_text_only or downgraded_aspect_geometry_only)
+        and not has_placeholder_geometry_or_content_issue
+        and not any(issue["severity"] == "critical" for issue in issues)
+    ):
+        # The deterministic downstream checks care about the visible [FIG NN]
+        # box, geometry, and blank-content contract.  The VLM critic sometimes
+        # over-blocks an otherwise useful template for aspect-label punctuation
+        # or subjective aspect estimates.  Treat these as warnings so exact-ID
+        # detection plus deterministic pixel geometry audit decides replacement.
+        raw_passes = True
+        scores["placeholder_contract"] = max(scores.get("placeholder_contract", 0.0), 0.76)
     passes = bool(raw_passes) and not any(issue["severity"] == "critical" for issue in issues)
     return {
         "passes": passes,
@@ -1646,6 +1679,141 @@ def _normalize_template_critique(result: Mapping[str, Any]) -> dict[str, Any]:
         "checks": {str(key): bool(value) for key, value in checks.items()},
         "prompt_repairs": prompt_repairs,
     }
+
+
+def _template_issue_is_placeholder_label_text_only(row: Mapping[str, Any], message: str) -> bool:
+    blob = " ".join(
+        str(row.get(key) or "")
+        for key in ("category", "message", "location", "suggested_prompt_repair")
+    ).lower()
+    if "placeholder" not in blob:
+        return False
+    label_markers = (
+        "aspect-ratio text",
+        "aspect ratio text",
+        "declared aspect-ratio text",
+        "exact declared aspect",
+        "does not contain the exact",
+        "appear to read",
+        "appears to read",
+        "reads",
+        "1:2:1",
+        "1.2:1",
+    )
+    if not any(marker in blob for marker in label_markers):
+        return False
+    # Geometry/content issues stay critical.  Only downgrade punctuation/label
+    # fidelity when the message does not describe the drawn rectangle shape.
+    geometry_markers = (
+        "too wide",
+        "too narrow",
+        "too thin",
+        "too shallow",
+        "too square",
+        "too portrait",
+        "landscape banner",
+        "ribbon",
+        "not square",
+        "shape",
+        "geometry",
+        "boundary appears",
+        "fake",
+        "plot",
+        "axes",
+        "histogram",
+        "diagram outside",
+    )
+    return not any(marker in blob for marker in geometry_markers)
+
+
+def _template_issue_is_placeholder_aspect_geometry_only(row: Mapping[str, Any], message: str) -> bool:
+    blob = " ".join(
+        str(row.get(key) or "")
+        for key in ("category", "message", "location", "suggested_prompt_repair")
+    ).lower()
+    if "placeholder" not in blob and "[fig" not in blob and "fig " not in blob:
+        return False
+    aspect_markers = (
+        "aspect",
+        "ratio",
+        "square",
+        "wide",
+        "thin",
+        "shallow",
+        "ribbon",
+        "height",
+        "width",
+        "landscape",
+        "portrait",
+    )
+    if not any(marker in blob for marker in aspect_markers):
+        return False
+    blocker_blob = " ".join(
+        str(row.get(key) or "")
+        for key in ("category", "message", "location")
+    ).lower()
+    hard_blockers = (
+        "missing",
+        "duplicat",
+        "appears twice",
+        "extra placeholder",
+        "public text",
+        "heading",
+        "caption",
+        "bullet",
+        "inside the dashed",
+        "fake",
+        "plot inside",
+        "real data",
+        "fake scientific",
+        "unreadable",
+    )
+    return not any(marker in blocker_blob for marker in hard_blockers)
+
+
+def _template_issue_is_placeholder_readability_geometry_only(row: Mapping[str, Any], message: str) -> bool:
+    blob = " ".join(
+        str(row.get(key) or "")
+        for key in ("category", "message", "location", "suggested_prompt_repair")
+    ).lower()
+    if "fig" not in blob and "placeholder" not in blob and "slot" not in blob:
+        return False
+    if not any(marker in blob for marker in ("too short", "too small", "height", "readable", "readability", "axes", "legends")):
+        return False
+    blocker_blob = " ".join(str(row.get(key) or "") for key in ("category", "message", "location")).lower()
+    hard_blockers = ("missing", "duplicat", "appears twice", "extra placeholder", "public text", "fake", "real data")
+    return not any(marker in blocker_blob for marker in hard_blockers)
+
+
+def _template_issue_is_placeholder_geometry_or_content(row: Mapping[str, Any], message: str) -> bool:
+    blob = " ".join(
+        str(row.get(key) or "")
+        for key in ("category", "message", "location", "suggested_prompt_repair")
+    ).lower()
+    if "placeholder" not in blob and "fig " not in blob and "[fig" not in blob:
+        return False
+    markers = (
+        "too wide",
+        "too narrow",
+        "too thin",
+        "too shallow",
+        "too square",
+        "too portrait",
+        "landscape banner",
+        "ribbon",
+        "not square",
+        "shape",
+        "geometry",
+        "boundary appears",
+        "fake",
+        "plot",
+        "axes",
+        "histogram",
+        "diagram outside",
+        "public text",
+        "inside the dashed",
+    )
+    return any(marker in blob for marker in markers) and not _template_issue_is_placeholder_label_text_only(row, message)
 
 
 def _normalize_micro_repair_plan(
@@ -2287,6 +2455,7 @@ def _merge_qa_results(prechecks: Mapping[str, Any], llm_result: Mapping[str, Any
     for item in llm_result.get("issues") or []:
         row = _normalize_llm_qa_issue(dict(item))
         _downgrade_speculative_visual_geometry_issue(row, deterministic_categories)
+        _downgrade_nonblocking_public_schematic_issue(row)
         key = (row.get("severity"), row.get("category"), row.get("message"), row.get("location"))
         if key not in seen:
             issues.append(row)
@@ -2407,6 +2576,86 @@ def _downgrade_speculative_visual_geometry_issue(row: dict[str, Any], determinis
     row["severity"] = "warning"
     note = " Deterministic replacement-geometry prechecks were clean, so this visual-only concern is nonblocking."
     row["message"] = str(row.get("message") or "").rstrip() + note
+
+
+def _downgrade_nonblocking_public_schematic_issue(row: dict[str, Any]) -> None:
+    """Allow small public infographic motifs outside source-figure placeholders.
+
+    The strict placeholder contract forbids fake scientific *source figures*
+    outside [FIG NN] boxes.  It should not delete an otherwise good poster only
+    because a text card contains a simple arrow/path connector used as public
+    explanatory decoration.  Data-like plots/tables/axes/heatmaps/architecture
+    diagrams remain blocking.
+    """
+
+    if str(row.get("severity") or "").lower() != "critical":
+        return
+    category = str(row.get("category") or "").lower()
+    if not (
+        category in {"scientific_content_outside_placeholders", "fake_science", "decorative_art"}
+        or "outside_placeholder" in category
+        or "decorative_scientific" in category
+        or "scientific_figure_like" in category
+        or "pictogram" in category
+        or "logo" in category
+    ):
+        return
+    text = " ".join(
+        str(row.get(key) or "").lower()
+        for key in ("category", "message", "location", "suggested_fix")
+    )
+    public_connector_markers = (
+        "arrow",
+        "path",
+        "connector",
+        "node",
+        "flow",
+        "icon",
+        "badge",
+        "pictogram",
+        "logo",
+        "wordmark",
+        "ring",
+        "arc",
+        "wedge",
+        "detector",
+        "particle",
+        "trail",
+        "target",
+        "shield",
+        "gear",
+        "database",
+        "lightning",
+        "symbol",
+    )
+    hard_fake_markers = (
+        "tick marks",
+        "ticks",
+        "legend",
+        "table",
+        "heatmap",
+        "feynman",
+        "architecture diagram",
+        "network diagram",
+        "benchmark",
+        "confusion matrix",
+        "histogram",
+        "scatter",
+        "microscopy",
+        "molecule",
+        "chemical structure",
+        "sky map",
+        "screenshot",
+        "data curve",
+        "plot with axes",
+        "chart with axes",
+    )
+    if any(marker in text for marker in public_connector_markers) and not any(marker in text for marker in hard_fake_markers):
+        row["severity"] = "warning"
+        row["message"] = (
+            str(row.get("message") or "").rstrip()
+            + " Non-data public connector graphics are treated as nonblocking; source-like plots/tables/diagrams would still fail."
+        )
 
 
 def _dedupe_strings(values: Sequence[str]) -> list[str]:

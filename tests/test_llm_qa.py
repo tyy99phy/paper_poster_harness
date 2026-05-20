@@ -198,6 +198,37 @@ def test_merge_qa_downgrades_visual_only_placeholder_remnant_claim():
     assert merged["issues"][0]["severity"] == "warning"
 
 
+def test_merge_qa_downgrades_nonblocking_decorative_icon_badges():
+    from poster_harness.llm_stages import _merge_qa_results
+
+    merged = _merge_qa_results(
+        {"passes": True, "issues": [], "checks": {}, "recommended_repairs": []},
+        {
+            "passes": False,
+            "summary": "Placeholder QA fails because decorative badge icons look too scientific.",
+            "score": 0.78,
+            "checks": {"placeholders_accounted_for": True},
+            "issues": [
+                {
+                    "severity": "critical",
+                    "category": "decorative_scientific_content_outside_placeholders",
+                    "message": "Callout badges use μ, shield, target, gear, and database pictogram icons outside placeholders.",
+                    "suggested_fix": "Replace icons with plain text chips.",
+                },
+                {
+                    "severity": "critical",
+                    "category": "scientific_figure_like_content_outside_placeholders",
+                    "message": "A CMS-like logo badge contains detector arcs and a wedge graphic that read as decorative identity art.",
+                    "suggested_fix": "Use plain text CMS wordmark.",
+                },
+            ],
+            "recommended_repairs": [],
+        },
+    )
+    assert merged["passes"] is True
+    assert all(issue["severity"] == "warning" for issue in merged["issues"])
+
+
 def test_template_critique_normalizes_scores_and_repairs():
     from poster_harness.llm_stages import _normalize_template_critique
 

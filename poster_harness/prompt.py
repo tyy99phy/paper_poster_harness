@@ -39,7 +39,7 @@ TEXT_DENSITY_RULES = [
     "Avoid microscopic paragraphs, footnote blocks, dense equations, and reference lists in the rendered poster.",
     "Prefer 2-5 bullets/fact chips per non-hero card and at most one short sentence per text block; preserve meaning without adding new science.",
     "Use public fact chips and numeric badges for explicitly grounded dataset/result facts; do not invent numbers.",
-    "If text competes with a result figure, shrink or omit lower-priority text first and enlarge/preserve the figure placeholder.",
+    "If text competes with a result figure, reconstruct the text layout: split it into shorter legible chips/sidebars and preserve the information target while enlarging/preserving the figure placeholder.",
 ]
 
 FIGURE_COMPOSITION_RULES = [
@@ -47,7 +47,7 @@ FIGURE_COMPOSITION_RULES = [
     "Every placeholder rectangle must match its selected source image aspect ratio; enlarge or reshape the surrounding block instead of stretching the placeholder.",
     "Method, detector, topology, or control-region placeholders should support the story, not dominate it unless the paper is instrumentation-focused.",
     "Dense multi-panel HEP plots need large absolute area; preserve their native wide/tall ratio rather than forcing a square slot.",
-    "For wide post-fit/distribution plots, reserve enough vertical height for axes and legends; reduce nearby flowchart/text space before making the plot hard to read.",
+    "For wide post-fit/distribution plots, reserve enough vertical height for axes and legends; reflow nearby flowchart/text into compact side or bottom tiers before making the plot hard to read.",
     "For professional HEP readers, dataset and strategy cards should show analysis-specific SR/CR, fit, and uncertainty details rather than a generic data-processing pipeline.",
     "Placeholders should align to the card grid and be easy to replace: rectangular, unobstructed, with visible margins.",
     "All figure-containing cards must use a light paper/lab-white surface around the placeholder; dark or saturated fills may be outer accents only, never the block background directly behind a future white plot.",
@@ -59,7 +59,7 @@ GENERIC_FIGURE_COMPOSITION_RULES = [
     "Every placeholder rectangle must match its selected source image aspect ratio; enlarge or reshape the surrounding block instead of stretching the placeholder.",
     "Method, validation, diagnostic, qualitative, or supporting-result placeholders should support the story, not dominate it unless the paper's contribution is methodological.",
     "Dense multi-panel figures need large absolute area; preserve their native wide/tall ratio rather than forcing a square slot.",
-    "For wide plots/tables/examples, reserve enough vertical height for axes, legends, labels, or row text; reduce nearby prose before making the figure hard to read.",
+    "For wide plots/tables/examples, reserve enough vertical height for axes, legends, labels, or row text; reflow nearby prose into compact side or bottom tiers before making the figure hard to read.",
     "Use domain-specific method/detail cards rather than generic data-processing pipelines.",
     "Placeholders should align to the card grid and be easy to replace: rectangular, unobstructed, with visible margins.",
     "All figure-containing cards must use a light paper/lab-white surface around the placeholder; dark or saturated fills may be outer accents only, never the block background directly behind a future white plot.",
@@ -167,6 +167,35 @@ def _domain_guidance_prompt_lines(style: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _placeholder_geometry_priority_lines(placeholders: list[dict[str, Any]]) -> list[str]:
+    if not placeholders:
+        return []
+    rows = [
+        "PLACEHOLDER GEOMETRY PRIORITY (highest priority; outranks art, symmetry, text density, and decoration):",
+        "- The visible dashed rectangle for every [FIG NN] placeholder must match its listed width/height aspect ratio. This is the most important instruction in the whole prompt.",
+        "- Generation order: first reserve and draw the blank [FIG NN] placeholder rectangles as hard geometric anchors on light mats; only then arrange text, flowcharts, badges, and decoration around those anchors.",
+        "- Do not stretch a placeholder to fill a card. If a card is too wide, shorten the dashed rectangle or make the card taller; compute height = width / listed ratio before rendering.",
+        "- If a placeholder shape conflicts with prose, flowcharts, badges, cards, or background art, reconstruct the surrounding text/design: reflow copy into compact legible tiers, merge labels, move badges/ornaments, and preserve the information target; never distort the placeholder.",
+        "- The light figure mat/card immediately behind a placeholder must support the same shape; do not hide a wrong large card by drawing a smaller correct-looking dashed inset.",
+        "- A generated template with an incorrect placeholder shape will be rejected before real-figure insertion.",
+    ]
+    for fig in placeholders:
+        aspect_text = str(fig.get("aspect") or "1:1 square")
+        ratio = _parse_aspect_ratio_text(aspect_text)
+        shape_hint = _aspect_shape_hint(aspect_text)
+        ratio_text = f"width/height ≈ {ratio:.2f}" if ratio else "match the stated source aspect"
+        rows.append(
+            f"- [{fig.get('id', 'FIG ??')}]: {ratio_text}; aspect \"{_q(aspect_text)}\"; "
+            f"label \"{_q(str(fig.get('label') or 'figure'))}\"; {shape_hint}."
+        )
+    rows += [
+        "- Ruler check before rendering: 2.5:1 is 2.5× wider than tall, so height is 40% of its width; 1.22:1 is only slightly wider than tall; 1:1.47 is portrait with width about 68% of height; 1:1.99 is portrait with width about 50% of height.",
+        "- Wide placeholders need enough height to remain readable; portrait placeholders need enough vertical space; near-square placeholders must not become banners.",
+        "",
+    ]
+    return rows
+
+
 def build_prompt(spec: dict[str, Any]) -> str:
     project = spec.get("project", {})
     style = spec.get("style", {})
@@ -187,6 +216,9 @@ def build_prompt(spec: dict[str, Any]) -> str:
         "- Do not paraphrase, abbreviate, or visually autocorrect any title word. The word 'for' must be spelled f-o-r, never 'fon'.",
         "- Keep Greek letters unambiguous in the title; if γ would look like Latin y, use clearer glyph spacing rather than a corrupted y.",
         "",
+    ]
+    lines += _placeholder_geometry_priority_lines(placeholders)
+    lines += [
         "POSITIVE ART DIRECTION:",
         f"- Art direction: {_sentence(style.get('art_direction', 'premium editorial science design with layered abstract geometry, luminous gradients, subtle depth, and clear hierarchy'))}",
         f"- Layout rhythm: {_sentence(style.get('layout_rhythm', 'asymmetric but balanced; avoid uniformly tiled white boxes'))}",
@@ -344,11 +376,13 @@ def build_prompt(spec: dict[str, Any]) -> str:
         ]
         for fig in placeholders:
             aspect_text = str(fig.get("aspect") or "1:1 square")
+            ratio = _parse_aspect_ratio_text(aspect_text)
             shape_hint = _aspect_shape_hint(aspect_text)
             hint_suffix = f"; visual shape: {shape_hint}" if shape_hint else ""
+            numeric_suffix = f"; visible dashed width/height ≈ {ratio:.2f}" if ratio else ""
             lines.append(
                 f"- [{fig.get('id', 'FIG ??')}]: label \"{_q(str(fig.get('label') or 'figure'))}\"; "
-                f"aspect ratio \"{_q(aspect_text)}\"{hint_suffix}."
+                f"aspect ratio \"{_q(aspect_text)}\"{numeric_suffix}{hint_suffix}."
             )
         lines += [
             "- Aspect ratios describe the visible dashed placeholder rectangle, not the surrounding decorative card. The dashed rectangle itself is what will be audited.",
@@ -357,12 +391,13 @@ def build_prompt(spec: dict[str, Any]) -> str:
             "- A square placeholder should look square; a wide placeholder should have real vertical presence and should not become a thin banner.",
             "- A moderate landscape placeholder such as 1.49:1 should look only about one and a half times wider than tall; never stretch it into a panoramic 2.5:1 or 3:1 banner.",
             "- A true portrait placeholder such as 1:1.99 should be a vertical panel about twice as tall as wide; do not make it square or landscape.",
+            "- For portrait placeholders, compare the visible width/height against the printed number: 1:1.99≈0.50, 1:1.54≈0.65, 1:1.47≈0.68.",
             "- A near-portrait placeholder such as 1:1.16 should look only slightly taller than wide; do not exaggerate it into a narrow tall column.",
             "- A square headline-result placeholder should be prominent but not oversized: keep its side around 30-34% of the canvas width, visibly larger than supporting scientific placeholders, never a giant sticker covering most of the result card.",
             "- For square placeholders, the visible light/white placeholder fill itself must also be square; do not put the [FIG NN] label inside a wide white rounded rectangle and only draw a square-ish dashed fragment inside it.",
             "- Keep the square headline-result placeholder clearly above the bottom summary/conclusion modules; its bottom edge should sit before the lower fifth of the poster begins, with an obvious gutter below it.",
             "- If a wide placeholder would become too thin at full poster width, make it narrower or make its section taller rather than stretching it into a ribbon.",
-            "- If prose, badges, or flowcharts compete with a placeholder, simplify those elements before distorting the placeholder shape.",
+            "- If prose, badges, or flowcharts compete with a placeholder, reconstruct their layout around the figure: shorter equivalent copy, side chips, stacked labels, or moved ornaments; do not make the poster sparse just to protect geometry.",
             "- Every dashed placeholder must be an interior figure slot, not the outer border of a whole section card.",
             "- Keep a clearly visible gutter between every pair of dashed placeholders; placeholder rectangles must never touch, overlap, or share a border.",
             "- Each placeholder's surrounding figure mat/card must be light and quiet; if a section has a dramatic dark background, place the figure in a large warm-white inset card with padding.",
@@ -444,14 +479,14 @@ def build_prompt(spec: dict[str, Any]) -> str:
                     )
                 if bullet_budget is not None:
                     lines.append(
-                        f"Copy-deck density rule for this figure-containing section: render must-priority units first and at most {bullet_budget} ordinary bullets; omit could-priority units before shrinking placeholders."
+                        f"Copy-deck density rule for this figure-containing section: render must-priority units first and at most {bullet_budget} ordinary bullets; rewrite should/could units as compact chips or side labels before shrinking placeholders, while preserving the target information density."
                     )
             else:
                 lines.append("No copy-deck units assigned to this section; keep rendered prose minimal and do not invent extra science copy.")
         elif sec.get("text"):
             if bullet_budget is not None:
                 lines.append(
-                    f"Text budget for this figure-containing section: render at most {bullet_budget} short bullets; omit lower-priority bullets before shrinking placeholders."
+                    f"Text budget for this figure-containing section: render at most {bullet_budget} short bullets; reconstruct lower-priority bullets as shorter chips or side labels before shrinking placeholders."
                 )
             lines.append("Text content:")
             for t in sec["text"]:
@@ -491,8 +526,12 @@ def build_prompt(spec: dict[str, Any]) -> str:
                     f"{shape_notes}. Preserve each placeholder's own ratio. "
                     "A 0.50:1 or 1:2 placeholder must be visibly vertical, about twice as tall as wide; "
                     "do not convert it into a square, a landscape card, or a wide table strip. "
-                    "If space is tight, use a tall sidebar/card or reduce prose rather than distorting the placeholder."
+                    "If space is tight, use a tall sidebar/card or reflow prose into compact side/bottom text tiers rather than distorting the placeholder."
                 )
+                if len(sec_figs) >= 2:
+                    lines.append(
+                        "For multiple portrait placeholders in one section, use a broad light figure band with clear gutters; recompose lower-priority prose as compact side chips before narrowing the placeholders."
+                    )
             elif any(ratio < 0.92 for ratio in ratios):
                 shape_notes = ", ".join(
                     f"[{fig.get('id')}]=~{(_parse_aspect_ratio_text(str(fig.get('aspect') or '')) or 1.0):.2f}:1"
@@ -502,14 +541,14 @@ def build_prompt(spec: dict[str, Any]) -> str:
                     "Mixed near-portrait/square placeholder section design: "
                     f"{shape_notes}. Preserve each placeholder's own ratio. "
                     "A near-portrait 0.86:1 or 1:1.16 placeholder is only slightly taller than wide; do not make it a narrow tall column. "
-                    "A square placeholder must stay square. If space is tight, enlarge the whole section or reduce prose rather than distorting either placeholder."
+                    "A square placeholder must stay square. If space is tight, enlarge the whole section or reflow prose into compact chips/sidebars rather than distorting either placeholder."
                 )
             elif any(ratio >= 2.0 for ratio in ratios):
                 wide_fig = next(fig for fig in sec_figs if (_parse_aspect_ratio_text(str(fig.get("aspect") or "")) or 1.0) >= 2.0)
                 wide_ratio = _parse_aspect_ratio_text(str(wide_fig.get("aspect") or "")) or 2.5
                 lines.append(
                     f"Wide-figure section design: draw the dashed placeholder as width:height about {wide_ratio:.1f}:1; "
-                    "give it a substantial, readable light figure zone; reduce nearby prose before making it look like a thin ribbon."
+                    "give it a substantial, readable light figure zone; reflow nearby prose into compact side/bottom tiers before making it look like a thin ribbon."
                 )
             elif any(1.35 <= ratio < 2.0 for ratio in ratios):
                 moderate_shapes = ", ".join(
@@ -573,7 +612,7 @@ def build_prompt(spec: dict[str, Any]) -> str:
                 lines.append("- No circular node icons, pictograms, mini charts, fake axes, equation-symbol badges, or decorative field-specific diagrams.")
                 lines.append("- This schematic should look like a professional paper-specific method/evidence summary with concrete datasets, assays, algorithms, observations, variables, metrics, theorem conditions, or controls visible in the nodes when supplied.")
             if len(flowchart_items) > 5:
-                lines.append("- Use only the five highest-value concrete nodes; omit lower-priority flowchart nodes before shrinking nearby text or placeholders.")
+                lines.append("- Use only the five highest-value concrete nodes; when there are too many nodes, merge or rewrite lower-priority nodes into concise compound labels/side chips before shrinking nearby text or placeholders.")
             for item in flowchart_items[:5]:
                 lines.append(f"- Node label: \"{_q(_flowchart_label_text(str(item)))}\"")
         if sec.get("caption") and not sec_figs:
@@ -647,10 +686,14 @@ def _positive_decorative_guidance(text: str) -> str:
 
 
 def _layout_contract_prompt_lines(contract: dict[str, Any]) -> list[str]:
+    canvas = contract.get("canvas") if isinstance(contract.get("canvas"), dict) else {}
+    canvas_w = int(canvas.get("width") or 1024)
+    canvas_h = int(canvas.get("height") or 1536)
     rows = [
         "LAYOUT CONTRACT (soft visual prior; replacement QA will check it):",
         "- Coordinates below are normalized poster fractions [x0, y0, x1, y1], not pixel art instructions.",
         "- The poster canvas is portrait, so normalized x/y spans are not visual aspect ratios. Use the stated aspect text for the visible dashed rectangle: a 1:1 placeholder must look square in pixels even if its normalized x-span is larger than its y-span.",
+        "- Each line also gives a native-canvas size intuition; use that width×height relationship as the visual ruler for the dashed rectangle.",
         "- Keep each visible dashed [FIG NN] rectangle roughly inside its planned zone/search zone and in the named section, while preserving artistic freedom for card shape, glow, ribbons, and surrounding decoration.",
         "- Do not use these coordinates as a reason to draw fake figure content; they only reserve blank placeholder rectangles for later real source figures.",
     ]
@@ -660,11 +703,20 @@ def _layout_contract_prompt_lines(contract: dict[str, Any]) -> list[str]:
         fig_id = str(item.get("id") or "").strip()
         if not fig_id:
             continue
+        zone = item.get("zone")
+        size_hint = ""
+        if isinstance(zone, (list, tuple)) and len(zone) >= 4:
+            try:
+                zw = max(1, int(round((float(zone[2]) - float(zone[0])) * canvas_w)))
+                zh = max(1, int(round((float(zone[3]) - float(zone[1])) * canvas_h)))
+                size_hint = f"; visual size intuition about {zw}×{zh} native px"
+            except Exception:
+                size_hint = ""
         rows.append(
             f"- [{fig_id}]: planned placeholder zone {_format_norm_box(item.get('zone'))}; "
             f"search zone {_format_norm_box(item.get('search_zone'))}; "
             f"aspect {item.get('aspect') or item.get('expected_aspect')}; "
-            f"label \"{_q(str(item.get('label') or 'figure'))}\"."
+            f"label \"{_q(str(item.get('label') or 'figure'))}\"{size_hint}."
         )
     return rows
 
@@ -801,13 +853,29 @@ def _aspect_shape_hint(aspect: str) -> str:
         return f"substantial wide panel with width:height about {ratio:.1f}:1; not 3.5:1, 4:1, or a thin ribbon"
     if ratio > 1.0:
         if ratio < 1.35:
-            return f"near-square panel with width:height about {ratio:.1f}:1; only slightly wider than tall, not a 1.5:1 landscape card"
-        return f"moderate landscape panel with width:height about {ratio:.1f}:1; not a panoramic banner"
-    return f"portrait panel, about {(1.0 / ratio):.1f} times taller than wide"
+            return f"near-square panel with width:height about {ratio:.2f}:1; only slightly wider than tall, not a 1.5:1 landscape card or banner"
+        return f"moderate landscape panel with width:height about {ratio:.2f}:1; not a panoramic banner"
+    return (
+        f"portrait panel with visible width:height about {ratio:.2f}:1; "
+        f"height about {(1.0 / ratio):.1f} times the width; not square, not landscape"
+    )
 
 
 def _section_layout_text(layout: Any, sec_figs: list[dict[str, Any]]) -> str:
     text = str(layout or "card").strip() or "card"
+    ratios = [_parse_aspect_ratio_text(str(fig.get("aspect") or "")) or 1.0 for fig in sec_figs]
+    near_square_ids = [
+        str(fig.get("id") or "")
+        for fig, ratio in zip(sec_figs, ratios)
+        if 1.08 <= ratio < 1.35
+    ]
+    if len(near_square_ids) >= 2 and not _has_square_hero_placeholder(sec_figs):
+        ids = ", ".join(f"[{item}]" for item in near_square_ids if item)
+        return (
+            f"{text}; paired near-square figure layout: reserve separate light mats for {ids}, "
+            "each dashed rectangle only slightly wider than tall (about 1.2:1), never a horizontal banner; "
+            "place text in side chips or a row below the pair"
+        )
     if not _has_square_hero_placeholder(sec_figs):
         return text
     # LLM-drafted specs sometimes describe a result section as "lower hero card
@@ -833,16 +901,10 @@ def _has_square_hero_placeholder(sec_figs: list[dict[str, Any]]) -> bool:
 
 
 def _should_skip_copy_unit_for_geometry(unit: dict[str, Any], sec_figs: list[dict[str, Any]]) -> bool:
-    if not _has_square_hero_placeholder(sec_figs):
-        return False
-    priority = str(unit.get("priority") or "should").lower()
-    utype = str(unit.get("type") or "bullet")
-    # Square hero result cards fail when the image model tries to fit too many
-    # fit/background chips around the limit plot.  Keep must-level public
-    # headlines and bullets, but drop optional method chips before geometry is
-    # compromised.  The statistical-method details remain available in the
-    # dedicated strategy sections and/or conclusion.
-    return priority != "must" and utype in {"fit_strategy", "uncertainty", "callout", "badge"}
+    # Do not silently drop copy units for geometry.  The prompt should ask image
+    # generation to reconstruct text into shorter chips/sidebars while preserving
+    # the information target, rather than sacrificing scientific content.
+    return False
 
 
 def _section_bullet_budget(sec_figs: list[dict[str, Any]]) -> int | None:
@@ -954,7 +1016,7 @@ def _information_density_prompt_lines(style: dict[str, Any], information_plan: d
         "- Do not make the poster a sparse cover illustration. It should communicate enough public content for a conference viewer to understand the paper's motivation, method, key figures, and conclusion.",
         "- Prefer compact information architecture: 4-6 section modules, 18-30 total short bullets/fact chips, 4-8 small badges, and a concise conclusion strip.",
         "- Keep the current generous whitespace/gutters; increase information density with smaller text tiers and shorter copy, not by flattening the layout or shrinking placeholders.",
-        "- Keep public facts legible and truthful. If the image model cannot fit a fact clearly, omit the lowest-priority fact rather than shrinking text to unreadable size or inventing abbreviations.",
+        "- Keep public facts legible and truthful. If the image model cannot fit a fact clearly, rewrite it as a shorter public chip or move it to a smaller but legible text tier; never use unreadable text or invented abbreviations.",
         "- Numeric badges are allowed only for numbers explicitly present in the supplied public text/assets; never invent luminosities, energies, masses, limits, years, or confidence levels.",
         "- Use figure placeholders as information anchors: each figure card should have a short nearby public headline explaining why the future real figure matters, without describing fake drawn contents.",
     ]

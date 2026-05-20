@@ -545,8 +545,13 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         style_overrides=style_overrides,
         content_outline=content_outline,
         domain_profile=domain_profile,
+        extra_instructions=_draft_section_count_instruction(config),
     )
     draft_spec = _apply_spec_extras(dict(draft_envelope["result"]), spec_extras)
+    draft_spec = _cap_spec_sections_for_stability(
+        draft_spec,
+        max_sections=int(cfg_get(config, "autoposter.max_sections", 5) or 0),
+    )
     draft_spec_path = dirs["specs"] / "poster_spec.draft.yaml"
     dump_config(draft_spec, draft_spec_path)
 
@@ -758,7 +763,18 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         1,
         int(_opt(getattr(args, "poster_sets", None), config, "autoposter.required_successes", 2) or 2),
     )
-    max_candidate_batches = max(1, int(cfg_get(config, "autoposter.max_candidate_batches", 3) or 3))
+    max_candidate_batches = max(
+        1,
+        int(
+            _opt(
+                getattr(args, "candidate_batches", None),
+                config,
+                "autoposter.max_candidate_batches",
+                8,
+            )
+            or 8
+        ),
+    )
     run_manifest["required_successes"] = required_successes
     run_manifest["max_candidate_batches"] = max_candidate_batches
     run_manifest["poster_sets"] = []
@@ -856,7 +872,6 @@ def _process_generated_template_candidate(
     generated_scale: float,
     run_manifest: dict[str, Any],
     placeholder_failures: list[str],
-    geometry_repair_depth: int = 0,
 ) -> list[str] | None:
     """Run detection, replacement, and QA for one generated placeholder layout."""
     stem = Path(image_path).stem
@@ -879,7 +894,7 @@ def _process_generated_template_candidate(
         min_confidence=float(_opt(args.min_detection_confidence, config, "autoposter.min_detection_confidence", 0.15)),
     )
     layout_contract_issues = list(spec_with_placements.get("_layout_contract_issues") or [])
-    if layout_contract_issues and bool(cfg_get(config, "autoposter.layout_contract.reject_misaligned", True)):
+    if layout_contract_issues and bool(cfg_get(config, "autoposter.layout_contract.reject_misaligned", False)):
         layout_contract_qa_path = dirs["qa"] / f"{stem}.layout-contract.qa.yaml"
         dump_config({"passes": False, "issues": layout_contract_issues}, layout_contract_qa_path)
         run_manifest["qa"].append(str(layout_contract_qa_path))
@@ -897,34 +912,8 @@ def _process_generated_template_candidate(
         geometry_issue_path = dirs["qa"] / f"{stem}.placeholder-geometry.qa.yaml"
         dump_config(geometry_qa, geometry_issue_path)
         run_manifest["qa"].append(str(geometry_issue_path))
-        repaired_layout = _attempt_placeholder_geometry_micro_repair(
-            image_path=image_path,
-            geometry_qa=geometry_qa,
-            final_spec=final_spec,
-            prompt=prompt,
-            dirs=dirs,
-            config=config,
-            args=args,
-            run_manifest=run_manifest,
-            repair_depth=geometry_repair_depth,
-        )
-        if repaired_layout is not None:
-            return _process_generated_template_candidate(
-                image_path=repaired_layout,
-                index=index,
-                final_spec=final_spec,
-                prompt=prompt,
-                dirs=dirs,
-                config=config,
-                args=args,
-                provider=provider,
-                generated_scale=generated_scale,
-                run_manifest=run_manifest,
-                placeholder_failures=placeholder_failures,
-                geometry_repair_depth=geometry_repair_depth + 1,
-            )
         placeholder_failures.append(
-            f"{image_path}: failed deterministic placeholder geometry QA; see {geometry_issue_path}"
+            f"{image_path}: failed deterministic placeholder geometry QA; see {geometry_issue_path}; rejecting this layout and regenerating a full candidate"
         )
         return None
     qa_image_path = Path(image_path)
@@ -1103,127 +1092,6 @@ def _export_realfigures_from_layout(
     return candidate_exports, qa_image
 
 
-def _attempt_placeholder_geometry_micro_repair(
-    *,
-    image_path: Path,
-    geometry_qa: Mapping[str, Any],
-    final_spec: Mapping[str, Any],
-    prompt: str,
-    dirs: Mapping[str, Path],
-    config: Mapping[str, Any],
-    args: argparse.Namespace,
-    run_manifest: dict[str, Any],
-    repair_depth: int,
-) -> Path | None:
-    repair_cfg = cfg_get(dict(config), "autoposter.micro_repair", {}) or {}
-    if isinstance(repair_cfg, Mapping):
-        enabled = bool(repair_cfg.get("enabled", True))
-        backend = str(repair_cfg.get("backend") or "image_edit").strip().lower()
-        max_rounds = int(repair_cfg.get("placeholder_geometry_max_rounds") or repair_cfg.get("max_rounds") or 1)
-        extra = str(repair_cfg.get("extra_instructions") or "")
-    else:
-        enabled = bool(repair_cfg)
-        backend = "image_edit"
-        max_rounds = 1
-        extra = ""
-    if not enabled or backend not in {"image_edit", "image_generation_edit", "generation_edit"}:
-        return None
-    if repair_depth >= max_rounds:
-        return None
-    issues = [item for item in geometry_qa.get("issues") or [] if isinstance(item, Mapping)]
-    if not issues:
-        return None
-    stem = image_path.stem
-    round_index = repair_depth + 1
-    repair_prompt = _build_placeholder_geometry_image_edit_prompt(
-        geometry_qa=geometry_qa,
-        spec=final_spec,
-        extra_instructions=extra,
-    )
-    prompt_path = dirs["prompts"] / f"{stem}.placeholder-geometry-microrepair{round_index}.image_edit_prompt.txt"
-    prompt_path.write_text(repair_prompt, encoding="utf-8")
-    run_manifest.setdefault("placeholder_geometry_micro_repairs", []).append(
-        {
-            "backend": "image_edit",
-            "stage": "placeholder_geometry",
-            "prompt": str(prompt_path),
-            "source_layout": str(image_path),
-            "repaired_layout": "",
-        }
-    )
-    edit_input = _prepare_micro_repair_edit_input(
-        source=image_path,
-        scratch_dir=dirs["scratch"],
-        stem=f"{stem}.placeholder-geometry-microrepair{round_index}",
-        round_index=round_index,
-        config=config,
-    )
-    try:
-        edited_source = edit_image_from_config(
-            image_path=edit_input,
-            prompt=repair_prompt,
-            out_dir=dirs["generated"],
-            basename=f"{stem}-placeholder-geometry-microrepair{round_index}-native",
-            config=config,
-            model=args.image_model or cfg_get(dict(config), "image_generation.model", "gpt-5.5"),
-            size=args.size or cfg_get(dict(config), "image_generation.size", "1024x1536"),
-            quality=args.quality or cfg_get(dict(config), "image_generation.quality", "high"),
-            account=args.account or cfg_get(dict(config), "image_generation.account.account", ""),
-        )
-        repaired_layout = _materialize_image_edit_layout(
-            edited_source=Path(edited_source),
-            previous_layout=image_path,
-            out_path=dirs["generated"] / f"{stem}-placeholder-geometry-microrepair{round_index}.png",
-        )
-    except Exception:
-        return None
-    if run_manifest.get("placeholder_geometry_micro_repairs"):
-        last = run_manifest["placeholder_geometry_micro_repairs"][-1]
-        if isinstance(last, dict):
-            last["repaired_layout"] = str(repaired_layout)
-            if edit_input.resolve() != image_path.resolve():
-                last["edit_input"] = str(edit_input)
-    return repaired_layout
-
-
-def _build_placeholder_geometry_image_edit_prompt(
-    *,
-    geometry_qa: Mapping[str, Any],
-    spec: Mapping[str, Any],
-    extra_instructions: str = "",
-) -> str:
-    project = spec.get("project") if isinstance(spec.get("project"), Mapping) else {}
-    title = str(project.get("title") or spec.get("title") or "scientific poster")
-    issues = [item for item in geometry_qa.get("issues") or [] if isinstance(item, Mapping)]
-    issue_lines: list[str] = []
-    for idx, issue in enumerate(issues[:8], start=1):
-        fig_id = str(issue.get("id") or f"FIG {idx:02d}")
-        expected = issue.get("expected_ratio")
-        actual = issue.get("actual_ratio")
-        msg = str(issue.get("message") or "")
-        issue_lines.append(
-            f"{idx}. {fig_id}: expected visible dashed-placeholder ratio {expected}:1, currently about {actual}:1. {msg}"
-        )
-    parts = [
-        "Perform a local placeholder-geometry MICRO-REPAIR on the provided scientific poster template.",
-        f"Poster title/topic: {title}",
-        "",
-        "The input is a placeholder-layout image BEFORE real figure replacement.",
-        "Do NOT redraw the full poster. Preserve the overall design, colors, text, section cards, and all [FIG NN] IDs.",
-        "Do NOT insert real or fake scientific figures. Every figure area must remain a blank dashed placeholder.",
-        "",
-        "Repair only these placeholder rectangle proportions:",
-        *issue_lines,
-        "",
-        "For each listed [FIG NN], locally resize the dashed rectangle and its light figure mat so the visible placeholder box matches the expected aspect ratio. Keep the ID, label, and aspect-ratio text inside the placeholder. It is acceptable to move nearby callout text slightly within the same card to make room, but do not change the reading order or overall layout.",
-        "Aspect-ratio intuition: 2.7:1 is a shallow wide strip; 1.32:1 is a modest landscape rectangle; 1.22:1 is close to square but still landscape. Avoid panoramic boxes for 1.22:1 or 1.32:1.",
-        "Return the complete edited placeholder-layout poster image, not a crop.",
-    ]
-    if extra_instructions.strip():
-        parts.extend(["", "Additional strict user instructions:", extra_instructions.strip()])
-    return "\n".join(parts)
-
-
 def _attempt_final_micro_repair(
     *,
     stem: str,
@@ -1339,7 +1207,7 @@ def _attempt_final_micro_repair(
             min_confidence=float(_opt(args.min_detection_confidence, config, "autoposter.min_detection_confidence", 0.15)),
         )
         layout_contract_issues = list(repaired_spec.get("_layout_contract_issues") or [])
-        if layout_contract_issues and bool(cfg_get(config, "autoposter.layout_contract.reject_misaligned", True)):
+        if layout_contract_issues and bool(cfg_get(config, "autoposter.layout_contract.reject_misaligned", False)):
             layout_contract_qa_path = dirs["qa"] / f"{stem}.microrepair{round_index}.layout-contract.qa.yaml"
             dump_config({"passes": False, "issues": layout_contract_issues}, layout_contract_qa_path)
             run_manifest["qa"].append(str(layout_contract_qa_path))
@@ -1502,9 +1370,9 @@ def _build_image_edit_micro_repair_prompt(
         "This image is the source layout BEFORE real scientific figure replacement. It intentionally contains blank [FIG NN] placeholders.",
         "Keep the same canvas size/aspect, overall layout, section cards, colors, background art, typography style, placeholder IDs, and placeholder aspect ratios.",
         "Do NOT redraw the poster from scratch. Do NOT cover areas with opaque patch rectangles. Do NOT insert real or fake scientific plots.",
-        "Preserve every [FIG NN] as a blank dashed placeholder with its ID, label, and aspect-ratio text. If QA says a final real figure/frame covered public text, you may make only a tiny local layout repair within that same section: move nearby public text/callouts out from under the placeholder, or nudge/resize the blank placeholder slightly while preserving its aspect ratio and section association.",
+        "Preserve every [FIG NN] placeholder, real figure, card, and section geometry exactly as-is. Do not move, resize, crop, or cover any scientific figure or placeholder.",
         "",
-        "Allowed edit scope: tiny local public-text/glyph corrections and tiny local placeholder/text spacing repairs requested by QA. Do not change the science story or section order.",
+        "Allowed edit scope: tiny local public-text/glyph corrections only. Do not change the science story, section order, layout, figure placement, placeholder geometry, or card geometry.",
         "After this edit, the harness will re-detect placeholders, paste the real paper figures again, and rerun final QA.",
         "Required corrections from QA:",
         *issue_lines,
@@ -1595,12 +1463,15 @@ def _final_qa_is_micro_repairable(qa_result: Mapping[str, Any]) -> bool:
     checks = qa_result.get("checks") if isinstance(qa_result.get("checks"), Mapping) else {}
     if checks and checks.get("placeholders_accounted_for") is False:
         return False
-    critical = [
-        item for item in qa_result.get("issues") or []
-        if isinstance(item, Mapping) and str(item.get("severity") or "").lower() == "critical"
-    ]
-    if not critical:
-        return True
+    # Final micro-repair is intentionally narrow: it edits the template image
+    # with image_generation/edit, then repeats detection/replacement.  It is
+    # suitable for tiny public-text/glyph defects (for example γ rendered as a
+    # Latin y).  It must never be used as a way to "nudge" figures,
+    # placeholders, geometry, or layout; those failures require rejecting this
+    # candidate and sampling a fresh full layout.
+    issues = [item for item in qa_result.get("issues") or [] if isinstance(item, Mapping)]
+    if not issues:
+        return False
     repairable_markers = (
         "text",
         "typo",
@@ -1608,9 +1479,11 @@ def _final_qa_is_micro_repairable(qa_result: Mapping[str, Any]) -> bool:
         "notation",
         "symbol",
         "gamma",
-        "public_text",
-        "claim_precision",
-        "scientific_claim",
+        "spelling",
+        "punctuation",
+        "copy",
+        "title",
+        "latin y",
     )
     blocking_markers = (
         "figure",
@@ -1618,19 +1491,37 @@ def _final_qa_is_micro_repairable(qa_result: Mapping[str, Any]) -> bool:
         "overlap",
         "containment",
         "placeholder",
+        "aspect",
+        "ratio",
         "missing",
+        "unreplaced",
         "fake_science",
         "fake_scientific_content",
+        "fabricated",
+        "data",
+        "plot",
+        "chart",
         "layout",
         "geometry",
+        "placement",
+        "boundary",
+        "protrud",
+        "outside",
+        "overflow",
+        "internal",
+        "workflow",
+        "caption",
+        "readability",
     )
-    for issue in critical:
+    saw_repairable = False
+    for issue in issues:
         blob = " ".join(str(issue.get(key) or "").lower() for key in ("category", "message", "suggested_fix"))
-        if any(marker in blob for marker in blocking_markers) and not any(marker in blob for marker in repairable_markers):
+        if any(marker in blob for marker in blocking_markers):
             return False
         if not any(marker in blob for marker in repairable_markers):
             return False
-    return True
+        saw_repairable = True
+    return saw_repairable
 
 
 def _qa_result_passes_strict(qa_result: Mapping[str, Any], *, qa_mode: str) -> bool:
@@ -1851,7 +1742,7 @@ def _generate_templates_with_critic(
                         {
                             "image": str(critic_image_path),
                             "qa": str(critique_path),
-                            "reason": "repairable template issues deferred to deterministic placeholder QA/final layout micro-repair",
+                            "reason": "template critic geometry judgment deferred to deterministic placeholder geometry QA",
                         }
                     )
                     accepted.append(critic_image_path)
@@ -1899,6 +1790,10 @@ def _attempt_template_critic_micro_repair(
         max_rounds = 1
         extra = ""
     if not enabled or max_rounds <= 0 or backend not in {"image_edit", "image_generation_edit", "generation_edit"}:
+        return None
+    if _template_critique_has_placeholder_geometry_issue(critique):
+        # Geometry/aspect problems must be solved by full layout regeneration;
+        # local template image-edit tends to preserve the bad layout skeleton.
         return None
     if not _template_critique_is_micro_repairable(critique):
         return None
@@ -1980,7 +1875,7 @@ def _attempt_template_critic_micro_repair(
                 {
                     "image": str(repaired_layout),
                     "qa": str(qa_path),
-                    "reason": "repairable template issues deferred to deterministic placeholder QA/final layout micro-repair",
+                    "reason": "template critic issue deferred to downstream strict QA after text-only template micro-repair",
                 }
             )
             return repaired_layout
@@ -1994,23 +1889,31 @@ def _attempt_template_critic_micro_repair(
 def _template_critique_is_micro_repairable(critique: Mapping[str, Any]) -> bool:
     issues = [item for item in critique.get("issues") or [] if isinstance(item, Mapping)]
     if not issues:
-        return True
+        return False
     repairable_markers = (
         "text",
         "typo",
         "glyph",
         "notation",
         "gamma",
-        "placeholder_contract",
-        "aspect",
-        "ratio",
-        "geometry",
         "spelling",
-        "scientific_accuracy",
-        "result-copy",
+        "title",
+        "punctuation",
         "copy",
     )
     blocking_markers = (
+        "placeholder",
+        "aspect",
+        "ratio",
+        "geometry",
+        "layout",
+        "figure card",
+        "dashed rectangle",
+        "boundary",
+        "too wide",
+        "too narrow",
+        "landscape",
+        "portrait",
         "fake_science",
         "fake scientific",
         "fake data",
@@ -2020,6 +1923,11 @@ def _template_critique_is_micro_repairable(critique: Mapping[str, Any]) -> bool:
         "missing [fig",
         "no placeholder",
         "internal",
+        "workflow",
+        "caption",
+        "readability",
+        "information density",
+        "artistry",
     )
     critical = [item for item in issues if str(item.get("severity") or "").lower() == "critical"]
     candidates = critical or issues
@@ -2028,7 +1936,7 @@ def _template_critique_is_micro_repairable(critique: Mapping[str, Any]) -> bool:
             str(issue.get(key) or "").lower()
             for key in ("category", "message", "suggested_prompt_repair", "location")
         )
-        if any(marker in blob for marker in blocking_markers) and not any(marker in blob for marker in repairable_markers):
+        if any(marker in blob for marker in blocking_markers):
             return False
         if not any(marker in blob for marker in repairable_markers):
             return False
@@ -2036,21 +1944,59 @@ def _template_critique_is_micro_repairable(critique: Mapping[str, Any]) -> bool:
 
 
 def _template_critique_can_defer_to_downstream(critique: Mapping[str, Any]) -> bool:
-    if not _template_critique_is_micro_repairable(critique):
-        return False
     checks = critique.get("checks") if isinstance(critique.get("checks"), Mapping) else {}
     if checks:
         if checks.get("no_internal_text") is False or checks.get("no_fake_science") is False:
             return False
         if checks.get("information_plan_visible") is False or checks.get("art_direction_strong") is False:
             return False
-        if checks.get("placeholder_contract_clean") is False:
+        if checks.get("placeholder_contract_clean") is False and (
+            _template_critique_has_critical_placeholder_geometry_issue(critique)
+            or _template_critique_has_hard_placeholder_issue(critique)
+        ):
             return False
-    # Do not defer placeholder geometry/aspect failures.  The regression that
-    # made real figures look worse came from accepting a visually wrong
-    # placeholder, then letting hidden replacement planning expand the figure
-    # frame upward into public text.  Geometry problems must be fixed by
-    # template image-edit/regeneration before real figures are pasted.
+    if _template_critique_has_placeholder_geometry_issue(critique):
+        # Aspect/size judgements from the VLM critic are useful prompt feedback,
+        # but deterministic pixel geometry QA is the authority.  Only defer
+        # non-critical geometry suspicions downstream.  Critical placeholder
+        # failures should drive a fresh full-layout regeneration, never a
+        # local edit/patch.
+        if _template_critique_has_critical_placeholder_geometry_issue(critique):
+            return False
+        return not _template_critique_has_hard_placeholder_issue(critique)
+    if not _template_critique_is_micro_repairable(critique):
+        return False
+    # Template critic is intentionally broad.  Only defer local public-text/glyph
+    # issues that downstream strict QA can safely re-check.
+    return True
+
+
+def _template_critique_has_hard_placeholder_issue(critique: Mapping[str, Any]) -> bool:
+    hard_markers = (
+        "missing placeholder",
+        "missing [fig",
+        "[fig 01] is missing",
+        "[fig 02] is missing",
+        "[fig 03] is missing",
+        "[fig 04] is missing",
+        "appears twice",
+        "duplicated",
+        "duplicate",
+        "wrong id",
+        "mislabeled",
+        "no valid [fig",
+        "extra placeholder",
+        "additional placeholder",
+        "public text inside",
+        "heading inside",
+        "caption inside",
+        "bullet inside",
+        "contains fake",
+        "fake plot",
+        "fake scientific",
+        "real data",
+        "real plot",
+    )
     for issue in critique.get("issues") or []:
         if not isinstance(issue, Mapping):
             continue
@@ -2058,11 +2004,69 @@ def _template_critique_can_defer_to_downstream(critique: Mapping[str, Any]) -> b
             str(issue.get(key) or "").lower()
             for key in ("category", "message", "suggested_prompt_repair", "location")
         )
-        if any(marker in blob for marker in ("placeholder", "aspect", "ratio", "geometry", "figure card")):
-            return False
-    # Template critic is intentionally broad.  Only defer local public-text/glyph
-    # issues that downstream strict QA can safely re-check.
-    return True
+        if any(marker in blob for marker in hard_markers):
+            return True
+    return False
+
+
+def _template_critique_has_placeholder_geometry_issue(critique: Mapping[str, Any]) -> bool:
+    for issue in critique.get("issues") or []:
+        if not isinstance(issue, Mapping):
+            continue
+        blob = " ".join(
+            str(issue.get(key) or "").lower()
+            for key in ("category", "message", "suggested_prompt_repair", "location")
+        )
+        if any(
+            marker in blob
+            for marker in (
+                "aspect",
+                "ratio",
+                "geometry",
+                "figure card",
+                "replacement box",
+                "dashed rectangle",
+                "boundary",
+                "too wide",
+                "too narrow",
+                "landscape",
+                "portrait",
+                "overlap",
+            )
+        ):
+            return True
+    return False
+
+
+def _template_critique_has_critical_placeholder_geometry_issue(critique: Mapping[str, Any]) -> bool:
+    for issue in critique.get("issues") or []:
+        if not isinstance(issue, Mapping):
+            continue
+        if str(issue.get("severity") or "").lower() != "critical":
+            continue
+        blob = " ".join(
+            str(issue.get(key) or "").lower()
+            for key in ("category", "message", "suggested_prompt_repair", "location")
+        )
+        if any(
+            marker in blob
+            for marker in (
+                "aspect",
+                "ratio",
+                "geometry",
+                "figure card",
+                "replacement box",
+                "dashed rectangle",
+                "boundary",
+                "too wide",
+                "too narrow",
+                "landscape",
+                "portrait",
+                "overlap",
+            )
+        ):
+            return True
+    return False
 
 
 def _build_template_image_edit_micro_repair_prompt(
@@ -2102,8 +2106,8 @@ def _build_template_image_edit_micro_repair_prompt(
         "",
         "Allowed edit scope:",
         "- Correct local public-text typos, corrupted glyphs, and notation errors.",
-        "- If the critic says a placeholder aspect ratio is wrong, locally resize that dashed placeholder rectangle/card so it visibly matches the printed aspect ratio, while keeping the same [FIG NN] ID and blank-placeholder contract.",
-        "- If the critic says a result value is unsupported, replace only that local text with the supplied/critic-approved value.",
+        "- Do not rewrite claims, add new facts, remove information, or change the scientific story.",
+        "- Do not repair placeholder geometry, card layout, figure sizes, or section structure in this micro-edit path.",
         "",
         "Critic findings to repair:",
         *issue_lines,
@@ -2114,10 +2118,6 @@ def _build_template_image_edit_micro_repair_prompt(
         parts.append(
             "Notation hint: where the decay means H to Z gamma, render it as H→Zγ in large headings, or use the words 'Z gamma' in small labels if γ risks looking like Latin y."
         )
-    if any(marker in qa_blob for marker in ("aspect", "ratio", "placeholder")):
-        parts.append(
-            "Placeholder hint: prioritize visible rectangle proportions over decorative symmetry; a 2.7:1 placeholder must be a shallow wide strip, while 1.22:1 and 1.32:1 placeholders should be modest landscape rectangles, not panoramic or portrait boxes."
-        )
     parts.append("Return the complete edited placeholder-layout poster image, not a crop.")
     if extra_instructions.strip():
         parts.extend(["", "Additional strict user instructions:", extra_instructions.strip()])
@@ -2127,6 +2127,15 @@ def _build_template_image_edit_micro_repair_prompt(
 def _template_critic_accepts(critique: Mapping[str, Any], config: Mapping[str, Any]) -> bool:
     scores = dict(critique.get("scores") or {})
     if bool(cfg_get(dict(config), "autoposter.template_critic.require_pass", True)) and not bool(critique.get("passes")):
+        return False
+    checks = critique.get("checks") if isinstance(critique.get("checks"), Mapping) else {}
+    for key in ("information_plan_visible", "art_direction_strong", "no_internal_text", "no_fake_science"):
+        if checks.get(key) is False:
+            return False
+    if checks.get("placeholder_contract_clean") is False and (
+        _template_critique_has_critical_placeholder_geometry_issue(critique)
+        or _template_critique_has_hard_placeholder_issue(critique)
+    ):
         return False
     thresholds = {
         "overall": float(cfg_get(dict(config), "autoposter.template_critic.min_overall_score", 0.72) or 0.0),
@@ -2142,14 +2151,14 @@ def _template_critic_accepts(critique: Mapping[str, Any], config: Mapping[str, A
 
 def _template_critic_repairs(critique: Mapping[str, Any]) -> list[str]:
     repairs = [
-        str(item).strip()
+        _sanitize_template_repair_for_aspect(str(item).strip())
         for item in critique.get("prompt_repairs") or []
         if str(item).strip() and not _repair_contradicts_placeholder_contract(str(item))
     ]
     for issue in critique.get("issues") or []:
         if not isinstance(issue, Mapping):
             continue
-        repair = str(issue.get("suggested_prompt_repair") or "").strip()
+        repair = _sanitize_template_repair_for_aspect(str(issue.get("suggested_prompt_repair") or "").strip())
         if repair and repair not in repairs and not _repair_contradicts_placeholder_contract(repair):
             repairs.append(repair)
     if not repairs:
@@ -2157,6 +2166,52 @@ def _template_critic_repairs(critique: Mapping[str, Any]) -> list[str]:
             "Regenerate the whole poster with stronger editorial HEP artistry, richer compact public facts, cleaner placeholder boxes, and more legible typography."
         ]
     return repairs[:10]
+
+
+def _sanitize_template_repair_for_aspect(text: str) -> str:
+    clean = str(text or "").strip()
+    clean = _sanitize_template_repair_for_information_preservation(clean)
+    low = clean.lower()
+    portrait_marker = any(marker in low for marker in ("fig 01", "fig 02", "fig 03", "[fig 01", "[fig 02", "[fig 03"))
+    if portrait_marker and any(marker in low for marker in ("wider", "more width", "widen")):
+        if any(marker in low for marker in ("tall", "portrait", "aspect", "ratio", "1:1.")):
+            clean += (
+                " Interpret 'wider' only as larger absolute area: increase height and width together while preserving the printed portrait width/height ratio; "
+                "do not make the dashed rectangle broader, square, or landscape."
+            )
+    if portrait_marker and any(marker in low for marker in ("too narrow", "narrower")):
+        clean += (
+            " Correct by matching the numeric source aspect ratio exactly, not by making a generic wide card."
+        )
+    return clean
+
+
+def _sanitize_template_repair_for_information_preservation(text: str) -> str:
+    clean = str(text or "").strip()
+    if not clean:
+        return clean
+    replacements = [
+        (r"\breduce or compress\b", "reflow or compact without losing information"),
+        (r"\breduce or compact\b", "reflow or compact without losing information"),
+        (r"\breduce nearby bullets\b", "rewrite nearby bullets as shorter equivalent chips"),
+        (r"\breduce surrounding bullets\b", "rewrite surrounding bullets as shorter equivalent chips"),
+        (r"\breduce validation bullets\b", "rewrite validation bullets as shorter equivalent chips"),
+        (r"\breduce badges or bullets\b", "merge badges/bullets into shorter equivalent chips"),
+        (r"\breduce nearby text\b", "reflow nearby text into shorter equivalent chips"),
+        (r"\bshrink adjacent result chips\b", "recompose adjacent result chips into a compact stack"),
+        (r"\bmove or reduce result chips\b", "move or recompose result chips into a compact stack"),
+        (r"\bomit could-priority units\b", "merge/rewrite could-priority units into compact chips"),
+        (r"\bomit lower-priority\b", "merge/rewrite lower-priority"),
+    ]
+    for pattern, replacement in replacements:
+        clean = re.sub(pattern, replacement, clean, flags=re.IGNORECASE)
+    if any(marker in clean.lower() for marker in ("placeholder", "fig 0", "[fig")) and any(
+        marker in clean.lower() for marker in ("text", "bullet", "badge", "chip", "flowchart", "callout")
+    ):
+        clean += (
+            " Preserve the same public information target; solve the conflict by rewriting and reflowing copy, not by making the poster sparse."
+        )
+    return clean
 
 
 def _repair_contradicts_placeholder_contract(text: str) -> bool:
@@ -2192,10 +2247,20 @@ def _prompt_with_template_critic_repairs(base_prompt: str, *, repairs: list[str]
             "Make the poster feel more like a premium HEP conference poster and less like a slide deck.",
         ]
     repair_lines = "\n".join(f"- {item}" for item in unique_repairs)
+    geometry_priority = "\n".join(
+        [
+            "- HIGHEST PRIORITY: regenerate with correct visible [FIG NN] placeholder aspect ratios. This outranks art, symmetry, flowcharts, badges, and decorative placement, but it must not make the poster sparse.",
+            "- If any placeholder was criticized as too wide, too shallow, too square, too portrait, or wrong-aspect, redesign the whole section around that placeholder instead of squeezing it into the old card.",
+            "- Preserve each placeholder as one blank dashed rectangle with only its ID, label, and aspect text; do not use a large wrong-shaped mat with a smaller correct inset.",
+            "- Reconstruct text/decor around the corrected placeholder: reflow public copy into shorter legible chips, sidebars, or stacked labels; merge flowchart nodes when needed; preserve the intended information density instead of dropping content.",
+        ]
+    )
     return (
         base_prompt.rstrip()
         + "\n\n"
         + f"REGENERATION CRITIQUE ROUND {round_index} (apply these changes to the whole poster; do not mention this critique in the poster):\n"
+        + geometry_priority
+        + "\n"
         + repair_lines
         + "\n- Regenerate a complete fresh poster, not a patched or cropped collage.\n"
     )
@@ -2776,6 +2841,83 @@ def _apply_spec_extras(spec: dict[str, Any], extras: Mapping[str, Any]) -> dict[
     return out
 
 
+def _draft_section_count_instruction(config: Mapping[str, Any]) -> str:
+    max_sections = int(cfg_get(dict(config), "autoposter.max_sections", 5) or 0)
+    extra = str(cfg_get(dict(config), "autoposter.draft_spec.extra_instructions", "") or "").strip()
+    parts: list[str] = []
+    if max_sections > 0:
+        parts.append(
+            f"Prefer {max_sections} or fewer rendered poster sections. "
+            "Do not create a separate takeaway/scope section if it would shrink scientific figure placeholders; "
+            "fold takeaways into the bottom conclusion strip instead."
+        )
+        parts.append(
+            "When multiple selected source figures are portrait diagrams, reserve a wide method section for them before adding extra text-only sections."
+        )
+    if extra:
+        parts.append(extra)
+    return " ".join(parts)
+
+
+def _cap_spec_sections_for_stability(spec: dict[str, Any], *, max_sections: int) -> dict[str, Any]:
+    """Keep the default/main poster route from over-fragmenting the layout."""
+
+    if max_sections <= 0:
+        return spec
+    sections = [dict(item) for item in spec.get("sections") or [] if isinstance(item, Mapping)]
+    if len(sections) <= max_sections:
+        return spec
+    out = copy.deepcopy(spec)
+    kept = sections[:max_sections]
+    overflow = sections[max_sections:]
+    kept_ids = {int(section.get("id") or idx) for idx, section in enumerate(kept, start=1)}
+    fallback_id = int(kept[-1].get("id") or max_sections)
+
+    conclusion = [str(item) for item in out.get("conclusion") or [] if str(item).strip()]
+    for section in overflow:
+        title = str(section.get("title") or "").strip()
+        overflow_bits: list[str] = []
+        for block in section.get("text") or []:
+            if not isinstance(block, Mapping):
+                continue
+            overflow_bits.extend(str(item).strip() for item in block.get("body") or [] if str(item).strip())
+            overflow_bits.extend(str(item).strip() for item in block.get("bullets") or [] if str(item).strip())
+        if not overflow_bits and section.get("caption"):
+            overflow_bits.append(str(section.get("caption")))
+        if overflow_bits:
+            text = sanitize_public_text("; ".join(overflow_bits[:3]), out.get("forbidden_phrases") or []).strip()
+            if text:
+                prefix = f"{title}: " if title else ""
+                conclusion.append((prefix + text)[:220])
+    out["sections"] = kept
+    out["conclusion"] = _dedupe_keep_order(conclusion, limit=5)
+
+    for placeholder in out.get("placeholders") or []:
+        if not isinstance(placeholder, dict):
+            continue
+        try:
+            section_id = int(placeholder.get("section") or fallback_id)
+        except Exception:
+            section_id = fallback_id
+        if section_id not in kept_ids:
+            placeholder["section"] = fallback_id
+    return out
+
+
+def _dedupe_keep_order(values: list[str], *, limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        key = text.lower()
+        if text and key not in seen:
+            out.append(text)
+            seen.add(key)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _guess_title(text: str) -> str:
     for line in text.splitlines():
         line = line.strip()
@@ -3030,6 +3172,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--variants", type=int, help="number of image-generation variants")
     p.add_argument("--poster-sets", type=int, help="number of strict-QA poster sets to collect; default 2")
+    p.add_argument("--candidate-batches", type=int, help="maximum fresh image-generation layout batches to sample before failing")
     p.add_argument("--max-figures", type=int)
     p.add_argument("--max-assets", type=int)
     p.add_argument("--min-image-width", type=int)

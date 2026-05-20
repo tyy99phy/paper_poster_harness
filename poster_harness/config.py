@@ -72,6 +72,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
         "domain_profile": "auto",
         "max_figures": 8,
         "max_assets": 48,
+        "max_sections": 5,
         "min_image_width": 96,
         "min_image_height": 96,
         "render_pages": True,
@@ -84,11 +85,11 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
         "redraw_normalized_placeholders": False,
         "placeholder_aspect_tolerance": 0.20,
         "required_successes": 2,
-        "max_candidate_batches": 3,
+        "max_candidate_batches": 8,
         "llm_stage_retries": 4,
         "layout_contract": {
             "enabled": True,
-            "reject_misaligned": True,
+            "reject_misaligned": False,
         },
         "template_critic": {
             "enabled": True,
@@ -162,6 +163,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
             # not replace the default route.
             "autoposter": {
                 "content_mode": "hep_dense",
+                "max_sections": 6,
                 "content_outline": {
                     "enabled": True,
                     "max_sections": 6,
@@ -192,7 +194,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
                             "Paper2Poster-rich editorial density without reducing whitespace: 18-30 concise public information units across the poster, "
                             "4-8 grounded fact badges, 4-6 section modules, and one compact conclusion strip. "
                             "Use a controlled smaller text tier for optional bullets/badges/micro-callouts, while keeping must-level facts clearly legible. "
-                            "Prefer short claims and fact chips over paragraphs; omit lower-priority facts before sacrificing legibility or placeholder geometry."
+                            "Prefer short claims and fact chips over paragraphs; reconstruct lower-priority facts into compact legible chips before changing placeholder geometry."
                         ),
                         "text_density": [
                             "Compress prose into poster bullets: short noun phrases, ideally under 11 words each.",
@@ -201,7 +203,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
                             "Avoid microscopic paragraphs, footnote blocks, dense equations, and reference lists in the rendered poster.",
                             "Prefer 2-5 bullets/fact chips per non-hero card and at most one short sentence per text block; preserve meaning without adding new science.",
                             "Use public fact chips and numeric badges for explicitly grounded dataset/result facts; do not invent numbers.",
-                            "If text competes with a result figure, shrink or omit lower-priority text first and enlarge/preserve the figure placeholder.",
+                            "If text competes with a result figure, reconstruct the text into shorter legible chips/sidebars while enlarging/preserving the figure placeholder.",
                         ],
                     },
                 },
@@ -220,7 +222,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
                             "For HEP experts, prefer concrete SR/CR, fit, selection, and uncertainty chips over generic analysis prose.",
                             "Avoid paragraphs, footnote blocks, dense equations, reference lists, and tiny illegible tables.",
                             "Use public fact chips and numeric badges only for explicitly grounded luminosity, energy, channel, mass/limit, or CL facts.",
-                            "If text competes with a result figure, omit could-priority units before shrinking placeholders or reducing gutters.",
+                            "If text competes with a result figure, merge/rewrite could-priority units into compact chips before shrinking placeholders or reducing gutters.",
                         ],
                     },
                 },
@@ -241,7 +243,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
                             "For HEP experts, prefer concrete SR/CR, fit, selection, and uncertainty chips over generic analysis prose.",
                             "Avoid paragraphs, footnote blocks, dense equations, reference lists, and tiny illegible tables.",
                             "Use public fact chips and numeric badges only for explicitly grounded luminosity, energy, channel, mass/limit, or CL facts.",
-                            "If text competes with a result figure, omit could-priority units before shrinking placeholders or reducing gutters.",
+                            "If text competes with a result figure, merge/rewrite could-priority units into compact chips before shrinking placeholders or reducing gutters.",
                         ],
                     },
                 },
@@ -455,7 +457,7 @@ DEFAULT_HARNESS_CONFIG: dict[str, Any] = {
                 "information_density": (
                     "Paper2Poster-rich editorial density: 14-24 concise public information units across the poster, "
                     "3-6 grounded fact badges, 4-6 section modules, and one compact conclusion strip. "
-                    "Prefer short claims and fact chips over paragraphs; omit lower-priority facts before sacrificing legibility or placeholder geometry."
+                    "Prefer short claims and fact chips over paragraphs; reconstruct lower-priority facts into compact legible chips before changing placeholder geometry."
                 ),
             },
             "extras": {

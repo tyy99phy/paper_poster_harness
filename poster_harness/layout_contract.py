@@ -78,10 +78,14 @@ def build_layout_contract(
         },
         "policy": {
             "purpose": "soft visual prior for image-generation plus strict sanity check for placeholder detection",
-            "planned_zone_tolerance": "generated placeholders may move modestly for artistic balance, but must remain in the same section and overlap their planned/search zone",
+            "planned_zone_tolerance": "generated placeholders may move modestly for artistic balance, but must remain close to their planned section zone; exact [FIG NN] detection and aspect QA remain authoritative",
             "replacement_rule": "real source figures are fitted inside detected placeholders; planned zones are never used as a fallback when detection fails",
             "min_iou": 0.06,
-            "max_center_distance_fraction": 0.28,
+            # The contract is a soft prior, not a layout fallback.  Image
+            # generation may choose a different but still perfectly replaceable
+            # editorial arrangement; reject only detections that are genuinely
+            # far from the planned section/search zone.
+            "max_center_distance_fraction": 0.22,
         },
         "sections": [
             {"id": int(section.get("id")), "title": str(section.get("title") or ""), "zone": _round_box(section_zones[int(section.get("id"))])}
@@ -138,7 +142,7 @@ def evaluate_layout_contract_alignment(
     max_center_distance_fraction = float(
         max_center_distance_fraction
         if max_center_distance_fraction is not None
-        else policy.get("max_center_distance_fraction", 0.28)
+        else policy.get("max_center_distance_fraction", 0.16)
     )
     planned = contract_boxes_for_image(contract, image_size, key="zone")
     search = contract_boxes_for_image(contract, image_size, key="search_zone")

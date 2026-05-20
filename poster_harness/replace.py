@@ -102,7 +102,16 @@ def replace_placeholders(
     if not dry_run:
         for _, _, _, _, erase_box, frame_box, is_square_result in render_items:
             if is_square_result:
-                _erase_placeholder_region_with_sampled_fill(canvas, erase_box)
+                if _box_area(erase_box) <= _box_area(frame_box) * 1.85:
+                    # When the cleanup envelope is close to the final square
+                    # frame, a solid erase is safer: it removes all dashed
+                    # placeholder strokes before the publication frame is
+                    # drawn.  For much larger decorative result cards, keep the
+                    # sampled artifact-only eraser to avoid creating a visible
+                    # giant white slab over public design elements.
+                    _erase_final_placeholder_region(canvas, erase_box)
+                else:
+                    _erase_placeholder_region_with_sampled_fill(canvas, erase_box)
             else:
                 _erase_final_placeholder_region(canvas, erase_box)
             _draw_final_figure_frame(canvas, frame_box)
@@ -536,19 +545,49 @@ def normalize_placeholder_geometry(
             source_candidate
             and (
                 redraw
-                or _nearby_placeholder_panel(source_candidate, original_box)
-                or _placeholder_panel_strongly_overlaps_seed(source_candidate, original_box)
+                or (
+                    _hidden_source_candidate_is_shrink_or_same(source_candidate, original_box)
+                    and (
+                        _nearby_placeholder_panel(source_candidate, original_box)
+                        or _placeholder_panel_strongly_overlaps_seed(source_candidate, original_box)
+                    )
+                )
             )
         )
+        original_seed_trustworthy = (
+            not redraw
+            and _ratio_relative_error(_box_ratio(original_box), ratio)
+            <= _effective_placeholder_ratio_tolerance(ratio, 0.20)
+            and _box_has_placeholder_edge_evidence(canvas, original_box)
+            and not _placeholder_candidate_has_public_text_overlap(canvas, original_box)
+        )
         contract_panel = None
-        if not source_candidate_acceptable:
+        if not source_candidate_acceptable and not original_seed_trustworthy:
             contract_panel = _recover_dashed_panel_with_contract(
                 canvas,
                 original_box=original_box,
                 search_box=contract_search_box,
                 ratio=ratio,
             )
-        if source_candidate_acceptable and source_candidate:
+            if (
+                contract_panel is not None
+                and not redraw
+                and not _hidden_source_candidate_is_shrink_or_same(contract_panel, original_box)
+            ):
+                # A soft contract search can find a nearby light card or
+                # flowchart tile.  Hidden replacement planning must never grow
+                # a detected placeholder downward/sideways to satisfy the
+                # contract; if the original seed is imperfect, fit the true
+                # source aspect *inside* that seed instead.
+                contract_panel = None
+        if original_seed_trustworthy:
+            # The VLM already found a clean, ratio-correct dashed placeholder.
+            # Do not let the soft layout contract pull replacement to another
+            # dashed/card-like element elsewhere in the same section.  This is
+            # the main guard against "correcting" a good plot slot into a
+            # nearby flowchart chip or callout box.
+            source_box = original_box
+        elif source_candidate_acceptable and source_candidate:
             source_box = source_candidate
         elif contract_panel is not None:
             source_box = contract_panel
@@ -559,7 +598,9 @@ def normalize_placeholder_geometry(
             # the wrong section.  When the recovered panel is far from the seed,
             # keep the detected placeholder as the hard visual envelope.
             source_box = original_box
-        source_box = _repair_edge_wide_source_box(source_box, original_box, ratio, canvas.size)
+        repaired_edge_box = _repair_edge_wide_source_box(source_box, original_box, ratio, canvas.size)
+        if redraw or _hidden_source_candidate_is_shrink_or_same(repaired_edge_box, original_box):
+            source_box = repaired_edge_box
         source_box = _enforce_canvas_gutter(source_box, canvas.size)
         if redraw:
             source_box = _apply_layout_contract_search_constraint(
@@ -622,6 +663,16 @@ def normalize_placeholder_geometry(
                     min(canvas.size[0], clear_box[2] + pad_x),
                     clear_box[3],
                 )
+            if original_seed_trustworthy:
+                # If later lower-hero constraints or square-result planning
+                # shrink/shift the publication frame, still erase the complete
+                # original clean dashed placeholder.  Otherwise old dashed
+                # borders can survive below/right of the real figure even
+                # though the final target is correctly contained.
+                clean_original = _clamp_box(original_box, canvas.size)
+                if _box_area(clean_original) <= _box_area(clear_box) * 1.35:
+                    clear_box = _clamp_box(_union_box(clear_box, clean_original), canvas.size)
+                    erase_box = _clamp_box(_union_box(erase_box, clean_original), canvas.size)
             if _needs_supporting_plot_text_clearance(ph, ratio) and _busy_content_below_placeholder(canvas, source_box):
                 # Wide fit/distribution plots often sit immediately above
                 # analysis-strategy bullets.  Preserve the detected placeholder
@@ -801,6 +852,24 @@ def audit_generated_placeholder_geometry(
                     ),
                 }
             )
+        if expected >= 2.0:
+            visible_h = visible_box[3] - visible_box[1]
+            min_h = max(96, int(round(canvas.height * 0.075)))
+            if visible_h < min_h:
+                issues.append(
+                    {
+                        "id": str(fig_id),
+                        "expected_ratio": round(expected, 4),
+                        "actual_ratio": round(actual, 4),
+                        "min_height": min_h,
+                        "detected_box": list(detected_box),
+                        "visible_box": list(visible_box),
+                        "message": (
+                            f"{fig_id} wide placeholder height is only {visible_h}px; "
+                            f"strict mode requires at least {min_h}px so axes and legends remain readable"
+                        ),
+                    }
+                )
         if _is_result_like_square_placeholder(ph, expected) and _box_too_large_for_result_square(
             visible_box,
             canvas.size,
@@ -844,7 +913,7 @@ def audit_generated_placeholder_geometry(
                 }
             )
         surface_metrics = _figure_surface_dark_metrics(canvas, visible_box, seed_box=detected_box)
-        if surface_metrics and surface_metrics["dark_fraction"] > 0.55 and surface_metrics["light_fraction"] < 0.30:
+        if surface_metrics and surface_metrics["dark_fraction"] > 0.75 and surface_metrics["light_fraction"] < 0.18:
             issues.append(
                 {
                     "id": str(fig_id),
@@ -870,6 +939,35 @@ def _is_result_like_square_placeholder(ph: dict[str, Any], ratio: float) -> bool
         return False
     low = str(ph.get("label") or "").lower()
     return any(word in low for word in ("limit", "result", "constraint", "upper", "exclusion"))
+
+
+def _hidden_source_candidate_is_shrink_or_same(
+    candidate: tuple[int, int, int, int],
+    seed: tuple[int, int, int, int],
+    *,
+    margin: int = 8,
+) -> bool:
+    """Keep hidden replacement planning conservative.
+
+    In the normal public export path (``redraw=False``), the generated layout is
+    the visible poster.  A recovered panel may safely tighten an over-broad VLM
+    seed to a smaller inner dashed placeholder, or make only a tiny edge
+    correction.  It must not expand a real figure into surrounding text/cards to
+    compensate for a bad generated placeholder.  If more room is needed, strict
+    QA should reject the template and the harness should generate a fresh
+    layout.
+    """
+
+    seed_area = max(1, _box_area(seed))
+    candidate_area = max(1, _box_area(candidate))
+    if candidate_area <= seed_area * 1.03:
+        return _box_overlap(candidate, seed) / max(1, min(candidate_area, seed_area)) >= 0.35
+    return (
+        candidate[0] >= seed[0] - margin
+        and candidate[1] >= seed[1] - margin
+        and candidate[2] <= seed[2] + margin
+        and candidate[3] <= seed[3] + margin
+    )
 
 
 def _box_too_large_for_result_square(
