@@ -1,0 +1,42 @@
+<svg width="320" height="320" viewBox="0 0 320 320" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Paper Poster Harness logo</title>
+  <desc id="desc">A scientific poster sheet with dashed figure placeholders and particle rings.</desc>
+  <defs>
+    <linearGradient id="bg" x1="26" y1="28" x2="294" y2="292" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#071A3A"/>
+      <stop offset="0.55" stop-color="#0B315F"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="86" y1="58" x2="244" y2="262" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FBFF"/>
+      <stop offset="1" stop-color="#EAF4FF"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="61" y1="251" x2="260" y2="73" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE"/>
+      <stop offset="0.55" stop-color="#60A5FA"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="10" y="10" width="300" height="300" rx="52" fill="url(#bg)"/>
+  <path d="M52 221C96 149 180 112 268 128" stroke="url(#accent)" stroke-width="4" stroke-linecap="round" opacity="0.9"/>
+  <path d="M48 102C110 142 198 151 278 84" stroke="#38BDF8" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+  <circle cx="260" cy="88" r="30" stroke="#F59E0B" stroke-width="2" opacity="0.7"/>
+  <circle cx="260" cy="88" r="15" stroke="#FDE68A" stroke-width="2" opacity="0.8"/>
+  <circle cx="260" cy="88" r="4" fill="#FDE68A" filter="url(#glow)"/>
+  <circle cx="68" cy="220" r="23" stroke="#22D3EE" stroke-width="2" opacity="0.65"/>
+  <circle cx="68" cy="220" r="6" fill="#22D3EE" filter="url(#glow)"/>
+  <rect x="82" y="54" width="156" height="212" rx="18" fill="url(#paper)" stroke="#B9D7F2" stroke-width="3"/>
+  <rect x="102" y="80" width="116" height="24" rx="7" fill="#0B315F"/>
+  <rect x="102" y="118" width="50" height="44" rx="7" fill="#EFF6FF" stroke="#2563EB" stroke-width="3" stroke-dasharray="8 6"/>
+  <rect x="168" y="118" width="50" height="44" rx="7" fill="#EFF6FF" stroke="#2563EB" stroke-width="3" stroke-dasharray="8 6"/>
+  <rect x="102" y="178" width="116" height="48" rx="7" fill="#FFF7ED" stroke="#F59E0B" stroke-width="3" stroke-dasharray="8 6"/>
+  <path d="M108 244H212" stroke="#93C5FD" stroke-width="6" stroke-linecap="round"/>
+  <path d="M112 92H208" stroke="#E0F2FE" stroke-width="7" stroke-linecap="round"/>
+  <path d="M116 139H138M182 139H204M128 202H192" stroke="#94A3B8" stroke-width="5" stroke-linecap="round"/>
+  <path d="M240 204L274 238" stroke="#F59E0B" stroke-width="5" stroke-linecap="round" filter="url(#glow)"/>
+  <circle cx="276" cy="240" r="8" fill="#FBBF24"/>
+</svg>

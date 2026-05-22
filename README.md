@@ -1,357 +1,180 @@
-# Paper Poster Harness
+<p align="center">
+  <img src="docs/assets/logo.svg" width="128" alt="Paper Poster Harness logo" />
+</p>
 
-把一篇学术论文自动生成会议海报的框架。
+<h1 align="center">Paper Poster Harness</h1>
 
-核心思路：**LLM 只负责版式设计，不碰科学内容。** 生图模型先画出带空白占位符的海报，框架再把论文里的真实图片确定性替换进去——这样既享受了 AI 的设计能力，又杜绝了模型伪造科学图表的问题。
+<p align="center">
+  Placeholder-first LLM + image-generation framework for turning papers into conference posters without fake scientific figures.
+</p>
 
-## 前提条件
+<p align="center">
+  <a href="README.md">English</a> ·
+  <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="docs/i18n/README.ja.md">日本語</a> ·
+  <a href="docs/i18n/README.es.md">Español</a>
+</p>
 
-- Python 3.10+
-- 一个 OpenAI/ChatGPT 账号（用于 LLM 推理和图片生成）
-- （可选）arXiv 论文需要网络访问
+<p align="center">
+  <img src="docs/assets/selected_12_preview.jpg" alt="Selected 12-paper benchmark: P2P baseline vs Paper Poster Harness" />
+</p>
 
-## 快速开始
+## What is this?
+
+Paper Poster Harness is a strict, auditable pipeline for producing academic posters from papers. The key idea is simple:
+
+> Let the image model design the poster, but never let it invent scientific data.
+
+The image-generation model creates an attractive poster template with **blank figure placeholders** such as `[FIG 01]`. The harness then detects those placeholders and deterministically replaces them with real figures extracted from the paper or its source package. If any stage fails QA, the run fails or regenerates a full candidate; it does not silently fall back to pasted poster screenshots.
+
+## Why placeholder-first?
+
+Image models can create beautiful scientific-looking charts, but those curves, error bars, histograms, event displays, and diagrams may be fabricated. That is unacceptable for scientific communication.
+
+| Component | Producer | Rule |
+|---|---|---|
+| Layout, color, typography, atmosphere | image generation | use creative design ability |
+| Scientific figures | deterministic replacement | only source figures from the paper |
+| Poster copy | LLM planning + filters | grounded, public-facing, no workflow/internal text |
+| Quality control | VLM + deterministic checks | reject bad placeholder geometry, bad replacement, or dirty public text |
+
+## Quick start
 
 ```bash
-# 1. 安装
+# 1. Install
 git clone https://github.com/tyy99phy/paper_poster_harness.git
 cd paper_poster_harness
 pip install -e .
 
-# 2. 登录 ChatGPT 账号（打开浏览器完成 OAuth）
+# 2. Create a config and log in with a local ChatGPT/OpenAI account
 poster-harness init-config --out poster_harness.yaml --login
 
-# 3. 从 arXiv 论文一键生成海报（默认 standard 稳定流程）
+# 3. Generate a poster from arXiv
 poster-harness autoposter \
   --config poster_harness.yaml \
   --arxiv-id 2206.08956 \
-  --out runs/my-poster
+  --out runs/ssww-demo
 
-# 可选：启用 hep_dense 高信息密度模式
+# Optional: HEP-dense mode for more expert-level HEP content
 poster-harness autoposter \
   --config poster_harness.yaml \
   --arxiv-id 2206.08956 \
   --content-mode hep_dense \
-  --out runs/my-poster-dense
+  --out runs/ssww-demo-dense
 ```
 
-跑完后在对应 `--out` 目录的 `exports/` 下找最终海报。
+Final posters are written under `exports/` inside the run directory.
 
-## 为什么是"占位符优先"
-
-AI 图片模型有一个致命问题：它会"发明"看起来很专业的科学图表——但这些图表的曲线、数据、误差棒全是假的。对于学术海报来说，这是不可接受的。
-
-这个框架的做法是：
-
-| 环节 | 谁来做 | 原则 |
-|------|--------|------|
-| 版式设计、配色、排版 | 生图模型 | 充分发挥 AI 的审美能力 |
-| 科学图表（曲线、散点图、费曼图等） | 确定性替换 | 只插入论文原始图片，绝不让 AI 画数据 |
-| 文字内容 | LLM + 过滤 | 从论文提取，LLM 压缩成海报文案，自动过滤内部/工作流用语 |
-
-流程中每一步失败都会直接报错（严格模式），不会悄悄降级或拿旧结果拼贴。
-
-## 工作流程
+## Pipeline
 
 ```text
-arXiv / 本地论文
-  → 提取文本 + 图片素材
-  → domain classifier 自动识别学科（如 HEP / CS-ML / Bio / Astro / Math / Chemistry）
-  → 根据 domain_profile 组合领域视觉语法、文字重点和 figure 类型提示词
-  → 可选 hep_dense：LLM 生成 paper content outline（专业事实、SR/CR、fit、systematics、figure-nearby text）
-  → LLM 起草 poster_spec（包含版式描述、章节、占位符规格）
-  → LLM 生成 storyboard（叙事主线、阅读顺序、图文角色、读者问题、信息密度计划）
-  → LLM 生成 physics quiz / copy deck（控制海报应回答的问题和可见文案）
-  → LLM 从素材中挑选最有价值的图片，分配给 [FIG 01]、[FIG 02] ...
-  → 组装完整 prompt，发给生图模型
-  → 生图模型画海报（只含空白占位符，不画科学内容）
-  → template critic 检查信息量、艺术性、文字质量、占位符合规性；不合格则带 critique 重新整张生图
-  → LLM 视觉检测每个占位符的像素坐标
-  → 占位符 QA（检查是否空白、是否可读、比例和局部 panel 是否合理）
-  → 将真实论文图片按坐标插入
-  → 4× 超分放大
-  → 最终 QA（检查文字是否公开、图片是否正常）
-  → 若只剩局部公开文字/符号 typo，则用 image_generation edit 微修 placeholder layout
-  → 对修好的 layout 重新检测占位符、重新贴真实图、重新 final QA
+paper PDF / arXiv ID / local source
+  → extract text and source figures
+  → infer domain profile (HEP, CS/ML, Bio, Astro, Math, Chemistry, Generic)
+  → plan poster content, storyboard, copy deck, and figure roles
+  → select real paper figures for [FIG NN] placeholders
+  → build a strict image-generation prompt
+  → generate a placeholder-only poster template
+  → template critic checks design, text, information density, and placeholder contract
+  → detect placeholder coordinates
+  → placeholder QA and containment QA
+  → insert real figures deterministically
+  → upscale/export
+  → final QA
+  → optional micro-repair only for small public text/glyph issues, then re-detect/re-insert/re-QA
 ```
 
-每一步的产物（spec、manifest、prompt、QA 报告）都会保存到 `runs/<run>/`，方便审阅和调试。
+Every intermediate artifact is saved: prompts, specs, figure manifests, detections, and QA reports.
 
-## 配置说明
+## Modes
 
-完整配置模板见 `templates/poster_harness_config.yaml`。主要板块：
+| Mode | Default | Description | Use case |
+|---|---:|---|---|
+| `standard` | yes | stable general pipeline with moderate information density | routine generation across fields |
+| `hep_dense` | no | higher-density HEP planning with analysis strategy, SR/CR, fits, systematics, limits | expert HEP posters and benchmark figures |
 
-### LLM 后端
+Examples:
+
+```bash
+poster-harness autoposter --config poster_harness.yaml --paper paper.pdf
+poster-harness autoposter --config poster_harness.yaml --query "CMS W mass Nature 2024"
+poster-harness autoposter --config poster_harness.yaml --arxiv-id 2309.03501 --domain-profile hep
+poster-harness autoposter --config poster_harness.yaml --arxiv-id 1706.03762 --domain-profile cs_ml
+```
+
+## Configuration highlights
+
+The full template lives at `templates/poster_harness_config.yaml`.
 
 ```yaml
 llm:
-  backend: chatgpt_account    # 默认后端：本地 ChatGPT 账号认证 JSON
+  backend: chatgpt_account
   model: gpt-5.5
-  timeout: 180
   account:
-    auth_dir: ~/.config/poster-harness/auth   # 登录凭证存放目录
-```
+    auth_dir: ~/.config/poster-harness/auth
 
-`account` 留空会自动发现本地认证文件，也可用 `POSTER_HARNESS_AUTH_FILE` 环境变量指定。
-
-### 图片生成
-
-```yaml
 image_generation:
   backend: chatgpt_account
   model: gpt-5.5
   size: 1024x1536
   quality: high
-  variants: 2                # 每轮生成几个候选
-  generated_scale: 4.0       # 生成后立即超分的倍数
-  upscale_factor: 4.0        # 最终导出放大倍数
+  variants: 2
+
 autoposter:
-  required_successes: 2      # 最终保留几组通过 QA 的海报
-  max_candidate_batches: 3   # 不够时最多再生成几轮候选
-```
-
-默认最终产出 2 组合格海报供用户选择。框架会先生成候选模板，并启用 template critic；每个候选还要通过 placeholder QA、替图 containment QA 和 final QA。若合格成品不足 2 组，会继续生成下一批候选，直到达到 `required_successes` 或超过 `max_candidate_batches` 后报错。
-
-局部小修只支持生图编辑，不会用确定性白框补丁替代：
-
-```yaml
-autoposter:
-  micro_repair:
-    enabled: true
-    backend: image_edit
-    max_rounds: 1
-```
-
-`micro_repair` 只处理 final QA 认为可局部修复的公开文字/符号问题。它编辑的是 **placeholder layout/template**，不是已经贴好真实图的 final poster；修好 layout 后会重新检测占位符、重新贴入真实论文图片、重新 final QA。若修复后仍不过 QA，严格模式会失败。
-
-
-### Template critic / 整张重生图
-
-```yaml
-autoposter:
+  required_successes: 2
+  max_candidate_batches: 3
+  content_mode: standard
+  domain_profile: auto
   template_critic:
     enabled: true
     require_pass: true
-    max_regen_rounds: 2
-    min_overall_score: 0.72
-    min_artistry_score: 0.65
-    min_information_density_score: 0.65
-    min_placeholder_contract_score: 0.75
+  micro_repair:
+    enabled: true
+    backend: image_edit
 ```
 
-这个阶段借鉴 Paper2Poster 的 visual-in-the-loop 思路，但仍保留我们的路线：**不手工补文字、不拼接旧图，而是把 critic 反馈交回生图模型重新生成完整 poster**。
+Authentication is intentionally local. Users log in and store their own account JSON; the repository does not ship credentials.
 
-### 样式预设与领域感知
+## Selected 12-paper benchmark
 
-默认 main 流程使用通用样式 + 自动领域识别：
+A compact qualitative benchmark is included under [`benchmarks/selected_12`](benchmarks/selected_12):
 
-```yaml
-autoposter:
-  style: generic
-  domain_profile: auto
-```
+- 6 HEP papers and 6 non-HEP papers.
+- 24 poster PNGs: `ours.png` and corrected `p2p.png` for each paper.
+- A manifest with arXiv IDs and selection notes.
+- Contact sheets for quick visual inspection.
 
-`domain_profile: auto` 会让 LLM 根据论文文本、arXiv 信息和图片素材选择领域配置，例如：
+The corrected P2P baseline uses real figure caches for the affected papers instead of full-page PDF screenshot fallbacks.
 
-- `hep`：高能物理 / 粒子物理 / 中微子 / 重离子 / flavor / precision
-- `cs_ml`：计算机科学 / 机器学习
-- `bio`：生命科学 / 生物医学
-- `astro`：天文 / 宇宙学
-- `math`：数学 / 理论
-- `chemistry`：化学 / 材料
-- `generic`：无法可靠归类时的通用科学海报
-
-领域配置只控制 **视觉语法、figure 类型、文字重点、禁止伪造的科学图像类型**；占位符检测和真实图片替换 pipeline 不变。
-
-也可以手动指定领域，跳过自动识别：
-
-```bash
-poster-harness autoposter --config poster_harness.yaml \
-  --arxiv-id 2206.08956 \
-  --domain-profile hep
-```
-
-如果只想要纯通用模式：
-
-```bash
-poster-harness autoposter --config poster_harness.yaml \
-  --paper paper.pdf \
-  --domain-profile generic
-```
-
-`cms-hep` 仍可作为显式 style preset 使用，但不再是默认值：
-
-```bash
-poster-harness autoposter --config poster_harness.yaml \
-  --arxiv-id 2206.08956 \
-  --style cms-hep \
-  --domain-profile hep
-```
-
-可以在 `domain_profiles` 和 `styles` 段下自定义新学科或新视觉风格。
-
-### 内容密度模式
-
-框架现在把稳定路线和高信息密度路线明确分开：
-
-| 模式 | 默认 | 特点 | 适用场景 |
-|------|------|------|----------|
-| `standard` | 是 | 保持 main 原有稳定流程；不启用额外 content outline；信息量适中、速度较快 | 日常批量生成、追求稳定 |
-| `hep_dense` | 否 | 启用 paper content outline；提高 copy deck 容量；更强调 SR/CR、selection、fit strategy、systematics、limits 等 HEP 专家信息 | 需要更像 `regen2` 的高信息密度专业海报 |
-
-配置文件默认值：
-
-```yaml
-autoposter:
-  content_mode: standard
-```
-
-命令行临时启用高密度模式：
-
-```bash
-poster-harness autoposter --config poster_harness.yaml \
-  --arxiv-id 2206.08956 \
-  --content-mode hep_dense
-```
-
-也可以写进配置：
-
-```yaml
-autoposter:
-  content_mode: hep_dense
-```
-
-注意：`hep_dense` 是 opt-in，只提高 HEP 信息密度；`domain_profile` 负责学科适配，两者相互独立。
-
-## 使用方式
-
-### 方式一：一键生成（推荐）
-
-```bash
-# 按关键词搜索 arXiv
-poster-harness autoposter --config poster_harness.yaml \
-  --query "heavy Majorana neutrino CMS VBS same-sign WW"
-
-# 已知 arXiv ID，跳过搜索
-poster-harness autoposter --config poster_harness.yaml \
-  --arxiv-id 2206.08956
-
-# 本地论文
-poster-harness autoposter --config poster_harness.yaml \
-  --paper paper.pdf --assets-dir figures/ \
-  --text-source main.tex
-```
-
-### 方式二：分步执行
-
-当你想审阅或调整中间产物时，可以逐步运行：
-
-```bash
-# 第 1 步：登录（只需一次）
-poster-harness login
-
-# 第 2 步：定位 arXiv 论文
-poster-harness resolve-arxiv --config poster_harness.yaml \
-  --query "..." --out resolution.yaml
-
-# 第 3 步：扫描本地图片素材
-poster-harness manifest --assets-dir figures/ \
-  --copy-to runs/my-poster/assets/ \
-  --out runs/my-poster/specs/assets_manifest.yaml
-
-# 第 4 步：生成 prompt（可在此编辑后再继续）
-poster-harness prompt \
-  --spec runs/my-poster/specs/poster_spec.yaml \
-  --out runs/my-poster/prompts/poster_prompt.txt
-
-# 第 5 步：生成海报
-poster-harness generate --config poster_harness.yaml \
-  --prompt runs/my-poster/prompts/poster_prompt.txt \
-  --out-dir runs/my-poster/generated/
-
-# 第 6 步：替换真实图片
-poster-harness replace \
-  --base-image runs/my-poster/generated/poster-placeholder-layout.png \
-  --spec runs/my-poster/specs/poster_spec.yaml \
-  --asset-dir runs/my-poster/assets/ \
-  --out runs/my-poster/exports/poster-realfigures.png
-
-# 第 7 步：超分导出
-poster-harness upscale \
-  --input runs/my-poster/exports/poster-realfigures.png \
-  --out runs/my-poster/exports/poster-realfigures-4x.png \
-  --factor 4
-```
-
-每一步的结果都写入文件，不会因为你跳步或重跑而丢失之前的数据。
-
-## 输出文件结构
+## Repository layout
 
 ```text
-runs/<run>/
-├── input/                  # 下载/复制的论文原文
-├── assets/                 # 复制的图片素材 + contact sheet
-├── generated/              # 生图模型产出的占位符海报
-│   ├── *-native.png        #   模型原生输出
-│   └── *placeholder-layout.png  #   超分后的占位符海报
-├── exports/                # 替换真实图片后的最终海报
-│   ├── *realfigures.png    #   原始尺寸
-│   └── *realfigures-4x.png #   4× 放大版
-├── specs/                  # spec/storyboard/selection/manifest
-├── prompts/                # 组装好的生图 prompt
-├── qa/                     # 占位符 QA + 最终 QA 报告
-├── scratch/                # 中间检测结果
-└── run_manifest.yaml       # 完整运行记录
+poster_harness/                 core package
+poster_harness/cli.py            CLI entry point
+templates/poster_harness_config.yaml
+docs/                            design notes and auth docs
+benchmarks/selected_12/          curated qualitative benchmark posters
+tests/                           unit tests for auth, arXiv, layout, QA, replacement
 ```
 
-## 占位符规则
+## Design principles
 
-生图模型被严格要求：**凡是论文图片区域，必须画成空白矩形占位符**。每个占位符只能包含三样东西：
+1. **No fake scientific plots.** Scientific figures must come from the paper/source.
+2. **No silent fallback.** If a strict LLM/image stage fails, report the error or regenerate a full candidate.
+3. **Keep layout creative.** The image model should control art direction, rhythm, typography, and atmosphere.
+4. **Keep replacement deterministic.** Placeholder detection and figure insertion are auditable.
+5. **Keep evidence.** Save prompts, specs, manifests, and QA files for every run.
 
-1. 精确编号：`[FIG 03]`
-2. 内容标签（如 "Observed 95% CL exclusion limit"）
-3. 目标宽高比（如 "1:1 square" 或 "2.5:1 wide"）
-
-不允许画任何科学内容——曲线、坐标轴、图例、费曼线、热力图、表格、缩略图，统统不行。占位符 QA 会逐项检查，不通过就不会进入替换阶段。
-
-## 常见问题
-
-### 登录失败 / token 过期
-
-认证文件在 `~/.config/poster-harness/auth/` 下。重新登录即可刷新：
+## Development
 
 ```bash
-poster-harness login --force
+pip install -e .
+pytest
 ```
 
-### 文本提取太短（"extracted text is too short"）
+See also:
 
-PDF 的文本层可能不完整。最可靠的做法是直接给 TeX 源码：
-
-```bash
-poster-harness autoposter --config poster_harness.yaml \
-  --paper paper.pdf --text-source main.tex
-```
-
-### 占位符 QA 不通过
-
-说明生图模型在占位符里画了不该画的东西，或者占位符编号不清晰。可以：
-- 增大 `variants`（多生成几个候选）
-- 增大 `autoposter.max_candidate_batches`（允许更多批次补足 2 组合格海报）
-- 调整 prompt（见 `docs/prompt_contract.md`）
-- 降低 `min_detection_confidence`（但可能引入误检）
-
-### 海报上的文字有内部/工作流用语
-
-检查 `forbidden_phrases` 配置，把需要过滤的词加进去。`autoposter` 默认已经过滤了常见内部用语。
-
-## 更多文档
-
-- [prompt 合约说明](docs/prompt_contract.md) — 生图模型需要遵守的占位符规则
-- [质量策略](docs/quality_policy.md) — 从初稿到打印级海报的质量分级
-- [账号认证](docs/account_auth.md) — 认证文件的格式和刷新机制
-- [Paper2Poster 吸收策略](docs/paper2poster_lessons.md) — 信息密度、多次生图、分层导出的设计取舍
-
-## License
-
-MIT
+- [`docs/account_auth.md`](docs/account_auth.md)
+- [`docs/prompt_contract.md`](docs/prompt_contract.md)
+- [`docs/quality_policy.md`](docs/quality_policy.md)
+- [`docs/paper2poster_lessons.md`](docs/paper2poster_lessons.md)
