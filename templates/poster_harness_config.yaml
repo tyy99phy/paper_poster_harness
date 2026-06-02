@@ -62,6 +62,7 @@ autoposter:
   normalize_placeholder_geometry: true
   redraw_normalized_placeholders: false
   placeholder_aspect_tolerance: 0.2
+  export_pptx: true
   required_successes: 2
   max_candidate_batches: 8
   llm_stage_retries: 4

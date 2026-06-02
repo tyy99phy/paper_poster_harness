@@ -79,12 +79,28 @@ PDF / arXiv ID / 本地源码
   → 检测占位符坐标
   → placeholder QA / containment QA
   → 确定性贴入真实论文图片
-  → 放大导出
+  → 放大导出 PNG 和分层 PPTX
   → final QA
   → 仅在少量公开文字/符号 typo 时进行 image-edit micro repair，然后重新检测/贴图/QA
 ```
 
 所有中间产物都会保留：prompt、spec、figure manifest、检测结果和 QA 报告。
+通过 QA 的海报也会默认额外导出分层单页 `.pptx`（`autoposter.export_pptx: true`）：生成式 layout 作为幻灯片背景，每张源论文真实图片作为独立 PowerPoint 图片对象插入，可以单独选中、移动、缩放或替换。
+
+## Run record 观测日志
+
+每次 `autoposter` 运行都会额外写出一份标准化观测记录：
+
+- `run_record.json`：机器可解析的真相源，便于以后聚合成语料和指标。
+- `run_record.md`：从 JSON 渲染的人类可读审计日志。
+
+这不是额外调用模型，而是 post-hoc observer：读取已有的 manifest、spec、QA、检测和贴图产物，记录 run card、能力阶段轨迹、QA/失败记录、真实图出处账本、客观检查和带 caveat 的 model-judge 分数，并在完整 workflow trace 中嵌入已保存的 prompt、规划 YAML、检测结果、placement spec 和 QA 判断。新的 run 还会在 `traces/` 下尽量保存各 LLM 阶段的完整 envelope（prompt、schema、raw text、result）。
+
+也可以对已有成功或失败 run 手动重新生成：
+
+```bash
+poster-harness record runs/ssww-demo
+```
 
 ## 模式
 
@@ -119,6 +135,7 @@ image_generation:
 autoposter:
   required_successes: 2
   max_candidate_batches: 3
+  export_pptx: true
   content_mode: standard
   domain_profile: auto
   template_critic:
@@ -130,3 +147,16 @@ autoposter:
 ```
 
 认证凭证只保存在用户本地，仓库不包含任何账号 JSON 或 API key。
+
+也可以从已经通过 QA 的 layout/spec 手动生成分层 PPTX：
+
+```bash
+poster-harness pptx \
+  --input runs/demo/generated/poster-placeholder-layout-native-production-base-4x.png \
+  --spec runs/demo/specs/poster_spec.01.with_placements.yaml \
+  --asset-dir runs/demo/assets \
+  --scale 4 \
+  --out runs/demo/exports/poster-layered.pptx
+```
+
+这个 PPTX 中，layout 是背景图，真实论文图片是独立 PowerPoint 图片对象。完整的文字/矢量可编辑重建属于后续独立 renderer。

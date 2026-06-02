@@ -79,12 +79,28 @@ paper PDF / arXiv ID / local source
   → detect placeholder coordinates
   → placeholder QA and containment QA
   → insert real figures deterministically
-  → upscale/export
+  → upscale/export PNG and layered PPTX
   → final QA
   → optional micro-repair only for small public text/glyph issues, then re-detect/re-insert/re-QA
 ```
 
 Every intermediate artifact is saved: prompts, specs, figure manifests, detections, and QA reports.
+Accepted posters also get a layered one-slide `.pptx` by default (`autoposter.export_pptx: true`): the generated layout is used as the slide background, while each source-paper figure is inserted as a separate PowerPoint picture object that can be selected, moved, resized, or replaced.
+
+## Run records
+
+Every `autoposter` run now emits a standardized observer record:
+
+- `run_record.json` — machine-readable source of truth for corpus/evaluation use.
+- `run_record.md` — human-readable audit log rendered from the JSON.
+
+The record is a post-hoc observer over existing artifacts, not an extra model call. It includes the run card, capability-stage trace, QA/failure accounting, source-figure provenance ledger, objective checks, model-judge scores with an explicit caveat, and a complete embedded workflow trace with persisted prompts, planning YAML, detections, placement specs, and QA judgments. New runs also persist exact LLM-stage envelopes under `traces/` where available.
+
+You can regenerate the record for any completed or failed run:
+
+```bash
+poster-harness record runs/ssww-demo
+```
 
 ## Modes
 
@@ -123,6 +139,7 @@ image_generation:
 autoposter:
   required_successes: 2
   max_candidate_batches: 3
+  export_pptx: true
   content_mode: standard
   domain_profile: auto
   template_critic:
@@ -134,6 +151,19 @@ autoposter:
 ```
 
 Authentication is intentionally local. Users log in and store their own account JSON; the repository does not ship credentials.
+
+Layered PPTX can also be generated manually from an accepted layout/spec pair:
+
+```bash
+poster-harness pptx \
+  --input runs/demo/generated/poster-placeholder-layout-native-production-base-4x.png \
+  --spec runs/demo/specs/poster_spec.01.with_placements.yaml \
+  --asset-dir runs/demo/assets \
+  --scale 4 \
+  --out runs/demo/exports/poster-layered.pptx
+```
+
+In this PPTX export, the layout is a background image and source figures are independent PowerPoint picture objects. Full editable text/vector reconstruction is a separate future renderer.
 
 ## Selected 12-paper benchmark
 
@@ -151,10 +181,12 @@ The corrected P2P baseline uses real figure caches for the affected papers inste
 ```text
 poster_harness/                 core package
 poster_harness/cli.py            CLI entry point
+poster_harness/pptx_export.py    layered PPTX export helpers
+poster_harness/run_record.py     post-hoc run observer / audit record
 templates/poster_harness_config.yaml
 docs/                            design notes and auth docs
 benchmarks/selected_12/          curated qualitative benchmark posters
-tests/                           unit tests for auth, arXiv, layout, QA, replacement
+tests/                           unit tests for auth, arXiv, layout, QA, replacement, PPTX, records
 ```
 
 ## Design principles
@@ -163,7 +195,8 @@ tests/                           unit tests for auth, arXiv, layout, QA, replace
 2. **No silent fallback.** If a strict LLM/image stage fails, report the error or regenerate a full candidate.
 3. **Keep layout creative.** The image model should control art direction, rhythm, typography, and atmosphere.
 4. **Keep replacement deterministic.** Placeholder detection and figure insertion are auditable.
-5. **Keep evidence.** Save prompts, specs, manifests, and QA files for every run.
+5. **Keep figures editable.** PPTX exports keep source figures as separate selectable objects even when the generated layout remains a background.
+6. **Keep evidence.** Save prompts, specs, manifests, traces, run records, and QA files for every run.
 
 ## Development
 

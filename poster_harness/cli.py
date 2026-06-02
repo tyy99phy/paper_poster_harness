@@ -4,6 +4,7 @@ import argparse
 import copy
 import shutil
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -33,6 +34,7 @@ from .latex_utils import clean_latex_inline, extract_latex_braced
 from .layout_contract import build_layout_contract
 from .micro_repair import apply_micro_repairs
 from .prompt import build_prompt, sanitize_public_text
+from .pptx_export import export_image_as_pptx, export_layered_pptx
 from .replace import audit_generated_placeholder_geometry, audit_figure_containment, normalize_placeholder_geometry, replace_placeholders, upscale_image
 from .image_backend import edit_image_from_config, generate_images_from_config
 from .llm import ChatGPTAccountResponsesProvider, OpenAICompatibleResponsesProvider
@@ -53,7 +55,7 @@ from .schemas import DEFAULT_MODEL, default_poster_spec
 
 def cmd_init(args: argparse.Namespace) -> None:
     root = Path(args.project_dir)
-    for sub in ["input", "assets", "generated", "exports", "specs", "prompts", "scratch"]:
+    for sub in ["input", "assets", "generated", "exports", "specs", "prompts", "scratch", "qa", "traces"]:
         (root / sub).mkdir(parents=True, exist_ok=True)
     spec = default_poster_spec(title=args.title or "Untitled Scientific Poster")
     dump_config(spec, root / "specs" / "poster_spec.yaml")
@@ -216,6 +218,21 @@ def cmd_upscale(args: argparse.Namespace) -> None:
     print(out)
 
 
+def cmd_pptx(args: argparse.Namespace) -> None:
+    if args.spec and args.asset_dir:
+        out = export_layered_pptx(
+            base_image=args.input,
+            spec=load_config(args.spec),
+            asset_dir=args.asset_dir,
+            out_path=args.out,
+            scale=args.scale,
+            long_edge_inches=args.long_edge_inches,
+        )
+    else:
+        out = export_image_as_pptx(args.input, args.out, long_edge_inches=args.long_edge_inches)
+    print(out)
+
+
 def cmd_sanitize(args: argparse.Namespace) -> None:
     text = Path(args.input).read_text(encoding="utf-8")
     spec = load_config(args.spec) if args.spec else {}
@@ -239,6 +256,27 @@ def cmd_manifest(args: argparse.Namespace) -> None:
     print(args.out)
     if args.copy_to:
         print(args.copy_to)
+
+
+def _write_run_record_best_effort(run_dir: Path) -> None:
+    """Emit run_record.{json,md} without ever breaking the main pipeline."""
+    try:
+        from .run_record import write_record
+
+        json_path, md_path = write_record(run_dir)
+    except Exception as exc:  # pragma: no cover - best-effort safety net
+        print(f"[warn] failed to write run record for {run_dir}: {exc}", file=sys.stderr)
+        return
+    print(f"run_record_json: {json_path}")
+    print(f"run_record_md: {md_path}")
+
+
+def cmd_record(args: argparse.Namespace) -> None:
+    from .run_record import write_record
+
+    json_path, md_path = write_record(args.run_dir)
+    print(json_path)
+    print(md_path)
 
 
 def cmd_llm_draft_spec(args: argparse.Namespace) -> None:
@@ -407,6 +445,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
 
     root = Path(args.out or cfg_get(config, "paper.out", "") or _default_run_dir(paper_arg, config, resolution))
     dirs = _ensure_project_dirs(root)
+    llm_trace_paths: list[str] = []
 
     config_assets = cfg_get(config, "paper.assets_dir", []) or []
     source_roots: list[Path] = [Path(p) for p in [*config_assets, *(args.assets_dir or [])] if p]
@@ -487,6 +526,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         args=args,
         resolution=resolution,
         arxiv_bundle=arxiv_bundle,
+        trace_paths=llm_trace_paths,
     )
     if domain_profile:
         domain_profile_path = dirs["specs"] / "domain_profile.yaml"
@@ -531,6 +571,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             extra_instructions=outline_extra,
         )
         content_outline = dict(outline_envelope["result"])
+        _dump_llm_trace(outline_envelope, dirs, llm_trace_paths, "paper_content_outline_from_text")
         content_outline_path = dirs["specs"] / "content_outline.yaml"
         dump_config(content_outline, content_outline_path)
 
@@ -548,6 +589,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         extra_instructions=_draft_section_count_instruction(config),
     )
     draft_spec = _apply_spec_extras(dict(draft_envelope["result"]), spec_extras)
+    _dump_llm_trace(draft_envelope, dirs, llm_trace_paths, "draft_spec_from_text")
     draft_spec = _cap_spec_sections_for_stability(
         draft_spec,
         max_sections=int(cfg_get(config, "autoposter.max_sections", 5) or 0),
@@ -579,6 +621,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             extra_instructions=storyboard_extra,
         )
         storyboard = dict(storyboard_envelope["result"])
+        _dump_llm_trace(storyboard_envelope, dirs, llm_trace_paths, "storyboard_from_text")
         storyboard_path = dirs["specs"] / "storyboard.yaml"
         dump_config(storyboard, storyboard_path)
         draft_spec["storyboard"] = storyboard
@@ -613,6 +656,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             extra_instructions=quiz_extra,
         )
         physics_quiz = dict(quiz_envelope["result"])
+        _dump_llm_trace(quiz_envelope, dirs, llm_trace_paths, "physics_quiz_from_text")
         physics_quiz_path = dirs["specs"] / "physics_quiz.yaml"
         dump_config(physics_quiz, physics_quiz_path)
         draft_spec["physics_quiz"] = physics_quiz
@@ -632,6 +676,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         extra_instructions=str(cfg_get(config, "autoposter.figure_layout_policy", "") or ""),
     )
     figure_selection = dict(selection_envelope["result"])
+    _dump_llm_trace(selection_envelope, dirs, llm_trace_paths, "select_figures")
     figure_selection_path = dirs["specs"] / "figure_selection.yaml"
     dump_config(figure_selection, figure_selection_path)
 
@@ -679,6 +724,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             extra_instructions=copy_extra,
         )
         copy_deck = dict(copy_envelope["result"])
+        _dump_llm_trace(copy_envelope, dirs, llm_trace_paths, "copy_deck_from_text")
         copy_deck_path = dirs["specs"] / "copy_deck.yaml"
         dump_config(copy_deck, copy_deck_path)
         final_spec["copy_deck"] = copy_deck
@@ -705,6 +751,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
             extra_instructions=flowchart_extra,
         )
         flowchart_rewrite_path = dirs["specs"] / "flowchart_rewrite.yaml"
+        _dump_llm_trace(flowchart_envelope, dirs, llm_trace_paths, "flowchart_rewrite")
         dump_config(flowchart_envelope, flowchart_rewrite_path)
         final_spec = apply_flowchart_rewrites(final_spec, flowchart_envelope)
     layout_contract_path: Path | None = None
@@ -755,6 +802,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
         "generated": [],
         "exports": [],
         "qa": [],
+        "llm_traces": llm_trace_paths,
     }
     if not assets_manifest.get("assets"):
         raise RuntimeError("autoposter: no usable image assets found; strict mode will not continue without real figure assets")
@@ -837,11 +885,13 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
                 run_manifest["exports"].extend(candidate_exports)
     except Exception:
         dump_config(run_manifest, root / "run_manifest.yaml")
+        _write_run_record_best_effort(root)
         raise
 
     if len(run_manifest["poster_sets"]) < required_successes:
         run_manifest_path = root / "run_manifest.yaml"
         dump_config(run_manifest, run_manifest_path)
+        _write_run_record_best_effort(root)
         details = [*template_failures, *placeholder_failures]
         detail = "; ".join(details[-12:]) if details else "no exportable generated image"
         raise RuntimeError(
@@ -852,6 +902,7 @@ def cmd_autoposter(args: argparse.Namespace) -> None:
     run_manifest_path = root / "run_manifest.yaml"
     run_manifest["generated"] = [str(item["template"]) for item in run_manifest["poster_sets"]]
     dump_config(run_manifest, run_manifest_path)
+    _write_run_record_best_effort(root)
     print(run_manifest_path)
     for poster_set in run_manifest["poster_sets"]:
         print(f"poster_set_{poster_set['index']}: {poster_set['template']}")
@@ -883,6 +934,12 @@ def _process_generated_template_candidate(
         image_path,
         expected_placeholders=final_spec.get("placeholders") or [],
         provider=provider,
+    )
+    _dump_llm_trace(
+        detection_envelope,
+        dirs,
+        run_manifest.setdefault("llm_traces", []),
+        f"detect_placeholders_from_image.{stem}",
     )
     detections = dict(detection_envelope["result"])
     detections_path = dirs["scratch"] / f"{stem}.detections.yaml"
@@ -944,6 +1001,12 @@ def _process_generated_template_candidate(
         provider=provider,
         qa_mode="placeholder",
     )
+    _dump_llm_trace(
+        placeholder_qa_envelope,
+        dirs,
+        run_manifest.setdefault("llm_traces", []),
+        f"qa_poster_placeholder.{stem}",
+    )
     placeholder_qa_result = dict(placeholder_qa_envelope["result"])
     placeholder_qa_path = dirs["qa"] / f"{stem}.placeholder.qa.yaml"
     dump_config(placeholder_qa_result, placeholder_qa_path)
@@ -979,6 +1042,12 @@ def _process_generated_template_candidate(
         detected_placeholders=detections,
         provider=provider,
         qa_mode="final",
+    )
+    _dump_llm_trace(
+        qa_envelope,
+        dirs,
+        run_manifest.setdefault("llm_traces", []),
+        f"qa_poster_final.{stem}",
     )
     qa_result = dict(qa_envelope["result"])
     qa_path = dirs["qa"] / f"{stem}.final.qa.yaml"
@@ -1060,6 +1129,9 @@ def _export_realfigures_from_layout(
 
     candidate_exports = [str(export_path)]
     qa_image = export_path
+    pptx_base_path = layout_path
+    pptx_scale = 1.0
+    pptx_out_path = export_path.with_suffix(".pptx")
     upscale_factor = float(_opt(args.upscale_factor, config, "image_generation.upscale_factor", 4.0) or 0)
     if upscale_factor and upscale_factor > 1:
         upscaled_path = dirs["exports"] / f"{stem}-realfigures-{int(upscale_factor)}x.png"
@@ -1087,8 +1159,23 @@ def _export_realfigures_from_layout(
                 )
                 export_path.unlink(missing_ok=True)
                 return None
+            pptx_base_path = upscaled_base_path
+            pptx_scale = extra_scale
         candidate_exports.append(str(upscaled_path))
         qa_image = upscaled_path
+        pptx_out_path = upscaled_path.with_suffix(".pptx")
+    if bool(cfg_get(dict(config), "autoposter.export_pptx", True)):
+        try:
+            pptx_path = export_layered_pptx(
+                base_image=pptx_base_path,
+                spec=spec_with_placements,
+                asset_dir=dirs["assets"],
+                out_path=pptx_out_path,
+                scale=pptx_scale,
+            )
+            candidate_exports.append(str(pptx_path))
+        except Exception as exc:
+            placeholder_failures.append(f"{layout_path}: failed layered PPTX export; {exc}")
     return candidate_exports, qa_image
 
 
@@ -1714,6 +1801,12 @@ def _generate_templates_with_critic(
                 image_path=critic_image_path,
                 provider=provider,
                 extra_instructions=str(cfg_get(dict(config), "autoposter.template_critic.extra_instructions", "") or ""),
+            )
+            _dump_llm_trace(
+                critique_envelope,
+                dirs,
+                run_manifest.setdefault("llm_traces", []),
+                f"critique_poster_template.{stem}",
             )
             critique = dict(critique_envelope["result"])
             critique_path = dirs["qa"] / f"{stem}.template-critic.qa.yaml"
@@ -2493,10 +2586,25 @@ def _dump_llm_result(envelope: Mapping[str, Any], path: str | Path) -> None:
     dump_config(dict(result), path)
 
 
+def _dump_llm_trace(
+    envelope: Mapping[str, Any],
+    dirs: Mapping[str, Path],
+    trace_paths: list[str],
+    stage_name: str,
+) -> Path:
+    """Persist the exact LLM-stage envelope: prompt, schema, raw text, and result."""
+    trace_dir = dirs["traces"]
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    path = trace_dir / f"{len(trace_paths) + 1:02d}.{stage_name}.envelope.yaml"
+    dump_config(dict(envelope), path)
+    trace_paths.append(str(path))
+    return path
+
+
 def _ensure_project_dirs(root: Path) -> dict[str, Path]:
     dirs = {
         name: root / name
-        for name in ["input", "assets", "generated", "exports", "specs", "prompts", "scratch", "qa"]
+        for name in ["input", "assets", "generated", "exports", "specs", "prompts", "scratch", "qa", "traces"]
     }
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -2667,6 +2775,7 @@ def _resolve_domain_profile(
     args: argparse.Namespace,
     resolution: Mapping[str, Any] | None,
     arxiv_bundle: Any,
+    trace_paths: list[str] | None = None,
 ) -> dict[str, Any] | None:
     requested = str(getattr(args, "domain_profile", None) or cfg_get(dict(config), "autoposter.domain_profile", "auto") or "auto")
     normalized = _normalize_domain_profile_name(requested)
@@ -2705,6 +2814,8 @@ def _resolve_domain_profile(
         max_text_chars=int(cfg_get(dict(config), "autoposter.domain_classifier.max_text_chars", 12000) or 12000),
         extra_instructions=str(cfg_get(dict(config), "autoposter.domain_classifier.extra_instructions", "") or ""),
     )
+    if trace_paths is not None:
+        _dump_llm_trace(envelope, dirs, trace_paths, "paper_domain_profile_from_text")
     detected = dict(envelope["result"])
     detected.setdefault("mode", "auto")
     detected.setdefault("available_profiles", available)
@@ -3038,6 +3149,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-sharpen", action="store_true")
     p.set_defaults(func=cmd_upscale)
 
+    p = sub.add_parser("pptx", help="export a poster image as PPTX; with --spec/--asset-dir, keep figures as separate objects")
+    p.add_argument("--input", required=True, help="flat poster image, or the placeholder/layout background when --spec is supplied")
+    p.add_argument("--out", required=True)
+    p.add_argument("--spec", help="placement spec for layered PPTX export")
+    p.add_argument("--asset-dir", help="source figure asset directory for layered PPTX export")
+    p.add_argument("--scale", type=float, default=1.0, help="coordinate scale between spec boxes and --input pixels")
+    p.add_argument("--long-edge-inches", type=float, default=15.0)
+    p.set_defaults(func=cmd_pptx)
+
     p = sub.add_parser("sanitize", help="remove internal/workflow lines from text")
     p.add_argument("--input", required=True)
     p.add_argument("--out", required=True)
@@ -3054,6 +3174,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-recursive", action="store_true")
     p.add_argument("--no-contact-sheet", action="store_true")
     p.set_defaults(func=cmd_manifest)
+
+    p = sub.add_parser("record", help="write standardized run_record.json and run_record.md for a run directory")
+    p.add_argument("run_dir", help="completed or failed PosterHarness run directory containing run_manifest.yaml")
+    p.set_defaults(func=cmd_record)
 
     p = sub.add_parser("llm-draft-spec", help="draft a poster spec from source text via the LLM stage")
     p.add_argument("--text", required=True)

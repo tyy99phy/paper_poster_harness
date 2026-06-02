@@ -18,6 +18,7 @@ def replace_placeholders(
     out_path: str | Path,
     scale: float = 1.0,
     dry_run: bool = False,
+    paste_assets: bool = True,
 ) -> Path:
     base = Image.open(base_image).convert('RGB')
     canvas = base.copy()
@@ -119,6 +120,8 @@ def replace_placeholders(
     for fig_id, asset_path, box, _, _, _, _ in render_items:
         if dry_run:
             _draw_debug_box(canvas, box, fig_id)
+            continue
+        if not paste_assets:
             continue
         assert asset_path is not None
         paste_fit(canvas, asset_path, box, pad=0)
