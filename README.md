@@ -96,6 +96,12 @@ Every `autoposter` run now emits a standardized observer record:
 
 The record is a post-hoc observer over existing artifacts, not an extra model call. It includes the run card, capability-stage trace, QA/failure accounting, source-figure provenance ledger, objective checks, model-judge scores with an explicit caveat, and a complete embedded workflow trace with persisted prompts, planning YAML, detections, placement specs, and QA judgments. New runs also persist exact LLM-stage envelopes under `traces/` where available.
 
+A sanitized full-trace corpus example is included under
+[`examples/corpus/ssww_2206_08956_full_trace`](examples/corpus/ssww_2206_08956_full_trace).
+It contains only the textual run-record corpus (`run_record.json` and `run_record.md`)
+plus bilingual documentation; binary images, PDFs, PPTX files, and local account/path
+details are omitted.
+
 You can regenerate the record for any completed or failed run:
 
 ```bash

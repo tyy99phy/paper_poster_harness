@@ -96,6 +96,11 @@ PDF / arXiv ID / 本地源码
 
 这不是额外调用模型，而是 post-hoc observer：读取已有的 manifest、spec、QA、检测和贴图产物，记录 run card、能力阶段轨迹、QA/失败记录、真实图出处账本、客观检查和带 caveat 的 model-judge 分数，并在完整 workflow trace 中嵌入已保存的 prompt、规划 YAML、检测结果、placement spec 和 QA 判断。新的 run 还会在 `traces/` 下尽量保存各 LLM 阶段的完整 envelope（prompt、schema、raw text、result）。
 
+仓库中也加入了一个脱敏后的完整流程语料示例：
+[`examples/corpus/ssww_2206_08956_full_trace`](examples/corpus/ssww_2206_08956_full_trace)。
+该目录只包含文本 run-record 语料（`run_record.json` 和 `run_record.md`）以及中英文说明；
+不包含 PNG、PDF、PPTX 等二进制产物，也不保留本地账户或绝对路径信息。
+
 也可以对已有成功或失败 run 手动重新生成：
 
 ```bash
